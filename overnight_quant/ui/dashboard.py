@@ -1640,6 +1640,23 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
     return state
 
 
+def load_sell_plan_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> dict[str, Any]:
+    base = Path(root) if root else ROOT
+    package = base / "overnight_quant"
+    reports = package / ("examples/reports" if mode == "demo" else "reports")
+
+    sell_plan_path = find_latest_file("sell_plan_*.md", reports)
+    lifecycle_path = find_latest_file("trade_lifecycle_*.md", reports)
+    review_path = find_latest_file("trade_review_*.md", reports)
+
+    return {
+        "sell_plan": parse_key_value_md(sell_plan_path or reports / "sell_plan_missing.md"),
+        "sell_plan_rows": parse_sell_plan_table(sell_plan_path or reports / "sell_plan_missing.md"),
+        "lifecycle": parse_key_value_md(lifecycle_path or reports / "lifecycle_missing.md"),
+        "trade_review": parse_key_value_md(review_path or reports / "trade_review_missing.md"),
+    }
+
+
 def formal_live_buy_plan_rows(state: dict[str, Any], language: str = DEFAULT_LANGUAGE) -> list[tuple[str, str]]:
     ticket = state.get("buy_ticket") or {}
     if ticket.get("status") == "MISSING":
@@ -1864,7 +1881,17 @@ def main() -> None:
     with tabs[6]:
         _render_position_update(st, state, language, mode)
     with tabs[7]:
-        _render_sell_plan_page(st, state, language)
+        def _render_sell_plan_tab() -> None:
+            _render_sell_plan_page(st, state, language, mode)
+
+        fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+        if callable(fragment):
+            try:
+                fragment(run_every="60s")(_render_sell_plan_tab)()
+            except TypeError:
+                fragment(_render_sell_plan_tab)()
+        else:
+            _render_sell_plan_tab()
 
 
 def _render_top_status_bar(st, state: dict[str, Any], language: str) -> None:
@@ -1967,38 +1994,53 @@ def _render_report_section(st, title: str, data: dict[str, Any], language: str, 
         st.json(data)
 
 
-def _render_sell_plan_page(st, state: dict[str, Any], language: str) -> None:
-    sell_plan = state.get("sell_plan", {})
-    rows = _table_records(state.get("sell_plan_rows"))
+def _render_sell_plan_page(st, state: dict[str, Any], language: str, mode: str = DEFAULT_MODE) -> None:
+    session_state = getattr(st, "session_state", {})
+    override = session_state.get("sell_plan_state_override") if hasattr(session_state, "get") else None
+    if isinstance(override, dict) and override.get("mode") == mode:
+        state = {**state, **override}
+
     title = "卖出计划" if language == "zh" else "Sell Plan"
     st.markdown(f"#### {title}")
+
+    controls = st.columns([1.1, 1.1, 3])
+    refresh_label = "刷新实时卖出提醒" if language == "zh" else "Refresh Realtime Sell Alert"
+    auto_label = "60秒自动刷新" if language == "zh" else "Auto-refresh 60s"
+    refresh_clicked = controls[0].button(refresh_label, use_container_width=True, key="refresh_sell_plan_realtime")
+    auto_refresh = controls[1].toggle(auto_label, value=False, key="sell_plan_auto_refresh")
+
+    should_refresh = bool(refresh_clicked)
+    if auto_refresh:
+        now_ts = datetime.now().timestamp()
+        last_ts = float(session_state.get("sell_plan_auto_refresh_at", 0) or 0) if hasattr(session_state, "get") else 0.0
+        if now_ts - last_ts > 55:
+            if hasattr(session_state, "__setitem__"):
+                session_state["sell_plan_auto_refresh_at"] = now_ts
+            should_refresh = True
+
+    if should_refresh:
+        feedback = run_dashboard_action("sell_plan_live", language)
+        refreshed = load_sell_plan_state(mode=mode)
+        refreshed["mode"] = mode
+        if hasattr(session_state, "__setitem__"):
+            session_state["last_action_feedback"] = feedback
+            session_state["sell_plan_state_override"] = refreshed
+        state = {**state, **refreshed}
+
+    controls[2].caption(
+        "只刷新卖出计划区域：重新拉取当前价、分时VWAP和分钟资金，只生成提醒与报告，不会下单。"
+        if language == "zh"
+        else "Only the sell-plan panel refreshes: it fetches current price, intraday VWAP, and minute fund flow. It only updates alerts and reports; it never places orders."
+    )
+
+    sell_plan = state.get("sell_plan", {})
+    rows = _table_records(state.get("sell_plan_rows"))
     status = str(sell_plan.get("status") or "MISSING")
     status_tone = status_badge(status)["tone"]
     cols = st.columns(3)
     render_status_card(cols[0], "状态" if language == "zh" else "Status", status, status_tone)
     render_status_card(cols[1], "计划日期" if language == "zh" else "Plan Date", sell_plan.get("trade_date", "MISSING"), "gray")
     render_status_card(cols[2], "持仓数量" if language == "zh" else "Open Positions", str(len(rows)), "green" if rows else "gray")
-
-    controls = st.columns([1.1, 1.1, 3])
-    refresh_label = "刷新实时卖出提醒" if language == "zh" else "Refresh Realtime Sell Alert"
-    auto_label = "60秒自动刷新" if language == "zh" else "Auto-refresh 60s"
-    if controls[0].button(refresh_label, use_container_width=True, key="refresh_sell_plan_realtime"):
-        st.session_state["last_action_feedback"] = run_dashboard_action("sell_plan_live", language)
-        st.rerun()
-    auto_refresh = controls[1].toggle(auto_label, value=False, key="sell_plan_auto_refresh")
-    if auto_refresh:
-        st.markdown("<meta http-equiv='refresh' content='60'>", unsafe_allow_html=True)
-        now_ts = datetime.now().timestamp()
-        last_ts = float(st.session_state.get("sell_plan_auto_refresh_at", 0) or 0)
-        if now_ts - last_ts > 55:
-            st.session_state["sell_plan_auto_refresh_at"] = now_ts
-            st.session_state["last_action_feedback"] = run_dashboard_action("sell_plan_live", language)
-            st.rerun()
-    controls[2].caption(
-        "刷新会重新拉取当前价、分时VWAP和分钟资金，只生成提醒与报告，不会下单。"
-        if language == "zh"
-        else "Refresh fetches current price, intraday VWAP, and minute fund flow. It only updates alerts and reports; it never places orders."
-    )
 
     if not rows:
         st.info("当前没有需要生成卖出计划的持仓。" if language == "zh" else "No open positions need a sell plan.")

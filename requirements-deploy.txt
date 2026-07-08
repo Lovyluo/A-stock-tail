@@ -1,6 +1,6 @@
 PyYAML>=6.0
 pytest>=8.0
-streamlit>=1.30
+streamlit>=1.37
 pandas>=2.0
 requests>=2.31
 easyquotation>=0.7

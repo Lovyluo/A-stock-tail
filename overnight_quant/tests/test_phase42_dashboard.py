@@ -690,6 +690,114 @@ def test_load_dashboard_state_reads_sell_plan_detail_table(tmp_path):
     assert "VWAP" in rows[0]["plan"]
 
 
+def test_sell_plan_refresh_updates_panel_state_without_rerun(monkeypatch):
+    from overnight_quant.ui import dashboard
+    from overnight_quant.ui.result_parser import SimpleTable
+
+    calls = []
+
+    def fake_run_dashboard_action(action, language):
+        calls.append((action, language))
+        return {"ok": True, "message": "refreshed"}
+
+    def fake_load_sell_plan_state(mode="live", root=None):
+        return {
+            "sell_plan": {"status": "SELL_PLAN_READY", "trade_date": "2026-07-08", "path": "sell_plan.md"},
+            "sell_plan_rows": SimpleTable(
+                [
+                    {
+                        "code": "603823",
+                        "name": "Demo",
+                        "qty": "300",
+                        "action": "先观察",
+                        "level": "C",
+                        "plan": "刷新后的计划",
+                        "realtime_alert": "刷新后的实时提醒",
+                    }
+                ],
+                ["code", "name", "qty", "action", "level", "plan", "realtime_alert"],
+            ),
+            "lifecycle": {},
+            "trade_review": {},
+        }
+
+    class FakeExpander:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeColumn:
+        def __init__(self, parent):
+            self.parent = parent
+
+        def button(self, label, use_container_width=False, key=None):
+            return key == "refresh_sell_plan_realtime"
+
+        def toggle(self, label, value=False, key=None):
+            return False
+
+        def caption(self, text):
+            self.parent.captions.append(text)
+
+        def markdown(self, text, unsafe_allow_html=False):
+            self.parent.markdowns.append((text, unsafe_allow_html))
+
+    class FakeStreamlit:
+        def __init__(self):
+            self.session_state = {}
+            self.markdowns = []
+            self.captions = []
+            self.infos = []
+
+        def markdown(self, text, unsafe_allow_html=False):
+            self.markdowns.append((text, unsafe_allow_html))
+
+        def columns(self, spec):
+            count = len(spec) if isinstance(spec, list) else int(spec)
+            return [FakeColumn(self) for _ in range(count)]
+
+        def caption(self, text):
+            self.captions.append(text)
+
+        def info(self, text):
+            self.infos.append(text)
+
+        def expander(self, label):
+            return FakeExpander()
+
+        def json(self, data):
+            pass
+
+        def dataframe(self, data, use_container_width=False):
+            pass
+
+        def rerun(self):
+            raise AssertionError("sell-plan refresh should not rerun the whole app")
+
+    monkeypatch.setattr(dashboard, "run_dashboard_action", fake_run_dashboard_action)
+    monkeypatch.setattr(dashboard, "load_sell_plan_state", fake_load_sell_plan_state)
+
+    fake = FakeStreamlit()
+    dashboard._render_sell_plan_page(
+        fake,
+        {
+            "sell_plan": {"status": "OLD"},
+            "sell_plan_rows": SimpleTable([], []),
+            "lifecycle": {},
+            "trade_review": {},
+        },
+        "zh",
+        mode="live",
+    )
+
+    assert calls == [("sell_plan_live", "zh")]
+    assert fake.session_state["last_action_feedback"]["message"] == "refreshed"
+    assert fake.session_state["sell_plan_state_override"]["sell_plan"]["status"] == "SELL_PLAN_READY"
+    assert any("刷新后的实时提醒" in text for text, _ in fake.markdowns)
+
+
 def test_key_value_rows_render_as_summary_cards_not_table():
     from overnight_quant.ui.dashboard import render_key_value_rows
 
