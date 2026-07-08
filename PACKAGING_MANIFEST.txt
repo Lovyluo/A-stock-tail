@@ -1,0 +1,7 @@
+﻿a-stock-data deployment package
+Created: 2026-07-03 Asia/Shanghai
+
+Included: source code, config, tests, docs, examples/historical data, deployment docs.
+Excluded: .git, pytest/python caches, generated markdown reports, records, backtest outputs, remote API caches.
+
+Start here: DEPLOY.md

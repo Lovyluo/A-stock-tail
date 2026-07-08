@@ -1,0 +1,3 @@
+order_id,ticket_id,strategy_name,trade_date,trade_time,code,name,side,price,qty,amount,max_acceptable_price,stop_loss_price,source_ticket_path,recorded_at,status,notes
+2026-05-23_300001_BUY_20260523145200,2026-05-23_300001,yang_yongxing_overnight_v1,2026-05-23,2026-05-23 14:52:00,300001,Demo Robotics,BUY,18.5,200,3700.0,18.78,17.95,overnight_quant\examples\reports\manual_order_ticket_2026-05-23_300001.md,2026-05-26T15:14:57,FILLED,
+2026-05-23_300001_SELL_20260524094500,2026-05-23_300001,yang_yongxing_overnight_v1,2026-05-24,2026-05-24 09:45:00,300001,Demo Robotics,SELL,19.02,200,3804.0,18.78,17.95,overnight_quant\examples\reports\manual_order_ticket_2026-05-23_300001.md,2026-05-26T15:15:16,FILLED,below_stop_loss=false

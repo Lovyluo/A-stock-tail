@@ -1,0 +1,25 @@
+dataset: sample_exact
+selection_as_of: "14:50"
+benchmark: "CSI 300"
+data_fidelity: sample_exact
+purpose: "Deterministic engine and event-order validation only; not evidence of strategy profitability."
+historical_true_fields:
+  - trade_date
+  - code
+  - open
+  - high
+  - low
+  - close
+  - volume
+  - amount
+  - limit_up
+  - limit_down
+simulated_or_fixture_fields:
+  - tail_pullback_pct
+  - range_position
+  - theme_tags
+  - main_net
+intentional_unavailable_fields:
+  - theme_tags
+  - main_net
+  - big_order_net

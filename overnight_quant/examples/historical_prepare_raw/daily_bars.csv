@@ -1,0 +1,8 @@
+trade_date,code,name,open,high,low,close,volume,amount,turnover_pct,float_mcap_yi,limit_up,limit_down,is_st,is_suspended,list_date,is_limit_down
+2025-01-02,300201,Prepared Sample,9.40,9.60,9.30,9.50,1000000,200000000,7.00,100,10.45,8.55,false,false,2020-01-01,false
+2025-01-03,300201,Prepared Sample,9.50,9.70,9.40,9.60,1000000,200000000,7.00,100,10.56,8.64,false,false,2020-01-01,false
+2025-01-06,300201,Prepared Sample,9.60,9.80,9.50,9.70,1000000,200000000,7.00,100,10.67,8.73,false,false,2020-01-01,false
+2025-01-07,300201,Prepared Sample,9.70,9.90,9.60,9.80,1000000,200000000,7.00,100,10.78,8.82,false,false,2020-01-01,false
+2025-01-08,300201,Prepared Sample,9.80,10.00,9.70,9.90,1000000,200000000,7.00,100,10.89,8.91,false,false,2020-01-01,false
+2025-01-09,300201,Prepared Sample,9.90,10.30,9.90,10.20,1800000,300000000,8.00,100,11.22,9.18,false,false,2020-01-01,false
+2025-01-10,300201,Prepared Sample,10.20,10.60,10.10,10.50,1900000,320000000,8.00,100,11.55,9.45,false,false,2020-01-01,false

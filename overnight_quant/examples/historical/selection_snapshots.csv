@@ -1,0 +1,8 @@
+selection_date,selection_as_of,code,name,price,open,high,low,change_pct,vol_ratio,turnover_pct,amount_wan,float_mcap_yi,limit_up,limit_down,is_st,is_suspended,is_new_stock,is_limit_up,is_bj,listed_days,tail_pullback_pct,upper_shadow_ratio,range_position,theme_tags,theme_rank,same_theme_strong_count,big_order_net,main_net,next_day_high
+2026-04-01,14:50,300101,Sample Profit,10.00,9.70,10.10,9.65,4.20,1.60,8.00,30000,100,11.00,9.00,false,false,false,false,false,1000,0.30,0.18,0.84,Robotics|AI,1,5,1800,3200,999.00
+2026-04-02,14:50,300150,Sample Market Fail,13.00,12.60,13.10,12.50,4.00,1.50,8.00,30000,100,14.30,11.70,false,false,false,false,false,1000,0.20,0.15,0.82,AI,1,4,1500,2500,
+2026-04-03,14:50,600102,Sample Stop,20.00,19.30,20.10,19.20,4.50,1.55,7.80,32000,120,22.00,18.00,false,false,false,false,false,1200,0.40,0.16,0.80,Semiconductors,2,4,1300,2700,
+2026-04-06,14:50,002102,Sample Limit Up,15.00,14.40,15.00,14.35,5.00,1.80,7.20,35000,90,15.00,12.30,false,false,false,true,false,900,0.00,0.00,1.00,AI,2,4,2100,3600,
+2026-04-07,14:50,300103,Sample Both Hit,30.00,29.10,30.20,28.90,4.60,1.70,8.50,38000,130,33.00,27.00,false,false,false,false,false,800,0.20,0.12,0.86,Robotics,1,5,1900,3300,
+2026-04-08,14:50,300105,Sample Missing Optional,16.00,15.40,16.15,15.30,4.10,1.35,7.00,22000,80,17.60,14.40,false,false,false,false,false,700,0.30,0.20,0.80,,,,,
+2026-04-09,14:50,600104,Sample Limit Down Risk,12.00,11.55,12.10,11.45,4.35,1.45,7.30,26000,95,13.20,10.80,false,false,false,false,false,1600,0.30,0.15,0.84,Power Equipment,3,3,1200,2400,

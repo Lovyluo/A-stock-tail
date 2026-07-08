@@ -1,0 +1,83 @@
+strategy:
+  name: yang_yongxing_overnight_v1
+  mode: conservative
+  min_total_score: 75
+  final_pick_count: 1
+scan:
+  default_mode: demo
+  max_candidates: 100
+after_close:
+  max_a_count: 5
+  max_b_count: 10
+  max_c_count: 10
+  min_a_score: 80
+  min_b_score: 70
+  min_c_score: 60
+intraday:
+  max_candidates: 20
+  min_signal_score_a: 82
+  min_signal_score_b: 68
+  min_price_above_vwap_pct: 0.2
+  max_price_above_vwap_pct: 3.8
+  vwap_pullback_tolerance_pct: 0.45
+  vwap_confirm_pct: 0.25
+  volume_expansion_ratio: 1.15
+  max_open_gap_pct: 6.5
+  max_intraday_change_pct: 8.5
+  min_limit_up_gap_pct: 1.2
+  min_range_position: 0.52
+filters:
+  allowed_code_prefixes:
+    - "00"
+    - "60"
+  enforce_allowed_code_prefixes: false
+  min_change_pct: 3
+  max_change_pct: 7
+  min_vol_ratio: 1
+  min_turnover_pct: 5
+  max_turnover_pct: 18
+  min_amount_wan: 15000
+  min_float_mcap_yi: 30
+  max_float_mcap_yi: 250
+  min_price: 3
+  max_price: 80
+  max_tail_pullback_pct: 3.5
+trend:
+  max_5d_gain_pct: 30
+  max_10d_gain_pct: 45
+  max_upper_shadow_ratio: 0.45
+risk:
+  max_position_ratio_per_stock: 0.2
+  max_order_value: 5000
+  max_daily_trades: 2
+  hard_stop_loss_pct: -3
+  disaster_stop_loss_pct: -5
+  no_trade_if_market_fail: true
+sell:
+  take_profit_pct_1: 3
+  take_profit_pct_2: 6
+  stop_loss_pct: -3
+  force_exit_before: "10:30"
+  allow_hold_if_limit_up: true
+cost:
+  commission_rate: 0.0003
+  min_commission: 5
+  stamp_tax_rate: 0.0005
+  slippage_pct: 0.0
+backtest:
+  initial_capital: 100000
+  output_dir: overnight_quant/backtest_outputs
+  sample_data_dir: overnight_quant/examples/historical
+  local_data_dir: overnight_quant/backtest_data/processed
+  raw_data_dir: overnight_quant/backtest_data/raw
+  manifest_dir: overnight_quant/backtest_data/manifests
+  historical_cache_dir: overnight_quant/backtest_data/cache/a_stock_data
+  astock_default_max_codes: 10
+  astock_min_sleep_seconds: 0.2
+  preparation_sample_dir: overnight_quant/examples/historical_prepare_raw
+  preparation_positive_sample_dir: overnight_quant/examples/historical_prepare_positive_raw
+  intraday_assumption: conservative
+paths:
+  records_dir: overnight_quant/records
+  reports_dir: overnight_quant/reports
+  examples_dir: overnight_quant/examples

@@ -1,0 +1,8 @@
+raw/*
+!raw/.gitignore
+processed/*
+!processed/.gitignore
+manifests/*
+!manifests/.gitignore
+cache/*
+!cache/.gitignore

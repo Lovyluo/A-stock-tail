@@ -1,0 +1,8 @@
+PyYAML>=6.0
+pytest>=8.0
+streamlit>=1.30
+pandas>=2.0
+requests>=2.31
+easyquotation>=0.7
+mootdx>=0.10
+stockstats>=0.6
