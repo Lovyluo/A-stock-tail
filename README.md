@@ -1,11 +1,17 @@
 # A-stock-tail
 
+[![CI](https://github.com/Lovyluo/A-stock-tail/actions/workflows/ci.yml/badge.svg)](https://github.com/Lovyluo/A-stock-tail/actions/workflows/ci.yml)
+
+Repository: https://github.com/Lovyluo/A-stock-tail
+
 A-stock-tail is a personal A-share research workspace built around two pieces:
 
 1. **Data Skill**: `SKILL.md` provides the A-share data-source capability.
 2. **Overnight Quant Dashboard**: `overnight_quant/` is an example application for after-close, pre-market, intraday, and sell-plan observation workflows.
 
 The project is designed for manual research, observation, and review. It does **not** place orders automatically, does **not** click brokerage software, and does **not** call any brokerage trading API.
+
+Read the risk boundary before using the project: [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Project Narrative
 
@@ -61,6 +67,22 @@ Dashboard default URL:
 http://localhost:8501/
 ```
 
+## Verification
+
+Run the full local test suite before changing or releasing the project:
+
+```powershell
+D:\A-stock\.venv\Scripts\python.exe -m pytest overnight_quant/tests -q
+```
+
+Expected result for v0.1.1 hardening:
+
+```text
+326 passed
+```
+
+GitHub Actions runs the same test command on Windows with Python 3.12.
+
 ## Common Commands
 
 ```powershell
@@ -105,4 +127,3 @@ The data Skill content is derived from:
 - License: Apache License 2.0
 
 See `NOTICE.md` and `LICENSE` for attribution and license details. This repository should not present the upstream data Skill work as fully original.
-
