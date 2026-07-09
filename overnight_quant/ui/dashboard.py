@@ -12,6 +12,7 @@ from overnight_quant.ui.result_parser import (
     SimpleTable,
     find_latest_file,
     parse_after_close_report,
+    parse_after_close_chip_volume_table,
     parse_after_close_risk_table,
     parse_dry_run_report,
     parse_intraday_report,
@@ -224,6 +225,16 @@ TABLE_COLUMN_LABELS = {
         "fund_context": "多日资金",
         "today_main_fund": "当日主力",
         "volume_context": "量价趋势",
+        "chip_peak_type": "筹码峰型",
+        "chip_avg_cost_20d": "20日成本proxy",
+        "chip_avg_cost_60d": "60日成本proxy",
+        "current_vs_chip_cost_pct": "偏离成本%",
+        "overhead_pressure_ratio": "上方压力",
+        "downside_support_ratio": "下方支撑",
+        "main_force_chip_proxy": "主力proxy",
+        "volume_signal": "量能信号",
+        "confidence_delta": "置信度变化",
+        "chip_volume_reasons": "筹码/量价理由",
         "level": "级别",
     },
     "en": {},
@@ -296,6 +307,22 @@ VALUE_LABELS_ZH = {
     "NaN": "无",
 }
 
+CHIP_PEAK_LABELS_ZH = {
+    "accumulation": "建仓峰",
+    "washout": "洗盘峰",
+    "markup": "拉升峰",
+    "distribution": "出货峰",
+    "neutral": "中性",
+}
+
+VOLUME_SIGNAL_LABELS_ZH = {
+    "today_confirmed": "当日放量确认",
+    "prev_high_volume": "前日高量待确认",
+    "weak_volume": "量能未确认",
+    "volume_data_missing": "量能数据缺失",
+    "chip_volume_disabled": "未启用",
+}
+
 SIDE_LABELS_ZH = {
     "BUY": "买入 / 加仓",
     "SELL": "卖出 / 减仓",
@@ -310,6 +337,24 @@ POSITION_STATUS_LABELS_ZH = {
 }
 
 REASON_LABELS_ZH = {
+    "prev_day_high_volume": "前一交易日阶段高量",
+    "today_volume_confirm": "当日放量确认",
+    "volume_not_confirmed": "成交量未确认",
+    "chip_peak_accumulation": "筹码proxy接近建仓峰",
+    "chip_peak_washout": "筹码proxy接近洗盘峰",
+    "chip_peak_markup": "筹码proxy接近拉升峰",
+    "chip_peak_distribution": "筹码proxy接近出货峰",
+    "chip_peak_neutral": "筹码proxy中性",
+    "overhead_pressure_high": "上方压力偏高",
+    "downside_support_visible": "下方支撑可见",
+    "main_force_chip_proxy_positive": "主力proxy偏正",
+    "main_force_chip_proxy_negative": "主力proxy偏负",
+    "main_force_chip_proxy_neutral": "主力proxy中性",
+    "main_force_from_candidate_fields": "使用候选行资金字段估算",
+    "main_force_from_fund_flow": "使用资金流估算",
+    "main_force_proxy_missing": "主力proxy缺失",
+    "chip_history_short": "历史窗口不足",
+    "chip_volume_data_missing": "筹码/量价数据缺失",
     "price_ok": "价格在策略范围内",
     "price_below_min": "价格低于下限",
     "price_above_max": "价格高于上限",
@@ -980,6 +1025,10 @@ def localize_table_value(field: str, value: Any, language: str) -> Any:
         return POSITION_STATUS_LABELS_ZH.get(str(value).upper(), str(value))
     if field_name in {"decision", "final_advice"}:
         return DECISION_LABELS_ZH.get(str(value), str(value))
+    if field_name == "chip_peak_type":
+        return CHIP_PEAK_LABELS_ZH.get(str(value), str(value))
+    if field_name == "volume_signal":
+        return VOLUME_SIGNAL_LABELS_ZH.get(str(value), str(value))
     if field_name in {"estimated_capital_flow", "is_trade_day", "fallback_to_demo", "valid_for_trading_observation"}:
         return VALUE_LABELS_ZH.get(str(value), str(value))
     if field_name in {
@@ -992,6 +1041,7 @@ def localize_table_value(field: str, value: Any, language: str) -> Any:
         "positive_reasons",
         "info_gap_reasons",
         "missing_reasons",
+        "chip_volume_reasons",
         "market_reasons",
         "market_reject_reasons",
     }:
@@ -1620,7 +1670,13 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
         "morning_replay": parse_after_close_report(replay_path or reports / "morning_replay_missing.md"),
         "watchlist": parse_watchlist_csv(watchlist_path or records / "next_morning_watchlist_missing.csv"),
         "after_close_risk_rows": parse_after_close_risk_table(after_close_path or reports / "after_close_missing.md"),
+        "after_close_chip_volume_rows": parse_after_close_chip_volume_table(
+            after_close_path or reports / "after_close_missing.md"
+        ),
         "morning_replay_risk_rows": parse_after_close_risk_table(replay_path or reports / "morning_replay_missing.md"),
+        "morning_replay_chip_volume_rows": parse_after_close_chip_volume_table(
+            replay_path or reports / "morning_replay_missing.md"
+        ),
         "morning_replay_watchlist": parse_watchlist_csv(
             replay_watchlist_path or records / "morning_replay_watchlist_missing.csv"
         ),
@@ -1862,6 +1918,8 @@ def main() -> None:
                 else "No A/B formal observation rows today; C-class rows below are risk review / do-not-chase notes."
             )
         render_table_or_empty(st, state["watchlist"], language, t(language, "empty_table"))
+        st.markdown("#### 筹码与量价确认" if language == "zh" else "#### Chip / Volume Confirmation")
+        render_table_or_empty(st, state["after_close_chip_volume_rows"], language, t(language, "empty_table"))
         st.markdown("#### C 类风险观察 / 不建议追" if language == "zh" else "#### C Class Risk Observation / Do Not Chase")
         render_table_or_empty(st, state["after_close_risk_rows"], language, t(language, "empty_table"))
     with tabs[5]:
@@ -1876,6 +1934,8 @@ def main() -> None:
                 else "Replay has no A/B formal observation rows; C-class rows below are risk review / do-not-chase notes."
             )
         render_table_or_empty(st, state["morning_replay_watchlist"], language, t(language, "empty_table"))
+        st.markdown("#### 筹码与量价确认" if language == "zh" else "#### Chip / Volume Confirmation")
+        render_table_or_empty(st, state["morning_replay_chip_volume_rows"], language, t(language, "empty_table"))
         st.markdown("#### C 类风险观察 / 不建议追" if language == "zh" else "#### C Class Risk Observation / Do Not Chase")
         render_table_or_empty(st, state["morning_replay_risk_rows"], language, t(language, "empty_table"))
     with tabs[6]:

@@ -94,6 +94,16 @@ def parse_after_close_risk_table(path: Path):
     )
 
 
+def parse_after_close_chip_volume_table(path: Path):
+    return _parse_markdown_table_sections(
+        Path(path),
+        [
+            "筹码与量价确认",
+            "Chip Volume Confirmation",
+        ],
+    )
+
+
 def parse_watchlist_csv(path: Path):
     return _read_csv_table(Path(path))
 

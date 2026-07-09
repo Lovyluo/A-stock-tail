@@ -19,6 +19,7 @@ This repository packages a data Skill together with an overnight observation exa
 
 - `SKILL.md`: A-share data capability source, adapted from the upstream `a-stock-data` project.
 - `overnight_quant/`: Example app and scripts for watchlists, scans, backtests, dashboard views, position updates, and manual sell-plan reminders.
+- `overnight_quant/strategy/chip_volume.py`: Chip and volume confidence proxy indicators for observation reports. These are not real holder-cost data and are not trading advice.
 - `docs/`, `DEPLOY.md`, and `overnight_quant_实盘使用手册.md`: Operational notes for local deployment and manual use.
 - `a-stock-data/`: Local upstream clone only. It is ignored by Git and is not part of the final `A-stock-tail` GitHub repository.
 
@@ -75,10 +76,10 @@ Run the full local test suite before changing or releasing the project:
 D:\A-stock\.venv\Scripts\python.exe -m pytest overnight_quant/tests -q
 ```
 
-Expected result for v0.1.1 hardening:
+Expected result after the chip/volume proxy module:
 
 ```text
-326 passed
+337 passed
 ```
 
 GitHub Actions runs the same test command on Windows with Python 3.12.

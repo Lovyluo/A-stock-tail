@@ -23,6 +23,16 @@ WATCHLIST_FIELDS = [
     "main_net",
     "main_net_source",
     "estimated_capital_flow",
+    "chip_peak_type",
+    "chip_avg_cost_20d",
+    "chip_avg_cost_60d",
+    "current_vs_chip_cost_pct",
+    "overhead_pressure_ratio",
+    "downside_support_ratio",
+    "main_force_chip_proxy",
+    "volume_signal",
+    "confidence_delta",
+    "chip_volume_reasons",
     "reason",
     "positive_reasons",
     "info_gap_reasons",
@@ -150,17 +160,18 @@ def write_after_close_report(result: dict, reports_dir: str) -> str:
     _add_category_section(lines, result, "A", "## 3. A类重点观察")
     _add_category_section(lines, result, "B", "## 4. B类备选观察")
     _add_category_section(lines, result, "C", "## 5. C类风险观察 / 不建议追")
+    _add_chip_volume_section(lines, result)
     lines.extend(
         [
             "",
-            "## 6. 次日早盘总策略",
+            "## 7. 次日早盘总策略",
             "",
             "- 指数若高开偏强，仅继续观察仍满足条件的个股。",
             "- 指数若明显偏弱，应缩小观察范围，优先取消失守昨收的个股。",
             "- 题材若出现明显分歧，不要依赖孤立个股强势。",
             "- 对高开过多或快速拉升但缺少承接的个股，不追高。",
             "",
-            "## 7. 数据质量",
+            "## 8. 数据质量",
             "",
             f"- fallback_status: {'YES' if result.get('quality', {}).get('fallback_to_demo') else 'NO'}",
         ]
@@ -201,12 +212,21 @@ def _add_category_section(lines: list[str], result: dict, category: str, title: 
             lines.append("- 无。")
         return
     if category == "C":
-        lines.extend(["| 代码 | 名称 | 评分 | 题材状态 | 风险原因 | 失效条件 |", "|---|---|---:|---|---|---|"])
+        lines.extend(
+            [
+                "| 代码 | 名称 | 评分 | 题材状态 | 峰型 proxy | 20日成本 proxy | 偏离成本% | 量能信号 | 置信度变化 | 风险原因 | 失效条件 |",
+                "|---|---|---:|---|---|---:|---:|---|---:|---|---|",
+            ]
+        )
         for row in rows:
             risk_copy = _join_reason_copy(row.get("missing_reasons", ""), row.get("risk_reasons", ""))
             lines.append(
                 f"| {row['code']} | {_escape(row['name'])} | {row['score']} | "
-                f"{_escape(_theme_state_copy(row.get('theme_market_state', '')))} | {_escape(risk_copy)} | {_escape(row['invalid_conditions'])} |"
+                f"{_escape(_theme_state_copy(row.get('theme_market_state', '')))} | "
+                f"{_escape(_chip_peak_label(row.get('chip_peak_type', 'neutral')))} | "
+                f"{_fmt(row.get('chip_avg_cost_20d'))} | {_fmt(row.get('current_vs_chip_cost_pct'))} | "
+                f"{_escape(_volume_signal_label(row.get('volume_signal', '')))} | {_fmt(row.get('confidence_delta'), digits=0)} | "
+                f"{_escape(risk_copy)} | {_escape(row['invalid_conditions'])} |"
             )
         return
     lines.extend(
@@ -221,6 +241,32 @@ def _add_category_section(lines: list[str], result: dict, category: str, title: 
             f"| {row['code']} | {_escape(row['name'])} | {row['score']} | "
             f"{_escape('|'.join(row.get('theme_tags') or []))} | {_escape(_theme_state_copy(row.get('theme_market_state', '')))} | {_escape(reason_copy)} | "
             f"{_escape(row['tomorrow_watch_plan'])} | {_escape(row['invalid_conditions'])} |"
+        )
+
+
+def _add_chip_volume_section(lines: list[str], result: dict) -> None:
+    lines.extend(["", "## 6. 筹码与量价确认", ""])
+    rows = [
+        row
+        for category in ("A", "B", "C")
+        for row in result.get("categories", {}).get(category, [])
+    ]
+    if not rows:
+        lines.append("- 暂无可展示的筹码/量价 proxy。")
+        return
+    lines.extend(
+        [
+            "| 代码 | 名称 | 分类 | 峰型 proxy | 20日成本 proxy | 偏离成本% | 量能信号 | 置信度变化 | 说明 |",
+            "|---|---|---|---|---:|---:|---|---:|---|",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {row.get('category', '')} | "
+            f"{_escape(_chip_peak_label(row.get('chip_peak_type', 'neutral')))} | "
+            f"{_fmt(row.get('chip_avg_cost_20d'))} | {_fmt(row.get('current_vs_chip_cost_pct'))} | "
+            f"{_escape(_volume_signal_label(row.get('volume_signal', '')))} | {_fmt(row.get('confidence_delta'), digits=0)} | "
+            f"{_escape(_chip_reason_copy(row))} |"
         )
 
 
@@ -251,6 +297,62 @@ def _csv_row(row: dict, result: dict) -> dict:
 
 def _join_reason_copy(*values: str) -> str:
     return "；".join(str(value) for value in values if value)
+
+
+def _chip_reason_copy(row: dict) -> str:
+    reasons = str(row.get("chip_volume_reasons") or "")
+    if not reasons:
+        return "无明确筹码/量价确认"
+    labels = {
+        "prev_day_high_volume": "前一日高量",
+        "today_volume_confirm": "当日放量确认",
+        "volume_not_confirmed": "量能未确认",
+        "chip_peak_accumulation": "建仓峰 proxy",
+        "chip_peak_washout": "洗盘峰 proxy",
+        "chip_peak_markup": "拉升峰 proxy",
+        "chip_peak_distribution": "出货峰 proxy",
+        "chip_peak_neutral": "中性 proxy",
+        "chip_volume_data_missing": "筹码/量价数据缺失",
+        "overhead_pressure_high": "上方压力偏高",
+        "downside_support_visible": "下方支撑可见",
+        "main_force_chip_proxy_positive": "主力 proxy 偏正",
+        "main_force_chip_proxy_negative": "主力 proxy 偏负",
+        "main_force_chip_proxy_neutral": "主力 proxy 中性",
+        "main_force_from_candidate_fields": "使用候选行资金字段估算",
+        "main_force_from_fund_flow": "使用资金流估算",
+        "main_force_proxy_missing": "主力 proxy 缺失",
+        "chip_history_short": "历史窗口不足",
+    }
+    tokens = [token.strip() for token in reasons.replace(";", "|").split("|") if token.strip()]
+    return "；".join(labels.get(token, token.replace("_", " ")) for token in tokens[:6])
+
+
+def _chip_peak_label(value: object) -> str:
+    return {
+        "accumulation": "建仓峰",
+        "washout": "洗盘峰",
+        "markup": "拉升峰",
+        "distribution": "出货峰",
+        "neutral": "中性",
+    }.get(str(value), str(value))
+
+
+def _volume_signal_label(value: object) -> str:
+    return {
+        "today_confirmed": "当日放量确认",
+        "prev_high_volume": "前日高量待确认",
+        "weak_volume": "量能未确认",
+        "volume_data_missing": "量能数据缺失",
+        "chip_volume_disabled": "未启用",
+    }.get(str(value), str(value))
+
+
+def _fmt(value: object, digits: int = 3) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:.{digits}f}"
 
 
 def _theme_state_copy(value: str) -> str:

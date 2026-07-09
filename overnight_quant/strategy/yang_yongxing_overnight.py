@@ -7,6 +7,7 @@ from pathlib import Path
 from overnight_quant.execution.manual_ticket import append_signal_csv, build_manual_ticket, save_manual_ticket
 from overnight_quant.reports.scan_reports import write_scan_summary
 from overnight_quant.risk.risk_manager import RiskManager
+from overnight_quant.strategy.chip_volume import build_chip_volume_confidence
 from overnight_quant.strategy.filters import evaluate_market_gate, evaluate_tail_stability, initial_filter
 from overnight_quant.strategy.scoring import rank_scored, score_stock
 
@@ -15,6 +16,16 @@ DEFAULT_CONFIG = {
     "strategy": {"name": "yang_yongxing_overnight_v1", "mode": "conservative", "min_total_score": 75, "final_pick_count": 1},
     "scan": {"default_mode": "demo", "max_candidates": 100},
     "after_close": {"max_a_count": 5, "max_b_count": 10, "max_c_count": 10, "min_a_score": 80, "min_b_score": 70, "min_c_score": 60},
+    "chip_volume": {
+        "enabled": True,
+        "profile_lookback_days": 60,
+        "avg_cost_windows": [20, 60],
+        "bucket_pct": 1.0,
+        "high_volume_prev_days": 3,
+        "volume_confirm_ratio": 1.2,
+        "max_confidence_bonus": 8,
+        "max_confidence_penalty": -10,
+    },
     "filters": {
         "allowed_code_prefixes": ["00", "60"],
         "enforce_allowed_code_prefixes": False,
@@ -112,6 +123,16 @@ class YangYongxingOvernightStrategy:
             tail = evaluate_tail_stability(stock, scan_config)
             kline = self.client.get_daily_kline(stock.get("code", "")) if initial["pass"] and tail["pass"] else []
             scored = score_stock(stock, kline, market_score, scan_config)
+            if scan_config.get("chip_volume", {}).get("enabled", True):
+                chip_volume = build_chip_volume_confidence(
+                    {**scored, "_chip_volume_config": scan_config.get("chip_volume", {})},
+                    kline,
+                )
+                _apply_chip_volume_fields(
+                    scored,
+                    chip_volume,
+                    min_score=float(scan_config.get("strategy", {}).get("min_total_score", 75)),
+                )
             kline_freshness_reasons = (
                 self.client.get_kline_freshness_reasons(stock.get("code", ""))
                 if hasattr(self.client, "get_kline_freshness_reasons")
@@ -242,6 +263,28 @@ def _apply_live_session_gate(market_gate: dict, market: dict) -> None:
     for key in ("trade_date", "run_time", "session_state", "is_trade_day"):
         if key in market:
             market_gate[key] = market[key]
+
+
+def _apply_chip_volume_fields(stock: dict, chip_volume: dict, min_score: float = 75.0) -> None:
+    stock["chip_volume"] = chip_volume
+    stock["chip_peak_type"] = chip_volume.get("peak_type", "neutral")
+    stock["chip_avg_cost_20d"] = chip_volume.get("chip_avg_cost_20d", 0.0)
+    stock["chip_avg_cost_60d"] = chip_volume.get("chip_avg_cost_60d", 0.0)
+    stock["current_vs_chip_cost_pct"] = chip_volume.get("current_vs_chip_cost_pct", 0.0)
+    stock["overhead_pressure_ratio"] = chip_volume.get("overhead_pressure_ratio", 0.0)
+    stock["downside_support_ratio"] = chip_volume.get("downside_support_ratio", 0.0)
+    stock["main_force_chip_proxy"] = chip_volume.get("main_force_chip_proxy", 0.0)
+    stock["volume_signal"] = chip_volume.get("volume_signal", "")
+    stock["confidence_delta"] = chip_volume.get("confidence_delta", 0)
+    reasons = [str(reason) for reason in chip_volume.get("reasons", [])]
+    stock["chip_volume_reasons"] = "|".join(reasons)
+    stock["score_reasons"] = list(dict.fromkeys(list(stock.get("score_reasons") or []) + reasons))
+    base_score = float(stock.get("total_score", stock.get("score", 0)) or 0)
+    adjusted = max(0.0, min(100.0, base_score + float(chip_volume.get("confidence_delta", 0) or 0)))
+    stock["total_score"] = round(adjusted, 2)
+    if "score" in stock:
+        stock["score"] = round(adjusted, 2)
+    stock["decision"] = "BUY_CANDIDATE" if adjusted >= min_score and not stock.get("risk_flags") else "REJECT"
 
 
 def _candidate_observation_context(client, market_gate: dict, scored_rows: list[dict]) -> dict:

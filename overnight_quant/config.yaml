@@ -26,6 +26,17 @@ intraday:
   max_intraday_change_pct: 8.5
   min_limit_up_gap_pct: 1.2
   min_range_position: 0.52
+chip_volume:
+  enabled: true
+  profile_lookback_days: 60
+  avg_cost_windows:
+    - 20
+    - 60
+  bucket_pct: 1.0
+  high_volume_prev_days: 3
+  volume_confirm_ratio: 1.2
+  max_confidence_bonus: 8
+  max_confidence_penalty: -10
 filters:
   allowed_code_prefixes:
     - "00"
