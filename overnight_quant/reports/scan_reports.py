@@ -99,8 +99,13 @@ def write_scan_summary(result: dict, reports_dir: str, trade_date: str, dry_run:
             lines.append(
                 f"- {stock.get('code', '')} {stock.get('name', '')}: score={stock.get('total_score', '')}, "
                 f"price={stock.get('price', '')}, estimated_capital_flow={estimated}, "
-                f"capital_score_source={stock.get('capital_score_source', '')}"
+                f"capital_score_source={stock.get('capital_score_source', '')}, "
+                f"chip_peak_type={stock.get('chip_peak_type', '')}, volume_signal={stock.get('volume_signal', '')}, "
+                f"confidence_delta={stock.get('confidence_delta', '')}"
             )
+            chip_copy = _chip_volume_reason_copy(stock)
+            if chip_copy:
+                lines.append(f"  - chip_volume_reasons: {chip_copy}")
             if stock.get("estimated_capital_flow"):
                 lines.append("  - 资金项为估算，仅用于辅助评分。")
     else:
@@ -112,7 +117,21 @@ def write_scan_summary(result: dict, reports_dir: str, trade_date: str, dry_run:
             reasons = ", ".join(_stock_rejection_reasons(stock))
             lines.append(
                 f"- {stock.get('code', '')} {stock.get('name', '')}: "
-                f"score={stock.get('total_score', '')}, reason={reasons}; watch only, do not chase."
+                f"score={stock.get('total_score', '')}, reason={reasons}, "
+                f"chip_peak_type={stock.get('chip_peak_type', '')}, volume_signal={stock.get('volume_signal', '')}, "
+                f"confidence_delta={stock.get('confidence_delta', '')}; watch only, do not chase."
+            )
+            chip_copy = _chip_volume_reason_copy(stock)
+            if chip_copy:
+                lines.append(f"  - chip_volume_reasons: {chip_copy}")
+    if dry_run and result.get("rejected"):
+        lines.extend(["", "## Rejected Chip/Volume Context", ""])
+        for stock in (result.get("rejected") or [])[:10]:
+            lines.append(
+                f"- {stock.get('code', '')} {stock.get('name', '')}: "
+                f"score={stock.get('total_score', '')}, chip_peak_type={stock.get('chip_peak_type', '')}, "
+                f"volume_signal={stock.get('volume_signal', '')}, confidence_delta={stock.get('confidence_delta', '')}, "
+                f"chip_volume_reasons={_chip_volume_reason_copy(stock) or 'None'}"
             )
     if absence_reasons:
         lines.extend(["", "## Buy Ticket Not Generated Reasons", ""])
@@ -187,3 +206,12 @@ def _stock_rejection_reasons(stock: dict) -> list[str]:
 
 def _format_inline_reasons(reasons: list[str]) -> str:
     return "; ".join(reasons) if reasons else "None"
+
+
+def _chip_volume_reason_copy(stock: dict) -> str:
+    reasons = stock.get("chip_volume_reasons") or ""
+    if isinstance(reasons, list):
+        tokens = [str(item) for item in reasons]
+    else:
+        tokens = [token.strip() for token in str(reasons).replace(";", "|").split("|") if token.strip()]
+    return "; ".join(tokens[:8])

@@ -83,6 +83,12 @@ def append_signal_csv(rows: list[dict], records_dir: str, file_name: str = "sign
         "main_net_source",
         "capital_score_source",
         "estimated_capital_flow",
+        "chip_peak_type",
+        "chip_avg_cost_20d",
+        "current_vs_chip_cost_pct",
+        "volume_signal",
+        "confidence_delta",
+        "chip_volume_reasons",
         "reasons",
     ]
     with file_path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -107,6 +113,12 @@ def append_signal_csv(rows: list[dict], records_dir: str, file_name: str = "sign
                     "main_net_source": row.get("main_net_source", ""),
                     "capital_score_source": row.get("capital_score_source", ""),
                     "estimated_capital_flow": row.get("estimated_capital_flow", ""),
+                    "chip_peak_type": row.get("chip_peak_type", ""),
+                    "chip_avg_cost_20d": row.get("chip_avg_cost_20d", ""),
+                    "current_vs_chip_cost_pct": row.get("current_vs_chip_cost_pct", ""),
+                    "volume_signal": row.get("volume_signal", ""),
+                    "confidence_delta": row.get("confidence_delta", ""),
+                    "chip_volume_reasons": row.get("chip_volume_reasons", ""),
                     "reasons": "|".join(row.get("all_reasons") or row.get("score_reasons") or []),
                 }
             )

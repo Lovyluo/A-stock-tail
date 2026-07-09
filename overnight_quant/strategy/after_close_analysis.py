@@ -15,6 +15,7 @@ from overnight_quant.data.market_calendar import (
     is_likely_cn_trade_day,
     previous_likely_cn_trade_day,
 )
+from overnight_quant.strategy.chip_volume import build_chip_volume_confidence
 
 
 DEFAULT_AFTER_CLOSE_CONFIG = {
@@ -25,6 +26,16 @@ DEFAULT_AFTER_CLOSE_CONFIG = {
         "min_a_score": 80,
         "min_b_score": 70,
         "min_c_score": 60,
+    },
+    "chip_volume": {
+        "enabled": True,
+        "profile_lookback_days": 60,
+        "avg_cost_windows": [20, 60],
+        "bucket_pct": 1.0,
+        "high_volume_prev_days": 3,
+        "volume_confirm_ratio": 1.2,
+        "max_confidence_bonus": 8,
+        "max_confidence_penalty": -10,
     },
     "filters": {
         "min_price": 3,
@@ -92,6 +103,24 @@ USER_REASON_LABELS = {
     "amount_below_min": "成交额低于观察门槛",
     "turnover_below_min": "换手率低于观察门槛",
     "vol_ratio_below_min": "量比低于观察门槛",
+    "prev_day_high_volume": "前一交易日出现阶段高量",
+    "today_volume_confirm": "当日成交量确认",
+    "volume_not_confirmed": "成交量未确认",
+    "chip_peak_accumulation": "筹码 proxy 接近建仓峰",
+    "chip_peak_washout": "筹码 proxy 接近洗盘峰",
+    "chip_peak_markup": "筹码 proxy 接近拉升峰",
+    "chip_peak_distribution": "筹码 proxy 接近出货峰",
+    "chip_peak_neutral": "筹码 proxy 暂无清晰峰型",
+    "overhead_pressure_high": "上方筹码 proxy 压力偏高",
+    "downside_support_visible": "下方筹码 proxy 支撑可见",
+    "main_force_chip_proxy_positive": "主力资金 proxy 偏正",
+    "main_force_chip_proxy_negative": "主力资金 proxy 偏负",
+    "main_force_chip_proxy_neutral": "主力资金 proxy 中性",
+    "main_force_from_candidate_fields": "使用候选行资金字段估算主力 proxy",
+    "main_force_from_fund_flow": "使用资金流行估算主力 proxy",
+    "main_force_proxy_missing": "主力资金 proxy 缺失",
+    "chip_history_short": "筹码 proxy 历史窗口不足",
+    "chip_volume_data_missing": "筹码/量价数据缺失",
 }
 
 MISSING_REASON_KEYS = {
@@ -100,6 +129,9 @@ MISSING_REASON_KEYS = {
     "capital_estimated_only",
     "freshness_risk",
     "safety_unknown",
+    "chip_volume_data_missing",
+    "main_force_proxy_missing",
+    "chip_history_short",
 }
 
 INFO_GAP_REASON_KEYS = {
@@ -126,6 +158,8 @@ RISK_REASON_KEYS = {
     "vol_ratio_below_min",
     "theme_one_day_risk",
     "theme_rotation_risk",
+    "chip_peak_distribution",
+    "overhead_pressure_high",
 }
 
 RISK_FLAG_REASON_KEYS = {
@@ -317,9 +351,19 @@ def _score_candidate(stock: dict, kline: list[dict], market_score: float, config
     trend, trend_reasons = _trend_score(row, kline, config)
     capital, capital_reasons = _capital_score(row)
     risk, risk_reasons = _risk_score(row, quality_flags, config)
+    chip_volume = (
+        build_chip_volume_confidence({**row, "_chip_volume_config": config.get("chip_volume", {})}, kline)
+        if config.get("chip_volume", {}).get("enabled", True)
+        else {}
+    )
+    chip_delta = float(chip_volume.get("confidence_delta", 0) or 0)
+    chip_reasons = [str(reason) for reason in chip_volume.get("reasons", [])]
+    if "chip_volume_data_missing" in chip_reasons:
+        quality_flags = _unique(quality_flags + ["chip_volume_data_missing"])
     total = market_score * 0.10 + theme * 0.25 + pv * 0.25 + trend * 0.20 + capital * 0.10 + risk * 0.10
+    total = max(0.0, min(100.0, total + chip_delta))
     source = row.get("fund_flow_source") or (row.get("_sources") or {}).get("main_net", "") or "unknown"
-    reason_keys = _unique(pv_reasons + theme_reasons + theme_market_reasons + trend_reasons + capital_reasons + risk_reasons)
+    reason_keys = _unique(pv_reasons + theme_reasons + theme_market_reasons + trend_reasons + capital_reasons + risk_reasons + chip_reasons)
     positive_keys, info_gap_keys, missing_keys, risk_keys = _split_reason_keys(reason_keys)
     row.update(
         {
@@ -328,6 +372,17 @@ def _score_candidate(stock: dict, kline: list[dict], market_score: float, config
             "total_score": round(total, 2),
             "main_net_source": source,
             "estimated_capital_flow": source == "estimated_from_big_order_net",
+            "chip_volume": chip_volume,
+            "chip_peak_type": chip_volume.get("peak_type", "neutral"),
+            "chip_avg_cost_20d": chip_volume.get("chip_avg_cost_20d", 0.0),
+            "chip_avg_cost_60d": chip_volume.get("chip_avg_cost_60d", 0.0),
+            "current_vs_chip_cost_pct": chip_volume.get("current_vs_chip_cost_pct", 0.0),
+            "overhead_pressure_ratio": chip_volume.get("overhead_pressure_ratio", 0.0),
+            "downside_support_ratio": chip_volume.get("downside_support_ratio", 0.0),
+            "main_force_chip_proxy": chip_volume.get("main_force_chip_proxy", 0.0),
+            "volume_signal": chip_volume.get("volume_signal", ""),
+            "confidence_delta": chip_volume.get("confidence_delta", 0),
+            "chip_volume_reasons": "|".join(chip_reasons),
             "data_quality_flags": quality_flags,
             "positive_reason_keys": positive_keys,
             "info_gap_reason_keys": info_gap_keys,
