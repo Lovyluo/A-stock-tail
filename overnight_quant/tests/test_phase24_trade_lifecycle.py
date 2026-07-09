@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from overnight_quant.execution.order_recorder import record_manual_order, record_position_update
-from overnight_quant.execution.position_tracker import get_open_positions
+from overnight_quant.execution.position_tracker import get_open_positions, get_position_summaries, read_order_rows
 from overnight_quant.scripts.run_sell_plan import _realtime_trigger_cn, _sell_trigger_cn, generate_sell_plan
 from overnight_quant.strategy.yang_yongxing_overnight import load_config
 
@@ -108,6 +108,41 @@ def test_position_update_buy_without_ticket_is_recorded(tmp_path):
     assert positions[0]["code"] == "300001"
     assert positions[0]["open_qty"] == 200
     assert positions[0]["stop_loss_price"] == 17.95
+
+
+def test_position_update_preserves_multiple_same_code_buys(tmp_path):
+    config = _tmp_config(tmp_path)
+
+    first = record_position_update(
+        config,
+        code="300001",
+        name="Demo Robotics",
+        price=18.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:01:00",
+        stop_loss_price=17.5,
+    )
+    second = record_position_update(
+        config,
+        code="300001",
+        name="Demo Robotics",
+        price=20.0,
+        qty=200,
+        side="BUY",
+        trade_time="2026-05-23 10:15:00",
+        stop_loss_price=18.8,
+    )
+    rows = read_order_rows(config["paths"]["records_dir"])
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert first["allow"] is True
+    assert second["allow"] is True
+    assert len(rows) == 2
+    assert [float(row["price"]) for row in rows] == [18.0, 20.0]
+    assert summary["open_qty"] == 300
+    assert summary["avg_buy_price"] == 19.3333
+    assert summary["stop_loss_price"] == 18.8
 
 
 def test_position_update_rejects_sell_more_than_open_qty(tmp_path):

@@ -374,8 +374,11 @@ def _normalize_existing_order(row: dict) -> dict:
 
 
 def _is_legacy_demo_placeholder_for_ticket(existing: dict, incoming: dict) -> bool:
+    if not incoming.get("ticket_id") and not incoming.get("source_ticket_path"):
+        return False
     return (
-        not existing.get("ticket_id")
+        not existing.get("order_id")
+        and not existing.get("ticket_id")
         and not existing.get("source_ticket_path")
         and str(existing.get("side") or "BUY").upper() == "BUY"
         and str(existing.get("code", "")).zfill(6) == str(incoming.get("code", "")).zfill(6)
