@@ -84,6 +84,14 @@ Expected result after the chip/volume proxy module:
 
 GitHub Actions runs the same test command on Windows with Python 3.12.
 
+## v0.2.1 Observation Calibration
+
+The chip and volume confidence proxy needs live after-close observation calibration before it should be trusted as a stable explanatory signal.
+
+- Use the proxy only to explain observation confidence.
+- Compare peak type, volume confirmation, and confidence_delta against real after-close outcomes.
+- Do not treat the proxy as standalone trade evidence.
+
 ## Common Commands
 
 ```powershell
