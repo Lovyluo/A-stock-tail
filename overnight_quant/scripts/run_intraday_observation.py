@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from overnight_quant.data.astock_client import AStockClient
 from overnight_quant.data.demo_data import demo_quotes
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.execution.position_tracker import get_open_positions
 from overnight_quant.execution.state_manager import config_for_mode
 from overnight_quant.reports.intraday_report import write_intraday_report, write_intraday_signals_csv
 from overnight_quant.strategy.intraday_observation import IntradayObservationAnalyzer, load_intraday_config
@@ -31,6 +32,10 @@ def run_intraday_observation(
     paths = runtime_config.get("paths", {})
     records_dir = Path(paths.get("records_dir", "overnight_quant/records"))
     candidate_rows, candidate_source = _load_candidates(records_dir, watchlist_path)
+    position_rows = _load_position_candidates(records_dir, runtime_config)
+    if position_rows:
+        candidate_rows = _merge_candidate_sources(candidate_rows, position_rows)
+        candidate_source = _join_sources(candidate_source, "open_positions")
     if mode == "demo" and not candidate_rows:
         candidate_rows = _demo_candidates()
         candidate_source = "demo_synthetic_watchlist"
@@ -58,6 +63,55 @@ def _load_candidates(records_dir: Path, explicit_path: str | None = None) -> tup
     return rows, str(path)
 
 
+def _load_position_candidates(records_dir: Path, config: dict) -> list[dict]:
+    score = float(config.get("intraday", {}).get("position_candidate_score", 72) or 72)
+    rows: list[dict] = []
+    for position in get_open_positions(str(records_dir)):
+        rows.append(
+            {
+                "trade_date": position.get("trade_date", ""),
+                "code": position.get("code", ""),
+                "name": position.get("name", ""),
+                "category": "POSITION",
+                "score": score,
+                "risk_flags": "",
+                "is_position": True,
+                "open_qty": position.get("open_qty", ""),
+                "avg_buy_price": position.get("avg_buy_price", ""),
+                "stop_loss_price": position.get("stop_loss_price", ""),
+            }
+        )
+    return rows
+
+
+def _merge_candidate_sources(watchlist_rows: list[dict], position_rows: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for row in watchlist_rows:
+        code = _normalize_code(row.get("code"))
+        if code:
+            merged[code] = dict(row)
+    for row in position_rows:
+        code = _normalize_code(row.get("code"))
+        if not code:
+            continue
+        if code in merged:
+            merged[code].update(
+                {
+                    "is_position": True,
+                    "open_qty": row.get("open_qty", ""),
+                    "avg_buy_price": row.get("avg_buy_price", ""),
+                    "position_score": row.get("score", ""),
+                }
+            )
+        else:
+            merged[code] = dict(row)
+    return list(merged.values())
+
+
+def _join_sources(*values: str) -> str:
+    return "+".join(value for value in values if value)
+
+
 def _latest_watchlist(records_dir: Path) -> Path | None:
     patterns = ["morning_replay_watchlist_*.csv", "next_morning_watchlist_*.csv"]
     matches: list[Path] = []
@@ -83,6 +137,14 @@ def _demo_candidates() -> list[dict]:
             }
         )
     return rows
+
+
+def _normalize_code(value) -> str:
+    text = str(value or "").strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else ""
 
 
 def _normalize_now(now: datetime | None) -> datetime:

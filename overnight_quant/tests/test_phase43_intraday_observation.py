@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.execution.order_recorder import record_position_update
 from overnight_quant.scripts.run_intraday_observation import run_intraday_observation
 from overnight_quant.strategy.intraday_observation import (
     BUY_POINT_A,
@@ -48,6 +49,12 @@ class StubIntradayClient:
 
     def get_intraday_bars(self, code: str) -> list[dict]:
         return list(self.bars)
+
+    def get_daily_kline(self, code: str, lookback: int = 120) -> list[dict]:
+        return _daily_bars()
+
+    def _safe_fund_flow(self, code: str):
+        return ([{"main_net": 3_000_000, "large_net": 1_000_000, "super_net": 500_000}], "unit_test", "")
 
 
 def test_demo_intraday_writes_signal_report_and_csv(tmp_path):
@@ -110,6 +117,52 @@ def test_live_intraday_confirmed_vwap_reclaim_can_emit_a_point(tmp_path):
     assert result["rows"][0]["has_intraday_series"] is True
 
 
+def test_intraday_includes_open_positions_as_candidates(tmp_path):
+    config = _tmp_config(tmp_path)
+    record_position_update(
+        config,
+        code="300002",
+        name="Held Stock",
+        price=18.2,
+        qty=200,
+        side="BUY",
+        trade_time="2026-05-22 09:40:00",
+    )
+
+    result = run_intraday_observation(
+        mode="live",
+        config=config,
+        client=StubIntradayClient(bars=_confirmed_bars(), market_ok=True),
+        now=datetime(2026, 5, 22, 10, 5, tzinfo=CN_TZ),
+        trade_date="2026-05-22",
+    )
+
+    assert result["candidate_source"] == "open_positions"
+    assert result["rows"][0]["code"] == "300002"
+    assert result["rows"][0]["is_position"] is True
+    assert result["rows"][0]["position_open_qty"] == 200
+    assert result["rows"][0]["signal"] in {BUY_POINT_A, "BUY_POINT_B", BUY_WATCH}
+
+
+def test_intraday_outputs_chip_volume_context_to_csv(tmp_path):
+    result = run_intraday_observation(
+        mode="live",
+        config=_tmp_config(tmp_path),
+        client=StubIntradayClient(bars=_confirmed_bars(), market_ok=True),
+        now=datetime(2026, 5, 22, 10, 5, tzinfo=CN_TZ),
+        trade_date="2026-05-22",
+        watchlist_path=_write_watchlist(tmp_path),
+    )
+    row = result["rows"][0]
+    csv_row = _csv_rows(result["signals_csv"])[0]
+
+    assert row["chip_peak_type"] in {"accumulation", "washout", "markup", "distribution", "neutral"}
+    assert row["volume_signal"]
+    assert "chip_peak_type" in csv_row
+    assert "volume_signal" in csv_row
+    assert "confidence_delta" in csv_row
+
+
 def _tmp_config(tmp_path):
     config = load_intraday_config()
     config["paths"] = {
@@ -148,6 +201,42 @@ def _confirmed_bars() -> list[dict]:
             }
         )
     return rows
+
+
+def _daily_bars() -> list[dict]:
+    rows = []
+    for index in range(60):
+        close = 18.0 + index * 0.01
+        volume = 1000
+        if index == 58:
+            volume = 4000
+        if index == 59:
+            close = 19.0
+            volume = 5000
+        rows.append(
+            {
+                "date": f"2026-04-{(index % 28) + 1:02d}",
+                "open": close - 0.05,
+                "close": close,
+                "high": close + 0.08,
+                "low": close - 0.08,
+                "volume": volume,
+                "amount": close * volume,
+            }
+        )
+    return rows
+
+
+def _write_watchlist(tmp_path) -> str:
+    records = tmp_path / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    path = records / "next_morning_watchlist_2026-05-22.csv"
+    path.write_text(
+        "trade_date,code,name,category,score,risk_flags\n"
+        "2026-05-22,300001,Demo Robotics,A,88,\n",
+        encoding="utf-8-sig",
+    )
+    return str(path)
 
 
 def _csv_rows(path: str) -> list[dict]:

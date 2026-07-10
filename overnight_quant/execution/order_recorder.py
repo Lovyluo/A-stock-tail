@@ -4,7 +4,12 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
-from overnight_quant.execution.position_tracker import get_open_positions, read_order_rows
+from overnight_quant.execution.position_tracker import (
+    get_open_positions,
+    read_name_bindings,
+    read_order_rows,
+    write_name_binding,
+)
 from overnight_quant.reports.lifecycle_report import write_trade_lifecycle_report
 from overnight_quant.reports.trade_review import write_trade_review
 
@@ -51,7 +56,21 @@ def record_manual_order(
         return {"allow": False, "reasons": reasons, "report_path": report_path}
 
     row = _build_order_row(ticket, code, price, qty, side, trade_time, notes)
+    if side == "BUY":
+        bound_name = _resolve_bound_name(records_dir, existing, code, row.get("name", ""))
+        if bound_name:
+            row["name"] = bound_name
     orders_csv = append_manual_order(row, records_dir)
+    name_binding_path = ""
+    if side == "BUY" and row.get("name"):
+        name_binding_path = write_name_binding(
+            records_dir,
+            code,
+            str(row.get("name", "")),
+            source_order_id=str(row.get("order_id", "")),
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+            notes="auto_bound_from_ticket_buy",
+        )
     review_report_path = ""
     lifecycle_report_path = write_trade_lifecycle_report(config, row["trade_date"])
     if side == "SELL":
@@ -67,6 +86,7 @@ def record_manual_order(
         "reasons": [],
         "row": row,
         "orders_csv": orders_csv,
+        "name_binding_path": name_binding_path,
         "report_path": report_path,
         "lifecycle_report_path": lifecycle_report_path,
         "trade_review_report_path": review_report_path,
@@ -94,9 +114,10 @@ def record_position_update(
     if reasons:
         return {"allow": False, "reasons": reasons, "report_path": report_path}
 
+    resolved_name = _resolve_bound_name(records_dir, existing, code, name)
     row = _build_position_update_row(
         code=code,
-        name=name,
+        name=resolved_name,
         price=price,
         qty=qty,
         side=side,
@@ -105,6 +126,16 @@ def record_position_update(
         stop_loss_price=stop_loss_price,
     )
     orders_csv = append_manual_order(row, records_dir)
+    name_binding_path = ""
+    if side == "BUY" and row.get("name"):
+        name_binding_path = write_name_binding(
+            records_dir,
+            code,
+            str(row.get("name", "")),
+            source_order_id=str(row.get("order_id", "")),
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+            notes="auto_bound_from_buy",
+        )
     review_report_path = ""
     lifecycle_report_path = write_trade_lifecycle_report(config, row["trade_date"])
     if side == "SELL":
@@ -120,9 +151,86 @@ def record_position_update(
         "reasons": [],
         "row": row,
         "orders_csv": orders_csv,
+        "name_binding_path": name_binding_path,
         "report_path": report_path,
         "lifecycle_report_path": lifecycle_report_path,
         "trade_review_report_path": review_report_path,
+    }
+
+
+def bind_stock_name(config: dict, code: str, name: str, notes: str = "") -> dict:
+    records_dir = config.get("paths", {}).get("records_dir", "overnight_quant/records")
+    reports_dir = config.get("paths", {}).get("reports_dir", "overnight_quant/reports")
+    code = str(code).strip().zfill(6)
+    name = str(name or "").strip()
+    reasons: list[str] = []
+    if not code.isdigit() or len(code) != 6:
+        reasons.append("invalid_code")
+    if not name:
+        reasons.append("name_required")
+    report_path = _write_record_report(reports_dir, code, "NAME_BINDING", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), not reasons, reasons)
+    if reasons:
+        return {"allow": False, "reasons": reasons, "report_path": report_path}
+    binding_path = write_name_binding(
+        records_dir,
+        code,
+        name,
+        source_order_id="manual_name_binding",
+        updated_at=datetime.now().isoformat(timespec="seconds"),
+        notes=notes,
+    )
+    lifecycle_report_path = write_trade_lifecycle_report(config, datetime.now().date().isoformat())
+    return {
+        "allow": True,
+        "reasons": [],
+        "name_binding_path": binding_path,
+        "report_path": report_path,
+        "lifecycle_report_path": lifecycle_report_path,
+    }
+
+
+def void_manual_order(config: dict, order_id: str, notes: str = "") -> dict:
+    records_dir = config.get("paths", {}).get("records_dir", "overnight_quant/records")
+    reports_dir = config.get("paths", {}).get("reports_dir", "overnight_quant/reports")
+    order_id = str(order_id or "").strip()
+    rows = read_order_rows(records_dir)
+    reasons: list[str] = []
+    target = None
+    for row in rows:
+        if str(row.get("order_id") or "").strip() == order_id:
+            target = row
+            break
+    if not order_id:
+        reasons.append("order_id_required")
+    elif target is None:
+        reasons.append("order_id_not_found")
+    elif str(target.get("status") or "FILLED").upper() == "VOID":
+        reasons.append("order_already_void")
+    report_path = _write_record_report(
+        reports_dir,
+        str((target or {}).get("code") or "000000").zfill(6),
+        "VOID",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        not reasons,
+        reasons,
+    )
+    if reasons:
+        return {"allow": False, "reasons": reasons, "report_path": report_path}
+
+    assert target is not None
+    target["status"] = "VOID"
+    suffix = f"voided_at={datetime.now().isoformat(timespec='seconds')}"
+    if notes:
+        suffix += f"; void_reason={notes}"
+    target["notes"] = f"{target.get('notes', '')}; {suffix}".strip("; ")
+    orders_csv = _write_order_rows(rows, records_dir)
+    lifecycle_report_path = write_trade_lifecycle_report(config, datetime.now().date().isoformat())
+    return {
+        "allow": True,
+        "reasons": [],
+        "orders_csv": orders_csv,
+        "report_path": report_path,
+        "lifecycle_report_path": lifecycle_report_path,
     }
 
 
@@ -180,13 +288,19 @@ def parse_manual_ticket(path: Path) -> dict:
 def append_manual_order(row: dict, records_dir: str) -> str:
     path = Path(records_dir)
     path.mkdir(parents=True, exist_ok=True)
-    file_path = path / "manual_orders.csv"
     rows = [
         item
         for item in read_order_rows(records_dir)
         if not _is_legacy_demo_placeholder_for_ticket(item, row)
     ]
     rows.append(row)
+    return _write_order_rows(rows, records_dir)
+
+
+def _write_order_rows(rows: list[dict], records_dir: str) -> str:
+    path = Path(records_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    file_path = path / "manual_orders.csv"
     with file_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=ORDER_FIELDS)
         writer.writeheader()
@@ -371,6 +485,20 @@ def _normalize_existing_order(row: dict) -> dict:
         "status": row.get("status", "FILLED"),
         "notes": row.get("notes", ""),
     }
+
+
+def _resolve_bound_name(records_dir: str, existing: list[dict], code: str, incoming_name: str) -> str:
+    bindings = read_name_bindings(records_dir)
+    if bindings.get(code):
+        return bindings[code]
+    for row in existing:
+        if str(row.get("status") or "FILLED").upper() == "VOID":
+            continue
+        if str(row.get("side") or "BUY").upper() != "BUY":
+            continue
+        if str(row.get("code", "")).zfill(6) == code and str(row.get("name") or "").strip():
+            return str(row.get("name") or "").strip()
+    return str(incoming_name or "").strip() or code
 
 
 def _is_legacy_demo_placeholder_for_ticket(existing: dict, incoming: dict) -> bool:

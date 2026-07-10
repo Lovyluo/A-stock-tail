@@ -1512,6 +1512,82 @@ def run_position_update_action(
     }
 
 
+def run_position_name_binding_action(
+    code: str,
+    name: str,
+    notes: str = "",
+    mode: str = DEFAULT_MODE,
+    timeout: int = 45,
+) -> dict[str, Any]:
+    state_arg = "example" if mode == "demo" else "real"
+    args = [
+        sys.executable,
+        "overnight_quant/scripts/run_record_order.py",
+        "--bind-name",
+        "--state",
+        state_arg,
+        "--code",
+        _normalize_stock_code(code),
+        "--name",
+        str(name or ""),
+        "--notes",
+        str(notes or ""),
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            shell=False,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "ACTION_TIMEOUT", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def run_position_void_action(
+    order_id: str,
+    notes: str = "",
+    mode: str = DEFAULT_MODE,
+    timeout: int = 45,
+) -> dict[str, Any]:
+    state_arg = "example" if mode == "demo" else "real"
+    args = [
+        sys.executable,
+        "overnight_quant/scripts/run_record_order.py",
+        "--void-order-id",
+        str(order_id or ""),
+        "--state",
+        state_arg,
+        "--notes",
+        str(notes or ""),
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            shell=False,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "ACTION_TIMEOUT", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
 def position_update_feedback(result: dict[str, Any], language: str = DEFAULT_LANGUAGE) -> dict[str, Any]:
     if result.get("ok"):
         return {
@@ -1553,49 +1629,16 @@ def _command_output_reasons(stdout: str) -> list[str]:
     return reasons
 
 
-def build_position_summary_table(manual_orders) -> SimpleTable:
+def build_position_summary_table(manual_orders, name_bindings=None) -> SimpleTable:
     rows = _table_records(manual_orders)
-    positions: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        code = _normalize_stock_code(row.get("code"))
-        if not code:
-            continue
-        side = str(row.get("side") or "BUY").upper()
-        qty = _as_int_value(row.get("qty") or row.get("quantity"))
-        price = _as_float_value(row.get("price") or row.get("buy_price"))
-        amount = _as_float_value(row.get("amount")) or round(qty * price, 2)
-        position = positions.setdefault(
-            code,
-            {
-                "code": code,
-                "name": row.get("name", ""),
-                "status": "OPEN",
-                "open_qty": 0,
-                "avg_buy_price": 0.0,
-                "buy_qty": 0,
-                "sell_qty": 0,
-                "buy_amount": 0.0,
-                "sell_amount": 0.0,
-                "realized_pnl": 0.0,
-                "stop_loss_price": _as_float_value(row.get("stop_loss_price")),
-                "last_buy_time": "",
-                "last_sell_time": "",
-            },
-        )
-        if row.get("name"):
-            position["name"] = row.get("name")
-        if side == "BUY":
-            position["buy_qty"] += qty
-            position["open_qty"] += qty
-            position["buy_amount"] += amount
-            position["last_buy_time"] = row.get("trade_time", "")
-            position["stop_loss_price"] = _as_float_value(row.get("stop_loss_price")) or position["stop_loss_price"]
-        elif side == "SELL":
-            position["sell_qty"] += qty
-            position["open_qty"] -= qty
-            position["sell_amount"] += amount
-            position["last_sell_time"] = row.get("trade_time", "")
+    binding_rows = _table_records(name_bindings)
+    bindings = {
+        _normalize_stock_code(row.get("code")): str(row.get("name") or "").strip()
+        for row in binding_rows
+        if _normalize_stock_code(row.get("code")) and str(row.get("name") or "").strip()
+    }
     columns = [
+        "position_id",
         "code",
         "name",
         "status",
@@ -1607,20 +1650,99 @@ def build_position_summary_table(manual_orders) -> SimpleTable:
         "sell_amount",
         "realized_pnl",
         "stop_loss_price",
+        "first_buy_time",
         "last_buy_time",
         "last_sell_time",
+        "closed_at",
     ]
-    summary_rows: list[dict[str, Any]] = []
-    for position in positions.values():
-        buy_qty = _as_int_value(position.get("buy_qty"))
-        sell_qty = _as_int_value(position.get("sell_qty"))
-        open_qty = _as_int_value(position.get("open_qty"))
-        avg_buy = round(_as_float_value(position.get("buy_amount")) / buy_qty, 4) if buy_qty else 0.0
-        position["avg_buy_price"] = avg_buy
-        position["realized_pnl"] = round(_as_float_value(position.get("sell_amount")) - avg_buy * min(sell_qty, buy_qty), 2)
-        position["status"] = _position_status_label(open_qty, buy_qty, sell_qty)
-        summary_rows.append({column: position.get(column, "") for column in columns})
+    summary_rows = [
+        {column: position.get(column, "") for column in columns}
+        for position in _dashboard_position_summaries(rows, bindings)
+    ]
     return SimpleTable(summary_rows, columns)
+
+
+def _dashboard_position_summaries(rows: list[dict[str, Any]], bindings: dict[str, str]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    current: dict[str, dict[str, Any]] = {}
+    cycle_counts: dict[str, int] = {}
+    for row in rows:
+        if str(row.get("status") or "FILLED").upper() == "VOID":
+            continue
+        code = _normalize_stock_code(row.get("code"))
+        if not code:
+            continue
+        side = str(row.get("side") or "BUY").upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        pos = current.get(code)
+        if side == "BUY" and pos and _position_status_label(
+            _as_int_value(pos.get("open_qty")),
+            _as_int_value(pos.get("buy_qty")),
+            _as_int_value(pos.get("sell_qty")),
+        ) == "CLOSED":
+            _finalize_dashboard_position(pos)
+            summaries.append(pos)
+            pos = None
+        if not pos:
+            cycle_counts[code] = cycle_counts.get(code, 0) + 1
+            pos = _new_dashboard_position(code, row, cycle_counts[code], bindings)
+            current[code] = pos
+        qty = _as_int_value(row.get("qty") or row.get("quantity"))
+        price = _as_float_value(row.get("price") or row.get("buy_price"))
+        amount = _as_float_value(row.get("amount")) or round(qty * price, 2)
+        if side == "BUY":
+            pos["buy_qty"] += qty
+            pos["open_qty"] += qty
+            pos["buy_amount"] += amount
+            pos["last_buy_time"] = row.get("trade_time", "")
+            pos["stop_loss_price"] = _as_float_value(row.get("stop_loss_price")) or pos["stop_loss_price"]
+            if not bindings.get(code):
+                pos["name"] = pos["name"] or row.get("name", "")
+        elif side == "SELL":
+            pos["sell_qty"] += qty
+            pos["open_qty"] -= qty
+            pos["sell_amount"] += amount
+            pos["last_sell_time"] = row.get("trade_time", "")
+    for pos in current.values():
+        _finalize_dashboard_position(pos)
+        summaries.append(pos)
+    return summaries
+
+
+def _new_dashboard_position(code: str, row: dict[str, Any], cycle_no: int, bindings: dict[str, str]) -> dict[str, Any]:
+    return {
+        "position_id": f"{code}-{cycle_no}",
+        "code": code,
+        "name": bindings.get(code) or row.get("name", ""),
+        "status": "OPEN",
+        "open_qty": 0,
+        "avg_buy_price": 0.0,
+        "buy_qty": 0,
+        "sell_qty": 0,
+        "buy_amount": 0.0,
+        "sell_amount": 0.0,
+        "realized_pnl": 0.0,
+        "stop_loss_price": _as_float_value(row.get("stop_loss_price")),
+        "first_buy_time": "",
+        "last_buy_time": "",
+        "last_sell_time": "",
+        "closed_at": "",
+    }
+
+
+def _finalize_dashboard_position(position: dict[str, Any]) -> None:
+    buy_qty = _as_int_value(position.get("buy_qty"))
+    sell_qty = _as_int_value(position.get("sell_qty"))
+    open_qty = _as_int_value(position.get("open_qty"))
+    avg_buy = round(_as_float_value(position.get("buy_amount")) / buy_qty, 4) if buy_qty else 0.0
+    position["avg_buy_price"] = avg_buy
+    position["realized_pnl"] = round(_as_float_value(position.get("sell_amount")) - avg_buy * min(sell_qty, buy_qty), 2)
+    position["status"] = _position_status_label(open_qty, buy_qty, sell_qty)
+    if position["status"] == "CLOSED":
+        position["closed_at"] = position.get("last_sell_time", "")
+    if not position.get("first_buy_time"):
+        position["first_buy_time"] = position.get("last_buy_time", "")
 
 
 def _position_status_label(open_qty: int, buy_qty: int, sell_qty: int) -> str:
@@ -1633,6 +1755,18 @@ def _position_status_label(open_qty: int, buy_qty: int, sell_qty: int) -> str:
     if buy_qty > 0 and sell_qty == buy_qty and open_qty == 0:
         return "CLOSED"
     return "OPEN"
+
+
+def split_position_summary_tables(position_summary) -> tuple[SimpleTable, SimpleTable]:
+    rows = _table_records(position_summary)
+    columns = list(getattr(position_summary, "columns", [])) or (list(rows[0]) if rows else [])
+    open_rows = [row for row in rows if _as_int_value(row.get("open_qty")) > 0]
+    closed_rows = [
+        row
+        for row in rows
+        if _as_int_value(row.get("open_qty")) <= 0 and _as_int_value(row.get("buy_qty")) > 0
+    ]
+    return SimpleTable(open_rows, columns), SimpleTable(closed_rows, columns)
 
 
 def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> dict[str, Any]:
@@ -1653,6 +1787,7 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
     signals_path = records / "signals.csv"
     signal_rejections_path = records / "signal_rejections.csv"
     manual_orders_path = records / "manual_orders.csv"
+    name_bindings_path = records / "stock_name_bindings.csv"
     buy_ticket_path = find_latest_file("manual_order_" + "ticket_*.md", reports)
     sell_plan_path = find_latest_file("sell_plan_*.md", reports)
     lifecycle_path = find_latest_file("trade_lifecycle_*.md", reports)
@@ -1684,13 +1819,14 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
         "signals": parse_signals_csv(signals_path),
         "signal_rejections": parse_signals_csv(signal_rejections_path),
         "manual_orders": parse_signals_csv(manual_orders_path),
+        "name_bindings": parse_signals_csv(name_bindings_path),
         "buy_ticket": parse_key_value_md(buy_ticket_path or reports / ("manual_order_" + "ticket_missing.md")),
         "sell_plan": parse_key_value_md(sell_plan_path or reports / "sell_plan_missing.md"),
         "sell_plan_rows": parse_sell_plan_table(sell_plan_path or reports / "sell_plan_missing.md"),
         "lifecycle": parse_key_value_md(lifecycle_path or reports / "lifecycle_missing.md"),
         "trade_review": parse_key_value_md(review_path or reports / "trade_review_missing.md"),
     }
-    state["position_summary"] = build_position_summary_table(state["manual_orders"])
+    state["position_summary"] = build_position_summary_table(state["manual_orders"], state["name_bindings"])
     state["reference_summary"] = live_reference_summary(state)
     state["conclusion"] = build_status_conclusion(state)
     return state
@@ -2275,8 +2411,32 @@ def _render_position_update(st, state: dict[str, Any], language: str, mode: str)
             st.session_state["position_update_feedback"] = position_update_feedback(result, language)
         st.rerun()
     _render_action_feedback(st, st.session_state.get("position_update_feedback"), language)
+    with st.expander("修正持仓记录" if language == "zh" else "Correct Position Records"):
+        with st.form("position_name_binding_form"):
+            col_a, col_b = st.columns(2)
+            bind_code = col_a.text_input("代码" if language == "zh" else "Code", key="bind_code", max_chars=6)
+            bind_name = col_b.text_input("正确名称" if language == "zh" else "Correct Name", key="bind_name")
+            bind_notes = st.text_input("修正备注" if language == "zh" else "Correction Notes", key="bind_notes")
+            bind_submitted = st.form_submit_button("保存名称绑定" if language == "zh" else "Save Name Binding")
+        if bind_submitted:
+            result = run_position_name_binding_action(bind_code, bind_name, bind_notes, mode=mode)
+            st.session_state["position_update_feedback"] = position_update_feedback(result, language)
+            st.rerun()
+
+        with st.form("position_void_form"):
+            void_order_id = st.text_input("要作废的 order_id" if language == "zh" else "Order ID To Void", key="void_order_id")
+            void_notes = st.text_input("作废原因" if language == "zh" else "Void Reason", key="void_notes")
+            void_submitted = st.form_submit_button("作废错误成交" if language == "zh" else "Void Erroneous Fill")
+        if void_submitted:
+            result = run_position_void_action(void_order_id, void_notes, mode=mode)
+            st.session_state["position_update_feedback"] = position_update_feedback(result, language)
+            st.rerun()
+
+    open_positions, closed_positions = split_position_summary_tables(state["position_summary"])
     st.markdown("#### 当前持仓" if language == "zh" else "#### Current Positions")
-    render_table_or_empty(st, state["position_summary"], language, t(language, "empty_table"))
+    render_table_or_empty(st, open_positions, language, t(language, "empty_table"))
+    with st.expander("已清仓 / 历史持仓" if language == "zh" else "Closed / Historical Positions"):
+        render_table_or_empty(st, closed_positions, language, t(language, "empty_table"))
     st.markdown("#### 手工成交记录" if language == "zh" else "#### Manual Fill Records")
     render_table_or_empty(st, state["manual_orders"], language, t(language, "empty_table"))
 

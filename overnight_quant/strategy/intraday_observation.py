@@ -16,6 +16,7 @@ from overnight_quant.data.market_calendar import (
     get_session_state,
     is_likely_cn_trade_day,
 )
+from overnight_quant.strategy.chip_volume import build_chip_volume_confidence
 
 
 DEFAULT_INTRADAY_CONFIG = {
@@ -32,6 +33,17 @@ DEFAULT_INTRADAY_CONFIG = {
         "max_intraday_change_pct": 8.5,
         "min_limit_up_gap_pct": 1.2,
         "min_range_position": 0.52,
+        "position_candidate_score": 72,
+    },
+    "chip_volume": {
+        "enabled": True,
+        "profile_lookback_days": 60,
+        "avg_cost_windows": [20, 60],
+        "bucket_pct": 1.0,
+        "high_volume_prev_days": 3,
+        "volume_confirm_ratio": 1.2,
+        "max_confidence_bonus": 8,
+        "max_confidence_penalty": -10,
     },
     "paths": {
         "records_dir": "overnight_quant/records",
@@ -138,13 +150,26 @@ class IntradayObservationAnalyzer:
         bars = self.client.get_intraday_bars(code) if hasattr(self.client, "get_intraday_bars") else []
         snapshot = _snapshot_from_current(current, candidate, bars)
         metrics = _intraday_metrics(snapshot, bars, self.config)
+        chip_volume = _chip_volume_context(self.client, candidate, snapshot, self.config)
         risk_flags = _candidate_risk_flags(candidate)
-        score, reasons, invalid = _score_intraday(candidate, snapshot, metrics, market_gate, window, risk_flags, self.config)
+        score, reasons, invalid = _score_intraday(
+            candidate,
+            snapshot,
+            metrics,
+            chip_volume,
+            market_gate,
+            window,
+            risk_flags,
+            self.config,
+        )
         signal = _classify_signal(candidate, score, metrics, market_gate, window, risk_flags, invalid, self.config)
         return {
             "code": code,
             "name": candidate.get("name") or current.get("name", ""),
             "source_category": candidate.get("category", ""),
+            "is_position": bool(candidate.get("is_position")),
+            "position_open_qty": candidate.get("open_qty", ""),
+            "position_avg_buy_price": candidate.get("avg_buy_price", ""),
             "after_close_score": _as_float(candidate.get("score"), 0.0),
             "signal": signal,
             "signal_score": round(score, 2),
@@ -158,6 +183,15 @@ class IntradayObservationAnalyzer:
             "volume_confirmation": metrics["volume_confirmation"],
             "intraday_source": "eastmoney_intraday_trends" if bars else "quote_vwap_proxy",
             "has_intraday_series": bool(bars),
+            "chip_peak_type": chip_volume.get("peak_type", "neutral"),
+            "chip_avg_cost_20d": chip_volume.get("chip_avg_cost_20d", 0.0),
+            "current_vs_chip_cost_pct": chip_volume.get("current_vs_chip_cost_pct", 0.0),
+            "overhead_pressure_ratio": chip_volume.get("overhead_pressure_ratio", 0.0),
+            "downside_support_ratio": chip_volume.get("downside_support_ratio", 0.0),
+            "main_force_chip_proxy": chip_volume.get("main_force_chip_proxy", 0.0),
+            "volume_signal": chip_volume.get("volume_signal", ""),
+            "confidence_delta": chip_volume.get("confidence_delta", 0),
+            "chip_volume_reasons": chip_volume.get("reasons", []),
             "buy_zone": _buy_zone(snapshot, metrics),
             "reasons": reasons,
             "invalid_conditions": invalid,
@@ -191,6 +225,7 @@ def _score_intraday(
     candidate: dict,
     snapshot: dict,
     metrics: dict,
+    chip_volume: dict,
     market_gate: dict,
     window: str,
     risk_flags: list[str],
@@ -219,6 +254,9 @@ def _score_intraday(
     elif candidate.get("category") == "B":
         score += 8
         reasons.append("after_close_category_b")
+    elif candidate.get("is_position"):
+        score += 6
+        reasons.append("open_position_candidate")
     score += min(_as_float(candidate.get("score"), 0.0) / 10, 10)
 
     distance = metrics["distance_to_vwap_pct"]
@@ -265,6 +303,14 @@ def _score_intraday(
         reject.append("too_close_to_limit_up")
     if risk_flags:
         reject.extend(risk_flags)
+    chip_delta = _as_float(chip_volume.get("confidence_delta"), 0.0)
+    score += chip_delta
+    chip_reasons = [str(reason) for reason in chip_volume.get("reasons", []) if reason]
+    reasons.extend(chip_reasons)
+    if chip_volume.get("peak_type") == "distribution":
+        reject.append("chip_distribution_pressure")
+    if _as_float(chip_volume.get("overhead_pressure_ratio"), 0.0) >= 0.65 and not metrics["volume_confirmation"]:
+        reject.append("overhead_pressure_without_volume_confirm")
     return score, _unique(reasons), _unique(reject)
 
 
@@ -344,6 +390,38 @@ def _intraday_metrics(snapshot: dict, bars: list[dict], config: dict) -> dict:
         "volume_confirmation": volume_confirmation,
         "has_intraday_series": True,
     }
+
+
+def _chip_volume_context(client, candidate: dict, snapshot: dict, config: dict) -> dict:
+    if not config.get("chip_volume", {}).get("enabled", True):
+        return {"peak_type": "neutral", "confidence_delta": 0, "reasons": ["chip_volume_disabled"]}
+    code = _normalize_code(candidate.get("code"))
+    lookback = int(config.get("chip_volume", {}).get("profile_lookback_days", 60) or 60)
+    daily_bars: list[dict] = []
+    fund_flow: list[dict] | None = None
+    try:
+        if hasattr(client, "get_daily_kline"):
+            daily_bars = client.get_daily_kline(code, lookback=max(lookback, 60))
+        elif hasattr(client, "_eastmoney_daily_kline"):
+            daily_bars = client._eastmoney_daily_kline(code, max(lookback, 60))
+    except Exception:
+        daily_bars = []
+    try:
+        if hasattr(client, "_safe_fund_flow"):
+            rows, _, _ = client._safe_fund_flow(code)
+            fund_flow = rows
+        elif hasattr(client, "_eastmoney_fund_flow_daily"):
+            fund_flow = client._eastmoney_fund_flow_daily(code, limit=10)
+    except Exception:
+        fund_flow = None
+    stock = {
+        **candidate,
+        **snapshot,
+        "price": snapshot.get("price"),
+        "current_price": snapshot.get("price"),
+        "_chip_volume_config": config.get("chip_volume", {}),
+    }
+    return build_chip_volume_confidence(stock, daily_bars, fund_flow)
 
 
 def _snapshot_from_current(current: dict, candidate: dict, bars: list[dict]) -> dict:

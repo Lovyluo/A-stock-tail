@@ -3,14 +3,14 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from overnight_quant.execution.position_tracker import get_position_summaries, read_order_rows
+from overnight_quant.execution.position_tracker import active_order_rows, get_position_summaries
 
 
 def write_trade_review(config: dict, code: str, trade_date: str | None = None) -> dict:
     code = str(code).zfill(6)
     records_dir = config.get("paths", {}).get("records_dir", "overnight_quant/records")
     reports_dir = config.get("paths", {}).get("reports_dir", "overnight_quant/reports")
-    rows = [row for row in read_order_rows(records_dir) if str(row.get("code", "")).zfill(6) == code]
+    rows = [row for row in active_order_rows(records_dir) if str(row.get("code", "")).zfill(6) == code]
     buy_rows = [row for row in rows if str(row.get("side") or "BUY").upper() == "BUY"]
     sell_rows = [row for row in rows if str(row.get("side") or "").upper() == "SELL"]
     latest_buy = buy_rows[-1] if buy_rows else {}
@@ -103,10 +103,11 @@ def write_trade_review(config: dict, code: str, trade_date: str | None = None) -
 
 
 def _find_position_summary(records_dir: str, code: str) -> dict:
-    for summary in get_position_summaries(records_dir):
-        if summary["code"] == code:
-            return summary
-    return {}
+    matches = [summary for summary in get_position_summaries(records_dir) if summary["code"] == code]
+    open_matches = [summary for summary in matches if int(summary.get("open_qty", 0) or 0) > 0]
+    if open_matches:
+        return open_matches[-1]
+    return matches[-1] if matches else {}
 
 
 def _read_ticket(path_value: str) -> dict:

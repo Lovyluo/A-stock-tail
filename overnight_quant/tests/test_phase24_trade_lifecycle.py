@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from overnight_quant.execution.order_recorder import record_manual_order, record_position_update
+from overnight_quant.execution.order_recorder import bind_stock_name, record_manual_order, record_position_update, void_manual_order
 from overnight_quant.execution.position_tracker import get_open_positions, get_position_summaries, read_order_rows
 from overnight_quant.scripts.run_sell_plan import _realtime_trigger_cn, _sell_trigger_cn, generate_sell_plan
 from overnight_quant.strategy.yang_yongxing_overnight import load_config
@@ -143,6 +143,100 @@ def test_position_update_preserves_multiple_same_code_buys(tmp_path):
     assert summary["open_qty"] == 300
     assert summary["avg_buy_price"] == 19.3333
     assert summary["stop_loss_price"] == 18.8
+
+
+def test_position_update_uses_bound_name_when_later_input_name_is_wrong(tmp_path):
+    config = _tmp_config(tmp_path)
+
+    record_position_update(
+        config,
+        code="300001",
+        name="Correct Name",
+        price=18.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:01:00",
+    )
+    result = record_position_update(
+        config,
+        code="300001",
+        name="Wrong Name",
+        price=20.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:15:00",
+    )
+    rows = read_order_rows(config["paths"]["records_dir"])
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert result["allow"] is True
+    assert rows[1]["name"] == "Correct Name"
+    assert summary["name"] == "Correct Name"
+
+
+def test_manual_name_binding_can_correct_existing_display_name(tmp_path):
+    config = _tmp_config(tmp_path)
+    record_position_update(
+        config,
+        code="300001",
+        name="Wrong Name",
+        price=18.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:01:00",
+    )
+
+    result = bind_stock_name(config, "300001", "Correct Name", notes="typo fix")
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert result["allow"] is True
+    assert summary["name"] == "Correct Name"
+
+
+def test_void_manual_order_removes_bad_fill_from_position_math(tmp_path):
+    config = _tmp_config(tmp_path)
+    first = record_position_update(
+        config,
+        code="300001",
+        name="Demo Robotics",
+        price=18.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:01:00",
+    )
+    record_position_update(
+        config,
+        code="300001",
+        name="Demo Robotics",
+        price=30.0,
+        qty=100,
+        side="BUY",
+        trade_time="2026-05-23 10:15:00",
+    )
+
+    result = void_manual_order(config, first["row"]["order_id"], notes="wrong lot")
+    rows = read_order_rows(config["paths"]["records_dir"])
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert result["allow"] is True
+    assert rows[0]["status"] == "VOID"
+    assert summary["open_qty"] == 100
+    assert summary["avg_buy_price"] == 30.0
+
+
+def test_reopened_position_starts_new_cost_cycle_after_full_close(tmp_path):
+    config = _tmp_config(tmp_path)
+    record_position_update(config, "300001", 10.0, 100, "BUY", "2026-05-23 10:01:00", name="Demo Robotics")
+    record_position_update(config, "300001", 11.0, 100, "SELL", "2026-05-23 10:30:00", name="Demo Robotics")
+    record_position_update(config, "300001", 12.0, 200, "BUY", "2026-05-23 13:30:00", name="Demo Robotics")
+
+    summaries = get_position_summaries(config["paths"]["records_dir"])
+    open_positions = get_open_positions(config["paths"]["records_dir"])
+
+    assert [row["status"] for row in summaries] == ["CLOSED", "OPEN"]
+    assert summaries[0]["avg_buy_price"] == 10.0
+    assert open_positions[0]["open_qty"] == 200
+    assert open_positions[0]["avg_buy_price"] == 12.0
 
 
 def test_position_update_rejects_sell_more_than_open_qty(tmp_path):

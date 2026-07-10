@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from overnight_quant.execution.position_tracker import get_open_positions, get_position_summaries, read_order_rows
+from overnight_quant.execution.position_tracker import active_order_rows, get_open_positions, get_position_summaries
 
 
 def write_trade_lifecycle_report(
@@ -15,7 +15,7 @@ def write_trade_lifecycle_report(
     trade_date = trade_date or date.today().isoformat()
     records_dir = config.get("paths", {}).get("records_dir", "overnight_quant/records")
     reports_dir = config.get("paths", {}).get("reports_dir", "overnight_quant/reports")
-    rows = read_order_rows(records_dir)
+    rows = active_order_rows(records_dir)
     open_positions = get_open_positions(records_dir)
     summaries = get_position_summaries(records_dir)
     buy_rows = [row for row in rows if str(row.get("side") or "BUY").upper() == "BUY"]

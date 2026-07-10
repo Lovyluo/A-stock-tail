@@ -666,6 +666,30 @@ def test_load_dashboard_state_reads_manual_orders_and_position_summary(tmp_path)
     assert rows[0]["realized_pnl"] == 100.0
 
 
+def test_position_summary_splits_open_and_closed_cycles(tmp_path):
+    from overnight_quant.ui.dashboard import build_position_summary_table, split_position_summary_tables
+    from overnight_quant.ui.result_parser import SimpleTable
+
+    manual_orders = SimpleTable(
+        [
+            {"order_id": "B1", "trade_time": "2026-05-23 10:00:00", "code": "300001", "name": "Demo", "side": "BUY", "price": 10, "qty": 100, "amount": 1000, "status": "FILLED"},
+            {"order_id": "S1", "trade_time": "2026-05-23 10:30:00", "code": "300001", "name": "Demo", "side": "SELL", "price": 11, "qty": 100, "amount": 1100, "status": "FILLED"},
+            {"order_id": "B2", "trade_time": "2026-05-23 13:30:00", "code": "300001", "name": "Demo", "side": "BUY", "price": 12, "qty": 200, "amount": 2400, "status": "FILLED"},
+        ]
+    )
+
+    summary = build_position_summary_table(manual_orders)
+    open_table, closed_table = split_position_summary_tables(summary)
+    open_rows = open_table.to_dict("records")
+    closed_rows = closed_table.to_dict("records")
+
+    assert len(open_rows) == 1
+    assert len(closed_rows) == 1
+    assert open_rows[0]["open_qty"] == 200
+    assert open_rows[0]["avg_buy_price"] == 12.0
+    assert closed_rows[0]["status"] == "CLOSED"
+
+
 def test_load_dashboard_state_reads_sell_plan_detail_table(tmp_path):
     from overnight_quant.ui.dashboard import load_dashboard_state
 

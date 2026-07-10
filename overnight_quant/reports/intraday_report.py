@@ -10,6 +10,9 @@ INTRADAY_SIGNAL_FIELDS = [
     "code",
     "name",
     "source_category",
+    "is_position",
+    "position_open_qty",
+    "position_avg_buy_price",
     "after_close_score",
     "signal",
     "signal_score",
@@ -22,6 +25,15 @@ INTRADAY_SIGNAL_FIELDS = [
     "limit_up_gap_pct",
     "volume_confirmation",
     "intraday_source",
+    "chip_peak_type",
+    "chip_avg_cost_20d",
+    "current_vs_chip_cost_pct",
+    "overhead_pressure_ratio",
+    "downside_support_ratio",
+    "main_force_chip_proxy",
+    "volume_signal",
+    "confidence_delta",
+    "chip_volume_reasons",
     "buy_zone",
     "reasons",
     "invalid_conditions",
@@ -74,15 +86,16 @@ def write_intraday_report(result: dict, reports_dir: str) -> str:
     if signal_rows:
         lines.extend(
             [
-                "| code | name | signal | score | price | vwap | vwap_gap_pct | buy_zone | reasons | invalid_conditions |",
-                "|---|---|---|---:|---:|---:|---:|---|---|---|",
+                "| code | name | source | signal | score | price | vwap | vwap_gap_pct | chip_peak | volume_signal | confidence_delta | buy_zone | reasons | invalid_conditions |",
+                "|---|---|---|---|---:|---:|---:|---:|---|---|---:|---|---|---|",
             ]
         )
         for row in signal_rows:
             lines.append(
-                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {row.get('signal', '')} | "
+                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {_escape(_source_label(row))} | {row.get('signal', '')} | "
                 f"{row.get('signal_score', '')} | {row.get('price', '')} | {row.get('vwap', '')} | "
-                f"{row.get('distance_to_vwap_pct', '')} | {_escape(row.get('buy_zone', ''))} | "
+                f"{row.get('distance_to_vwap_pct', '')} | {_escape(row.get('chip_peak_type', ''))} | "
+                f"{_escape(row.get('volume_signal', ''))} | {row.get('confidence_delta', '')} | {_escape(row.get('buy_zone', ''))} | "
                 f"{_escape(_join(row.get('reasons')))} | {_escape(_join(row.get('invalid_conditions')))} |"
             )
     else:
@@ -92,14 +105,15 @@ def write_intraday_report(result: dict, reports_dir: str) -> str:
         lines.extend(["", "## No-Buy Audit", ""])
         lines.extend(
             [
-                "| code | name | score | price | vwap | invalid_conditions | risk_flags |",
-                "|---|---|---:|---:|---:|---|---|",
+                "| code | name | source | score | price | vwap | chip_peak | volume_signal | invalid_conditions | risk_flags |",
+                "|---|---|---|---:|---:|---:|---|---|---|---|",
             ]
         )
         for row in no_buy_rows[:20]:
             lines.append(
-                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {row.get('signal_score', '')} | "
+                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {_escape(_source_label(row))} | {row.get('signal_score', '')} | "
                 f"{row.get('price', '')} | {row.get('vwap', '')} | "
+                f"{_escape(row.get('chip_peak_type', ''))} | {_escape(row.get('volume_signal', ''))} | "
                 f"{_escape(_join(row.get('invalid_conditions')))} | {_escape(_join(row.get('risk_flags')))} |"
             )
     lines.extend(["", "## Data Quality", ""])
@@ -124,6 +138,7 @@ def _csv_row(row: dict, result: dict) -> dict:
     output["reasons"] = _join(row.get("reasons"))
     output["invalid_conditions"] = _join(row.get("invalid_conditions"))
     output["risk_flags"] = _join(row.get("risk_flags"))
+    output["chip_volume_reasons"] = _join(row.get("chip_volume_reasons"))
     return output
 
 
@@ -135,3 +150,9 @@ def _join(value) -> str:
 
 def _escape(value) -> str:
     return str(value).replace("|", "/").replace("\n", " ")
+
+
+def _source_label(row: dict) -> str:
+    if row.get("is_position") in {True, "True", "true", "1", 1}:
+        return f"{row.get('source_category', '')}+POSITION"
+    return str(row.get("source_category", ""))
