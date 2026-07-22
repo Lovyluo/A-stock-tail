@@ -91,10 +91,11 @@ def write_after_close_report(result: dict, reports_dir: str) -> str:
         else path / f"after_close_analysis_{result['trade_date']}.md"
     )
     lines = [
-        "# 早盘前收盘回放观察报告" if is_replay else "# 盘后观察池报告",
+        "# 早盘前收盘回放观察报告" if is_replay else "# 尾盘观察池报告",
         "",
         f"date: {result['trade_date']}",
         f"analysis_mode: {result.get('analysis_mode', 'after_close')}",
+        f"analysis_context: {result.get('analysis_context', '')}",
         f"mode: {result['mode']}",
         f"status: {result['status']}",
         f"session_state: {result['session_state']}",
@@ -201,6 +202,7 @@ def _add_category_section(lines: list[str], result: dict, category: str, title: 
         if result["status"] in {
             "NOT_TRADING_DAY",
             "NOT_AFTER_CLOSE",
+            "NOT_TAIL_OBSERVATION_WINDOW",
             "DATA_FALLBACK_DEMO",
             "DATA_QUALITY_BLOCKED",
             "NOT_REPLAY_WINDOW",

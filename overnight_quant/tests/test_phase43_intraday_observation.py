@@ -110,6 +110,26 @@ def test_live_intraday_confirmed_vwap_reclaim_can_emit_a_point(tmp_path):
     assert result["rows"][0]["has_intraday_series"] is True
 
 
+def test_intraday_outputs_holding_defence_and_watchlist_observation_conditions(tmp_path):
+    analyzer = IntradayObservationAnalyzer(
+        StubIntradayClient(bars=_confirmed_bars(), market_ok=True),
+        _tmp_config(tmp_path),
+        "live",
+        now=datetime(2026, 5, 22, 10, 5, tzinfo=CN_TZ),
+        candidate_rows=[
+            {**_candidate(), "source_bucket": "holding", "avg_buy_price": 19.2, "stop_loss_price": 18.4},
+            {**_candidate(), "code": "600001", "source_bucket": "watchlist", "source_buckets": "watchlist|auction_new"},
+        ],
+    )
+
+    result = analyzer.analyze("2026-05-22")
+    holding, watch = result["rows"]
+    assert holding["source_bucket"] == "holding"
+    assert any("止损观察线" in item for item in holding["defence_conditions"])
+    assert watch["source_bucket"] == "watchlist"
+    assert any("竞价偏强" in item for item in watch["observation_conditions"])
+
+
 def _tmp_config(tmp_path):
     config = load_intraday_config()
     config["paths"] = {

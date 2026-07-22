@@ -15,6 +15,7 @@ from overnight_quant.data.demo_data import demo_quotes
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.execution.state_manager import config_for_mode
 from overnight_quant.reports.intraday_report import write_intraday_report, write_intraday_signals_csv
+from overnight_quant.strategy.auction_observation import load_trading_day_candidates
 from overnight_quant.strategy.intraday_observation import IntradayObservationAnalyzer, load_intraday_config
 
 
@@ -49,12 +50,14 @@ def run_intraday_observation(
 
 
 def _load_candidates(records_dir: Path, explicit_path: str | None = None) -> tuple[list[dict], str]:
-    path = Path(explicit_path) if explicit_path else _latest_watchlist(records_dir)
+    if not explicit_path:
+        return load_trading_day_candidates(records_dir, include_auction=True), "holdings|tail_pick|watchlist|auction"
+    path = Path(explicit_path)
     if not path or not path.exists():
         return [], ""
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    rows = [row for row in rows if str(row.get("category", "")).upper() in {"A", "B"}]
+    rows = [row for row in rows if not row.get("category") or str(row.get("category", "")).upper() in {"A", "B"}]
     return rows, str(path)
 
 

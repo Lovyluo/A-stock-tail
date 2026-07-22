@@ -10,8 +10,11 @@ INTRADAY_SIGNAL_FIELDS = [
     "code",
     "name",
     "source_category",
+    "source_bucket",
+    "source_buckets",
     "after_close_score",
     "signal",
+    "action_bias",
     "signal_score",
     "price",
     "vwap",
@@ -26,6 +29,8 @@ INTRADAY_SIGNAL_FIELDS = [
     "reasons",
     "invalid_conditions",
     "risk_flags",
+    "defence_conditions",
+    "observation_conditions",
 ]
 
 RISK_WARNING = "Observation only; no automated orders; not investment advice."
@@ -74,15 +79,17 @@ def write_intraday_report(result: dict, reports_dir: str) -> str:
     if signal_rows:
         lines.extend(
             [
-                "| code | name | signal | score | price | vwap | vwap_gap_pct | buy_zone | reasons | invalid_conditions |",
-                "|---|---|---|---:|---:|---:|---:|---|---|---|",
+                "| code | name | source | action_bias | signal | score | price | vwap | vwap_gap_pct | observation | defence | reasons | invalid_conditions |",
+                "|---|---|---|---|---|---:|---:|---:|---:|---|---|---|---|",
             ]
         )
         for row in signal_rows:
             lines.append(
-                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {row.get('signal', '')} | "
+                f"| {row.get('code', '')} | {_escape(row.get('name', ''))} | {_escape(row.get('source_buckets', ''))} | "
+                f"{row.get('action_bias', '')} | {row.get('signal', '')} | "
                 f"{row.get('signal_score', '')} | {row.get('price', '')} | {row.get('vwap', '')} | "
-                f"{row.get('distance_to_vwap_pct', '')} | {_escape(row.get('buy_zone', ''))} | "
+                f"{row.get('distance_to_vwap_pct', '')} | {_escape(_join(row.get('observation_conditions')))} | "
+                f"{_escape(_join(row.get('defence_conditions')))} | "
                 f"{_escape(_join(row.get('reasons')))} | {_escape(_join(row.get('invalid_conditions')))} |"
             )
     else:
@@ -124,6 +131,8 @@ def _csv_row(row: dict, result: dict) -> dict:
     output["reasons"] = _join(row.get("reasons"))
     output["invalid_conditions"] = _join(row.get("invalid_conditions"))
     output["risk_flags"] = _join(row.get("risk_flags"))
+    output["defence_conditions"] = _join(row.get("defence_conditions"))
+    output["observation_conditions"] = _join(row.get("observation_conditions"))
     return output
 
 

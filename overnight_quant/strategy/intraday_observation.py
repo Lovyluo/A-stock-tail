@@ -145,8 +145,11 @@ class IntradayObservationAnalyzer:
             "code": code,
             "name": candidate.get("name") or current.get("name", ""),
             "source_category": candidate.get("category", ""),
+            "source_bucket": candidate.get("source_bucket", "watchlist"),
+            "source_buckets": candidate.get("source_buckets", candidate.get("source_bucket", "watchlist")),
             "after_close_score": _as_float(candidate.get("score"), 0.0),
             "signal": signal,
+            "action_bias": _action_bias(candidate, snapshot, metrics, market_gate, risk_flags, invalid),
             "signal_score": round(score, 2),
             "price": snapshot["price"],
             "vwap": snapshot["vwap"],
@@ -162,6 +165,8 @@ class IntradayObservationAnalyzer:
             "reasons": reasons,
             "invalid_conditions": invalid,
             "risk_flags": risk_flags,
+            "defence_conditions": _defence_conditions(candidate, metrics),
+            "observation_conditions": _observation_conditions(candidate),
         }
 
 
@@ -411,6 +416,48 @@ def _candidate_risk_flags(candidate: dict) -> list[str]:
         "safety_field_unknown",
     }
     return _unique(token.strip() for token in tokens if token.strip() in hard)
+
+
+def _is_holding(candidate: dict) -> bool:
+    return candidate.get("source_bucket") == "holding" or "holding" in str(candidate.get("source_buckets", ""))
+
+
+def _action_bias(candidate: dict, snapshot: dict, metrics: dict, market_gate: dict, risk_flags: list[str], invalid: list[str]) -> str:
+    holding = _is_holding(candidate)
+    if risk_flags or not snapshot.get("price") or not snapshot.get("vwap"):
+        return "avoid"
+    below_vwap = float(metrics.get("distance_to_vwap_pct", 0) or 0) < 0
+    if holding and (below_vwap or not market_gate.get("pass")):
+        return "defend"
+    if not market_gate.get("pass") or invalid:
+        return "defend" if holding else "observe"
+    if float(metrics.get("distance_to_vwap_pct", 0) or 0) >= 0 and metrics.get("volume_confirmation"):
+        return "attack"
+    return "observe"
+
+
+def _defence_conditions(candidate: dict, metrics: dict) -> list[str]:
+    if not _is_holding(candidate):
+        return []
+    conditions = ["跌破 VWAP 后反抽不过", "市场方向转弱"]
+    cost = _as_float(candidate.get("avg_buy_price") or candidate.get("buy_price"), 0.0)
+    stop = _as_float(candidate.get("stop_loss_price"), 0.0)
+    if cost:
+        conditions.append(f"跌破持仓成本 {cost:.3f}")
+    if stop:
+        conditions.append(f"跌破止损观察线 {stop:.3f}")
+    if float(metrics.get("distance_to_vwap_pct", 0) or 0) < 0:
+        conditions.append("当前位于 VWAP 下方，优先观察承接")
+    return conditions
+
+
+def _observation_conditions(candidate: dict) -> list[str]:
+    if _is_holding(candidate):
+        return ["重新站稳 VWAP 且分时低点不再下移"]
+    conditions = ["回踩 VWAP 不破", "放量重新站上 VWAP"]
+    if "auction" in str(candidate.get("source_buckets", "")):
+        conditions.append("竞价偏强但盘中承接转弱时降低观察等级")
+    return conditions
 
 
 def _limit_candidates(rows: list[dict], config: dict) -> list[dict]:

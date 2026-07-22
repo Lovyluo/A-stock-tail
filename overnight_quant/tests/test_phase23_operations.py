@@ -23,7 +23,7 @@ def test_preflight_report_generation(tmp_path, monkeypatch):
     text = report.read_text(encoding="utf-8")
     assert "PRE_MARKET" not in text
     assert "session_state: NON_TRADING_DAY" in text
-    assert result["status"] == "NON_TRADING_DAY"
+    assert result["status"] == "PROJECT_HEALTHY"
 
 
 def test_dry_run_does_not_generate_manual_ticket(tmp_path, monkeypatch):

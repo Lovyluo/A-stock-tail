@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.data.astock_client import AStockClient, DATA_CONTEXT_PREVIOUS_CLOSE_REPLAY
-from overnight_quant.data.market_calendar import CN_TZ, effective_after_close_trade_day, previous_likely_cn_trade_day
+from overnight_quant.data.market_calendar import CN_TZ, effective_tail_observation_trade_day, previous_likely_cn_trade_day
 from overnight_quant.execution.state_manager import config_for_mode
 from overnight_quant.reports.after_close_report import write_after_close_report, write_watchlist_csv
 from overnight_quant.strategy.after_close_analysis import AfterCloseAnalyzer, load_after_close_config
@@ -30,7 +30,8 @@ def run_after_close_analysis(
         raise ValueError("REPLAY_REQUIRES_LIVE_MODE")
     analyzer_now = _normalize_now(now)
     effective_trade_date = trade_date
-    carryover_trade_day = effective_after_close_trade_day(analyzer_now) if mode == "live" and not replay_previous_close else None
+    tail_start = runtime_config.get("tail_observation", {}).get("live_start", "14:50")
+    carryover_trade_day = effective_tail_observation_trade_day(analyzer_now, tail_start) if mode == "live" and not replay_previous_close else None
     if carryover_trade_day and carryover_trade_day != analyzer_now.date() and effective_trade_date is None:
         effective_trade_date = carryover_trade_day.isoformat()
     if client is not None:
@@ -70,7 +71,7 @@ def _normalize_now(now: datetime | None) -> datetime:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate an after-close next-morning observation watchlist.")
+    parser = argparse.ArgumentParser(description="Generate a tail-observation watchlist after 14:50 or replay it after close.")
     parser.add_argument("--mode", choices=["demo", "live"], default="demo")
     parser.add_argument("--date", default=None)
     parser.add_argument("--replay-previous-close", action="store_true")
@@ -89,6 +90,7 @@ def main() -> int:
     categories = result["categories"]
     print(f"Mode: {result['mode']}")
     print(f"Analysis Mode: {result.get('analysis_mode', 'after_close')}")
+    print(f"Analysis Context: {result.get('analysis_context', '')}")
     print(f"Status: {result['status']}")
     print(f"Session State: {result['session_state']}")
     print(f"Candidate Source: {result['candidate_source']}")

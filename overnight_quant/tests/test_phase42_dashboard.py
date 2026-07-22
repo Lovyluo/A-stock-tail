@@ -130,6 +130,8 @@ def test_command_whitelist_contains_only_approved_actions():
 
     assert set(APPROVED_ACTIONS) == {
         "preflight",
+        "news_live",
+        "auction_live",
         "intraday_live",
         "live_dry_run",
         "formal_live_scan",
@@ -137,6 +139,8 @@ def test_command_whitelist_contains_only_approved_actions():
         "morning_replay_live",
         "sell_plan_live",
         "demo_intraday",
+        "demo_auction",
+        "demo_news",
         "demo_after_close",
         "demo_scan",
     }
@@ -335,16 +339,7 @@ def test_premium_dashboard_css_has_dark_financial_terminal_theme():
 def test_premium_tabs_include_tail_and_sell_plan():
     from overnight_quant.ui.dashboard import premium_tab_labels
 
-    assert premium_tab_labels("en") == [
-        "Overview",
-        "Preflight",
-        "Live Dry-run",
-        "Tail",
-        "After Close",
-        "Morning Replay",
-        "Position Update",
-        "Sell Plan",
-    ]
+    assert premium_tab_labels("en") == ["Today", "News", "Auction", "Intraday", "Tail Observation", "Positions / Sell Plan", "Audit / Maintenance"]
 
 
 def test_risk_badge_html_uses_status_tone_classes():
