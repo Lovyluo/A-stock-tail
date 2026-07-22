@@ -130,6 +130,8 @@ def test_previous_likely_trade_day_uses_weekday_proxy():
 def test_pre_market_effective_after_close_trade_day_uses_previous_trade_day():
     assert effective_after_close_trade_day(datetime(2026, 5, 25, 0, 30, tzinfo=CN_TZ)).isoformat() == "2026-05-22"
     assert effective_after_close_trade_day(datetime(2026, 5, 25, 15, 30, tzinfo=CN_TZ)).isoformat() == "2026-05-25"
+    assert effective_after_close_trade_day(datetime(2026, 5, 23, 15, 30, tzinfo=CN_TZ)).isoformat() == "2026-05-22"
+    assert effective_after_close_trade_day(datetime(2026, 5, 24, 15, 30, tzinfo=CN_TZ)).isoformat() == "2026-05-22"
     assert effective_after_close_trade_day(datetime(2026, 5, 25, 10, 0, tzinfo=CN_TZ)) is None
 
 

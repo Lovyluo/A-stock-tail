@@ -36,12 +36,14 @@ def effective_after_close_trade_day(value: datetime) -> date | None:
 
     Before the market opens, the previous trading day is still the effective
     after-close session. This lets Monday pre-market also behave as Friday
-    after-close for review/watchlist generation.
+    after-close for review/watchlist generation. On weekends, the most recent
+    weekday is still the effective after-close day so the dashboard can reopen
+    the latest watchlist instead of failing as a non-trading day.
     """
     current = value if value.tzinfo else value.replace(tzinfo=CN_TZ)
     current = current.astimezone(CN_TZ)
     if not is_likely_cn_trade_day(current):
-        return None
+        return previous_likely_cn_trade_day(current)
     session = get_session_state(current)
     if session in {PRE_MARKET, CALL_AUCTION}:
         return previous_likely_cn_trade_day(current)

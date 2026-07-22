@@ -98,15 +98,42 @@ def test_demo_mode_writes_example_outputs_and_labels_demo_only(tmp_path):
     assert _rows(result["watchlist_csv"])
 
 
-def test_live_non_trading_day_writes_header_only_watchlist(tmp_path):
+def test_live_weekend_after_close_carries_over_previous_trade_day(tmp_path):
+    config = _tmp_config(tmp_path)
+    config["after_close"]["min_a_score"] = 90
+    config["after_close"]["min_b_score"] = 70
+
     result = run_after_close_analysis(
         mode="live",
+        now=datetime(2026, 5, 23, 15, 30, tzinfo=CN_TZ),
+        config=config,
+        client=StubAfterCloseClient("live", demo_quotes()),
+    )
+
+    assert result["status"] == "WATCHLIST_READY"
+    assert result["session_state"] == "NON_TRADING_DAY"
+    assert result["trade_date"] == "2026-05-22"
+    assert result["next_trade_date"] == "2026-05-25"
+    assert result["after_close_carryover"] == "YES"
+    assert result["observation_date"] == "2026-05-23"
+    assert result["valid_for_trading_observation"] == "YES"
+    assert _rows(result["watchlist_csv"])
+    text = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "after_close_carryover: YES" in text
+    assert "最近一个交易日盘后延续窗口" in text
+
+
+def test_live_weekend_current_date_override_is_not_after_close(tmp_path):
+    result = run_after_close_analysis(
+        mode="live",
+        trade_date="2026-05-23",
         now=datetime(2026, 5, 23, 15, 30, tzinfo=CN_TZ),
         config=_tmp_config(tmp_path),
         client=StubAfterCloseClient("live", demo_quotes()),
     )
 
-    assert result["status"] == "NOT_TRADING_DAY"
+    assert result["status"] == "NOT_AFTER_CLOSE"
+    assert result["trade_date"] == "2026-05-23"
     assert result["valid_for_trading_observation"] == "NO"
     assert _rows(result["watchlist_csv"]) == []
     assert _headers(result["watchlist_csv"]) == WATCHLIST_FIELDS

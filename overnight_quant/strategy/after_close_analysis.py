@@ -222,8 +222,6 @@ class AfterCloseAnalyzer:
                     return self._blocked_result(result, "NOT_REPLAY_WINDOW")
             else:
                 effective_after_close_day = effective_after_close_trade_day(self.now)
-                if not is_likely_cn_trade_day(self.now):
-                    return self._blocked_result(result, "NOT_TRADING_DAY")
                 if not effective_after_close_day or date_value != effective_after_close_day.isoformat():
                     return self._blocked_result(result, "NOT_AFTER_CLOSE")
 

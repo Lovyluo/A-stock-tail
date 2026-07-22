@@ -123,7 +123,7 @@ def write_after_close_report(result: dict, reports_dir: str) -> str:
                 f"observation_date: {result.get('observation_date', '')}",
                 f"freshness_basis: {result.get('freshness_basis', '')}",
                 "",
-                "当前为开盘前时段，本观察池按上一交易日盘后延续窗口生成。",
+                "当前不在当日常规收盘后生成窗口，本观察池按最近一个交易日盘后延续窗口生成。",
             ]
         )
     lines.extend(["", "## 1. 市场环境", "", f"- 市场评分: {result.get('market_score', 0)}"])
