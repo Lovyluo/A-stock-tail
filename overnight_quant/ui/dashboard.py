@@ -607,11 +607,11 @@ ACTION_TEXT = {
         "auction_live": "集合竞价观察",
         "intraday_live": "盘中攻防",
         "live_dry_run": "Live Dry-run",
-        "formal_live_scan": "正式 Live 尾盘扫描",
-        "after_close_live": "尾盘观察池",
+        "formal_live_scan": "尾盘策略",
+        "after_close_live": "盘后观察池",
         "morning_replay_live": "早盘 Replay",
         "sell_plan_live": "卖出计划",
-        "demo_after_close": "演示：尾盘观察池",
+        "demo_after_close": "演示：盘后观察池",
         "demo_auction": "演示：集合竞价",
         "demo_news": "演示：消息面",
         "demo_scan": "演示：Demo Scan",
@@ -623,7 +623,7 @@ ACTION_TEXT = {
         "intraday_live": "Intraday VWAP",
         "live_dry_run": "Live Dry-run",
         "formal_live_scan": "Formal Live Tail Scan",
-        "after_close_live": "Tail Observation",
+        "after_close_live": "After-Close Watchlist",
         "morning_replay_live": "Morning Replay",
         "sell_plan_live": "Sell Plan",
         "demo_after_close": "Demo: After-Close",
@@ -991,12 +991,12 @@ def status_badge(status: str) -> dict[str, str]:
 
 def premium_tab_labels(language: str) -> list[str]:
     if language == "en":
-        return ["Today", "News", "Auction", "Intraday", "Tail Observation", "Positions / Sell Plan", "Audit / Maintenance"]
-    return ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘观察池", "持仓/卖出计划", "审计与维护"]
+        return ["Today", "News", "Auction", "Intraday", "Tail Strategy", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
+    return ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘策略", "盘后观察池", "持仓/卖出计划", "审计与维护"]
 
 
 def primary_action_keys() -> list[str]:
-    return ["news_live", "auction_live", "intraday_live", "after_close_live", "sell_plan_live"]
+    return ["news_live", "auction_live", "intraday_live", "formal_live_scan", "after_close_live", "sell_plan_live"]
 
 
 def maintenance_action_keys() -> list[str]:
@@ -1406,16 +1406,16 @@ def _action_failure_message(action: str, result: dict[str, Any], language: str) 
 
 def _action_success_warning_message(action: str, result: dict[str, Any], language: str) -> str:
     status = _command_output_field(result.get("stdout", ""), "Status")
-    if action == "after_close_live" and status in {"NOT_AFTER_CLOSE", "NOT_TRADING_DAY", "NOT_TAIL_OBSERVATION_WINDOW"}:
+    if action == "after_close_live" and status in {"NOT_AFTER_CLOSE", "NOT_TRADING_DAY"}:
         session_state = _command_output_field(result.get("stdout", ""), "Session State") or "UNKNOWN"
         if language == "en":
             return (
                 f"After-close command ran, but the formal watchlist was not generated. "
-                f"Status: {status}; session: {session_state}. Run it after market close."
+                f"Status: {status}; session: {session_state}. Run it from 14:50 onward."
             )
         return (
             "盘后观察池命令已运行，但本次没有生成正式观察池。"
-            f"状态：{status}；当前时段：{session_state}。请在收盘后再运行。"
+            f"状态：{status}；当前时段：{session_state}。请在交易日 14:50 后再运行。"
         )
     if action == "morning_replay_live" and status == "NOT_REPLAY_WINDOW":
         session_state = _command_output_field(result.get("stdout", ""), "Session State") or "UNKNOWN"
@@ -1909,14 +1909,35 @@ def main() -> None:
         _render_report_section(st, "盘中攻防" if language == "zh" else "Intraday Attack / Defence", state["intraday"], language, "intraday")
         render_table_or_empty(st, state["intraday_signals"], language, t(language, "empty_table"))
     with tabs[4]:
-        _render_report_section(st, "尾盘观察池" if language == "zh" else "Tail Observation", state["after_close"], language, "after_close")
+        st.caption("原尾盘策略窗口：交易日 14:25-14:55。" if language == "zh" else "Existing tail strategy window: trading days 14:25-14:55.")
+        _render_report_section(st, "尾盘策略审计" if language == "zh" else "Tail Strategy Audit", state["dry_run"], language, "dry_run")
+        st.markdown("#### 正式 Live 买入核对信息" if language == "zh" else "#### Formal Live Buy Review")
+        plan_rows = formal_live_buy_plan_rows(state, language)
+        if plan_rows:
+            render_key_value_rows(st, plan_rows, language)
+        else:
+            st.caption("暂无正式 Live 人工买入票据。" if language == "zh" else "No formal Live manual ticket is available.")
+        _render_guidance(st, tail_usage_guidance(state, language))
+        observable, legacy_rejected = split_tail_signal_rows(state["signals"])
+        raw_rejected = state["signal_rejections"] if not state["signal_rejections"].empty else legacy_rejected
+        rejected, hard_excluded = split_tail_rejection_rows(raw_rejected)
+        st.markdown("#### 尾盘可观察候选" if language == "zh" else "#### Tail Observable Candidates")
+        render_table_or_empty(st, observable, language, t(language, "empty_table"))
+        st.markdown("#### 风险排除 / 不观察" if language == "zh" else "#### Risk Exclusions / Do Not Observe")
+        render_table_or_empty(st, rejected, language, t(language, "empty_table"))
+        if not hard_excluded.empty:
+            with st.expander("基础硬排除审计" if language == "zh" else "Base Hard-Exclusion Audit"):
+                render_table_or_empty(st, hard_excluded, language, t(language, "empty_table"))
+    with tabs[5]:
+        st.caption("盘后观察池使用独立盘后分析策略，交易日 14:50 起可运行。" if language == "zh" else "The separate after-close analysis is available from 14:50 on trading days.")
+        _render_report_section(st, "盘后观察池" if language == "zh" else "After-Close Watchlist", state["after_close"], language, "after_close")
         st.markdown("#### A/B 正式观察池" if language == "zh" else "#### A/B Formal Observation")
         render_table_or_empty(st, state["watchlist"], language, t(language, "empty_table"))
         st.markdown("#### 筹码与量价确认" if language == "zh" else "#### Chip / Volume Confirmation")
         render_table_or_empty(st, state["after_close_chip_volume_rows"], language, t(language, "empty_table"))
         st.markdown("#### C 类风险观察 / 不建议追" if language == "zh" else "#### C Class Risk Observation / Do Not Chase")
         render_table_or_empty(st, state["after_close_risk_rows"], language, t(language, "empty_table"))
-    with tabs[5]:
+    with tabs[6]:
         _render_position_update(st, state, language, mode)
         def _render_sell_plan_tab() -> None:
             _render_sell_plan_page(st, state, language, mode)
@@ -1928,7 +1949,7 @@ def main() -> None:
                 fragment(_render_sell_plan_tab)()
         else:
             _render_sell_plan_tab()
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("#### " + ("维护动作" if language == "zh" else "Maintenance Actions"))
         maintenance = maintenance_action_keys()
         cols = st.columns(3)
@@ -1946,12 +1967,14 @@ def _render_top_status_bar(st, state: dict[str, Any], language: str) -> None:
     news = state.get("news_briefing", {})
     auction = state.get("auction", {})
     intraday = state.get("intraday", {})
-    tail = state.get("after_close", {})
+    tail = state.get("dry_run", {})
+    after_close = state.get("after_close", {})
     items = [
         ("mode", t(language, "mode"), hero_conclusion(state, language)["mode_label"]),
         ("status", "消息面" if language == "zh" else "News", news.get("status", "MISSING")),
         ("status", "集合竞价" if language == "zh" else "Auction", auction.get("market_auction_bias", auction.get("status", "MISSING"))),
-        ("status", "盘中/尾盘" if language == "zh" else "Intraday / Tail", f"{intraday.get('status', 'MISSING')} / {tail.get('status', 'MISSING')}"),
+        ("status", "盘中/尾盘策略" if language == "zh" else "Intraday / Tail", f"{intraday.get('status', 'MISSING')} / {tail.get('status', 'MISSING')}"),
+        ("status", "盘后观察池" if language == "zh" else "After Close", after_close.get("status", "MISSING")),
     ]
     cells = []
     for field, label, value in items:
@@ -1982,45 +2005,54 @@ def _render_premium_hero(st, state: dict[str, Any], language: str) -> None:
 def _render_action_grid(st, language: str) -> None:
     st.markdown('<div class="oq-action-grid">', unsafe_allow_html=True)
     action_keys = primary_action_keys()
-    cols = st.columns(len(action_keys))
-    for col, action in zip(cols, action_keys):
-        if col.button(action_label(language, action), use_container_width=True, key=f"main_{action}"):
-            st.session_state["last_action_feedback"] = run_dashboard_action(action, language)
-            st.rerun()
+    for start in range(0, len(action_keys), 3):
+        row_actions = action_keys[start : start + 3]
+        cols = st.columns(3)
+        for col, action in zip(cols, row_actions):
+            if col.button(action_label(language, action), use_container_width=True, key=f"main_{action}"):
+                st.session_state["last_action_feedback"] = run_dashboard_action(action, language)
+                st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_overview(st, state: dict[str, Any], language: str) -> None:
     st.subheader(t(language, "overview"))
     st.info(state["conclusion"])
-    cols = st.columns(5)
+    first_row = st.columns(3)
+    second_row = st.columns(3)
     render_status_card(
-        cols[0],
+        first_row[0],
         "消息面方向" if language == "zh" else "News Direction",
         state["news_briefing"].get("status", "MISSING"),
         status_badge(state["news_briefing"].get("status", "MISSING"))["tone"],
     )
     render_status_card(
-        cols[1],
+        first_row[1],
         "集合竞价方向" if language == "zh" else "Auction Direction",
         state["auction"].get("market_auction_bias", state["auction"].get("status", "MISSING")),
         status_badge(state["auction"].get("status", "MISSING"))["tone"],
     )
     render_status_card(
-        cols[2],
+        first_row[2],
         "盘中攻防" if language == "zh" else "Intraday",
         state["intraday"].get("status", "MISSING"),
         status_badge(state["intraday"].get("status", "MISSING"))["tone"],
     )
     render_status_card(
-        cols[3],
-        "尾盘观察池" if language == "zh" else "Tail Observation",
+        second_row[0],
+        "尾盘策略" if language == "zh" else "Tail Strategy",
+        state["dry_run"].get("status", "MISSING"),
+        status_badge(state["dry_run"].get("status", "MISSING"))["tone"],
+    )
+    render_status_card(
+        second_row[1],
+        "盘后观察池" if language == "zh" else "After Close",
         state["after_close"].get("status", "MISSING"),
         status_badge(state["after_close"].get("status", "MISSING"))["tone"],
     )
     position_rows = _table_records(state.get("position_summary"))
     risk_status = state.get("sell_plan", {}).get("status", "NO_OPEN_POSITION" if not position_rows else "REVIEW_REQUIRED")
-    render_status_card(cols[4], "持仓风险" if language == "zh" else "Position Risk", risk_status, status_badge(risk_status)["tone"])
+    render_status_card(second_row[2], "持仓风险" if language == "zh" else "Position Risk", risk_status, status_badge(risk_status)["tone"])
 
 
 def _render_report_section(st, title: str, data: dict[str, Any], language: str, section_key: str) -> None:

@@ -2,7 +2,7 @@
 
 ## Product workflow
 
-The v0.3 workflow is: project health check -> pre-market news briefing -> call-auction observation -> intraday VWAP attack/defence observation -> tail observation after 14:50.
+The v0.3 workflow is: project health check -> pre-market news briefing -> call-auction observation -> intraday VWAP attack/defence observation -> existing tail scan -> after-close observation.
 
 The project health check is a maintenance function. It verifies configuration, writable runtime directories, demo workflows, report parsing, and optional external data-source connectivity. It is not a market-timing gate and is hidden from the normal action area.
 
@@ -13,9 +13,10 @@ The project health check is a maintenance function. It verifies configuration, w
 | News briefing | Previous likely trading day 15:00 to current day 09:25 | Any time |
 | Call-auction observation | Trading day 09:25-09:30 | Any time |
 | Intraday workbench | Existing intraday observation windows | Any time |
-| Tail observation | Trading day from 14:50, plus after-close replay | Any time |
+| Tail scan | Existing trading-day 14:25-14:55 window | Any time for demo/dry-run |
+| After-close observation | Trading day from 14:50, plus after-close replay | Any time |
 
-After 15:00, tail observation remains available as a review/recovery run. Before 14:50, a live run returns `NOT_TAIL_OBSERVATION_WINDOW`. The weekday calendar remains a documented proxy and does not claim exchange-holiday precision.
+The tail scan keeps its original strategy and 14:25-14:55 session gate. The after-close observation uses its own scoring and watchlist workflow; only its start time is moved to 14:50. After 15:00 it remains available as an after-close review/recovery run. Before 14:50, a live after-close run returns `NOT_AFTER_CLOSE`. The weekday calendar remains a documented proxy and does not claim exchange-holiday precision.
 
 ## Data-source priority
 
@@ -36,7 +37,7 @@ Every external source is optional. A failed source is recorded with its error an
 
 ## Dashboard policy
 
-The normal workspace contains Today, News, Auction, Intraday, Tail Observation, Positions/Sell Plan, and Audit/Maintenance sections. Live dry-run and project health check are excluded from the normal action selector. They may appear only inside Audit/Maintenance when developer actions are enabled by configuration.
+The normal workspace contains Today, News, Auction, Intraday, Tail Strategy, After-Close Watchlist, Positions/Sell Plan, and Audit/Maintenance sections. Formal tail scan and after-close observation are separate actions. Live dry-run and project health check are excluded from the normal action selector. They may appear only inside Audit/Maintenance when developer actions are enabled by configuration.
 
 ## Safety boundary
 

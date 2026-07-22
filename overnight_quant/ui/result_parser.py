@@ -66,7 +66,11 @@ def parse_live_quality_report(path: Path) -> dict[str, str]:
 
 
 def parse_after_close_report(path: Path) -> dict[str, str]:
-    return _with_type(parse_key_value_md(path), "after_close")
+    result = _with_type(parse_key_value_md(path), "after_close")
+    if result.get("status") == "NOT_TAIL_OBSERVATION_WINDOW":
+        result["source_status"] = result["status"]
+        result["status"] = "NOT_AFTER_CLOSE"
+    return result
 
 
 def parse_intraday_report(path: Path) -> dict[str, str]:

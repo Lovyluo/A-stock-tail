@@ -159,7 +159,7 @@ def test_action_labels_are_localized_and_demo_is_marked_as_demo():
     from overnight_quant.ui.dashboard import action_label
 
     assert action_label("zh", "live_dry_run") == "Live Dry-run"
-    assert action_label("zh", "formal_live_scan") == "正式 Live 尾盘扫描"
+    assert action_label("zh", "formal_live_scan") == "尾盘策略"
     assert "演示" in action_label("zh", "demo_scan")
     assert "Demo" in action_label("en", "demo_scan")
 
@@ -339,7 +339,19 @@ def test_premium_dashboard_css_has_dark_financial_terminal_theme():
 def test_premium_tabs_include_tail_and_sell_plan():
     from overnight_quant.ui.dashboard import premium_tab_labels
 
-    assert premium_tab_labels("en") == ["Today", "News", "Auction", "Intraday", "Tail Observation", "Positions / Sell Plan", "Audit / Maintenance"]
+    assert premium_tab_labels("en") == ["Today", "News", "Auction", "Intraday", "Tail Strategy", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
+
+
+def test_legacy_after_close_status_is_normalized_without_losing_audit_value(tmp_path):
+    from overnight_quant.ui.result_parser import parse_after_close_report
+
+    report = tmp_path / "after_close_analysis_2026-07-22.md"
+    report.write_text("# 盘后观察池报告\n\nstatus: NOT_TAIL_OBSERVATION_WINDOW\n", encoding="utf-8")
+
+    result = parse_after_close_report(report)
+
+    assert result["status"] == "NOT_AFTER_CLOSE"
+    assert result["source_status"] == "NOT_TAIL_OBSERVATION_WINDOW"
 
 
 def test_risk_badge_html_uses_status_tone_classes():
