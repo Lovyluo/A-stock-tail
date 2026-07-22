@@ -120,13 +120,13 @@ def test_live_before_close_writes_header_only_watchlist_and_session(tmp_path):
         client=StubAfterCloseClient("live", demo_quotes()),
     )
 
-    assert result["status"] == "NOT_TAIL_OBSERVATION_WINDOW"
+    assert result["status"] == "NOT_AFTER_CLOSE"
     assert result["session_state"] == "TAIL_SESSION"
     assert result["valid_for_trading_observation"] == "NO"
     assert _rows(result["watchlist_csv"]) == []
 
 
-def test_live_monday_pre_market_waits_for_tail_window(tmp_path):
+def test_live_monday_pre_market_counts_as_previous_friday_after_close(tmp_path):
     config = _tmp_config(tmp_path)
     config["after_close"]["min_a_score"] = 90
     config["after_close"]["min_b_score"] = 70
@@ -138,9 +138,14 @@ def test_live_monday_pre_market_waits_for_tail_window(tmp_path):
         client=StubAfterCloseClient("live", demo_quotes()),
     )
 
-    assert result["status"] == "NOT_TAIL_OBSERVATION_WINDOW"
+    assert result["status"] == "WATCHLIST_READY"
     assert result["session_state"] == "PRE_MARKET"
-    assert result["trade_date"] == "2026-05-25"
+    assert result["trade_date"] == "2026-05-22"
+    assert result["next_trade_date"] == "2026-05-25"
+    assert result["after_close_carryover"] == "YES"
+    assert result["observation_date"] == "2026-05-25"
+    assert Path(result["report_path"]).name == "after_close_analysis_2026-05-22.md"
+    assert "after_close_carryover: YES" in Path(result["report_path"]).read_text(encoding="utf-8")
 
 
 def test_live_pre_market_current_date_override_is_not_after_close(tmp_path):
@@ -152,7 +157,7 @@ def test_live_pre_market_current_date_override_is_not_after_close(tmp_path):
         client=StubAfterCloseClient("live", demo_quotes()),
     )
 
-    assert result["status"] == "NOT_TAIL_OBSERVATION_WINDOW"
+    assert result["status"] == "NOT_AFTER_CLOSE"
     assert result["trade_date"] == "2026-05-25"
     assert _rows(result["watchlist_csv"]) == []
 

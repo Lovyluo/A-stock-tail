@@ -8,12 +8,14 @@ def test_live_dry_run_and_health_check_are_not_primary_actions():
     assert "preflight" in APPROVED_ACTIONS
     assert "live_dry_run" not in primary_action_keys()
     assert "preflight" not in primary_action_keys()
+    assert "formal_live_scan" in primary_action_keys()
+    assert "after_close_live" in primary_action_keys()
     assert {"live_dry_run", "preflight"}.issubset(set(maintenance_action_keys()))
 
 
 def test_dashboard_tabs_match_trading_day_workflow():
     labels = premium_tab_labels("zh")
-    assert labels == ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘观察池", "持仓/卖出计划", "审计与维护"]
+    assert labels == ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘策略", "盘后观察池", "持仓/卖出计划", "审计与维护"]
 
 
 def test_workbench_does_not_contain_forbidden_execution_capabilities():

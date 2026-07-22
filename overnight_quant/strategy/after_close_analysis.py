@@ -10,8 +10,7 @@ from overnight_quant.data.market_calendar import (
     CALL_AUCTION,
     CN_TZ,
     PRE_MARKET,
-    effective_after_close_trade_day,
-    effective_tail_observation_trade_day,
+    effective_after_close_observation_trade_day,
     get_session_state,
     is_likely_cn_trade_day,
     previous_likely_cn_trade_day,
@@ -222,10 +221,10 @@ class AfterCloseAnalyzer:
                 if not is_likely_cn_trade_day(self.now) or result["session_state"] not in {PRE_MARKET, CALL_AUCTION}:
                     return self._blocked_result(result, "NOT_REPLAY_WINDOW")
             else:
-                live_start = self.config.get("tail_observation", {}).get("live_start", "14:50")
-                effective_after_close_day = effective_tail_observation_trade_day(self.now, live_start)
+                live_start = self.config.get("after_close_observation", {}).get("live_start", "14:50")
+                effective_after_close_day = effective_after_close_observation_trade_day(self.now, live_start)
                 if not effective_after_close_day or date_value != effective_after_close_day.isoformat():
-                    return self._blocked_result(result, "NOT_TAIL_OBSERVATION_WINDOW")
+                    return self._blocked_result(result, "NOT_AFTER_CLOSE")
 
         market = self.client.get_market_snapshot()
         result["market"] = market
@@ -346,13 +345,11 @@ def _analysis_context(mode: str, now: datetime, config: dict, analysis_mode: str
         return "demo"
     if analysis_mode == "previous_close_replay":
         return "after_close_replay"
-    start_value = str(config.get("tail_observation", {}).get("live_start", "14:50"))
-    end_value = str(config.get("tail_observation", {}).get("live_end", "15:00"))
+    start_value = str(config.get("after_close_observation", {}).get("live_start", "14:50"))
     start_hour, start_minute = (int(item) for item in start_value.split(":")[:2])
-    end_hour, end_minute = (int(item) for item in end_value.split(":")[:2])
     current_time = now.time().replace(tzinfo=None)
-    if time(start_hour, start_minute) <= current_time < time(end_hour, end_minute):
-        return "tail_window_live"
+    if time(start_hour, start_minute) <= current_time < time(15, 0):
+        return "after_close_early_window"
     return "after_close_replay"
 
 
@@ -789,7 +786,7 @@ def _final_view(status: str) -> str:
     return {
         "DEMO_ANALYSIS": "当前为演示观察池，仅用于流程演练，不可作为正式实盘观察。",
         "NOT_TRADING_DAY": "当前为非交易日，不生成正式盘后观察池。",
-        "NOT_AFTER_CLOSE": "请在收盘后运行，才能生成正式盘后观察池。",
+        "NOT_AFTER_CLOSE": "盘后观察池从 14:50 开始运行；当前时段尚未开放。",
         "DATA_FALLBACK_DEMO": "Live 数据已回退到 demo，仅保留演练结果，不生成正式观察池。",
         "DATA_QUALITY_BLOCKED": "关键时效或安全字段不确定，正式观察池已阻断。",
         "WATCHLIST_READY": "已生成次日早盘观察结果，仅供人工观察确认。",
