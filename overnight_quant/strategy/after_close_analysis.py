@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from overnight_quant.data.market_calendar import (
@@ -11,6 +11,7 @@ from overnight_quant.data.market_calendar import (
     CN_TZ,
     PRE_MARKET,
     effective_after_close_trade_day,
+    effective_tail_observation_trade_day,
     get_session_state,
     is_likely_cn_trade_day,
     previous_likely_cn_trade_day,
@@ -221,11 +222,10 @@ class AfterCloseAnalyzer:
                 if not is_likely_cn_trade_day(self.now) or result["session_state"] not in {PRE_MARKET, CALL_AUCTION}:
                     return self._blocked_result(result, "NOT_REPLAY_WINDOW")
             else:
-                effective_after_close_day = effective_after_close_trade_day(self.now)
-                if not is_likely_cn_trade_day(self.now):
-                    return self._blocked_result(result, "NOT_TRADING_DAY")
+                live_start = self.config.get("tail_observation", {}).get("live_start", "14:50")
+                effective_after_close_day = effective_tail_observation_trade_day(self.now, live_start)
                 if not effective_after_close_day or date_value != effective_after_close_day.isoformat():
-                    return self._blocked_result(result, "NOT_AFTER_CLOSE")
+                    return self._blocked_result(result, "NOT_TAIL_OBSERVATION_WINDOW")
 
         market = self.client.get_market_snapshot()
         result["market"] = market
@@ -296,6 +296,7 @@ class AfterCloseAnalyzer:
             "next_trade_date": _next_likely_trade_date(trade_date),
             "next_trade_date_calendar": "weekday_proxy",
             "analysis_mode": self.analysis_mode,
+            "analysis_context": _analysis_context(self.mode, self.now, self.config, self.analysis_mode),
             "mode": self.mode,
             "status": "",
             "session_state": get_session_state(self.now),
@@ -338,6 +339,21 @@ class AfterCloseAnalyzer:
         result["categories"] = {"A": [], "B": [], "C": []}
         result["final_view"] = _final_view(status)
         return result
+
+
+def _analysis_context(mode: str, now: datetime, config: dict, analysis_mode: str) -> str:
+    if mode == "demo":
+        return "demo"
+    if analysis_mode == "previous_close_replay":
+        return "after_close_replay"
+    start_value = str(config.get("tail_observation", {}).get("live_start", "14:50"))
+    end_value = str(config.get("tail_observation", {}).get("live_end", "15:00"))
+    start_hour, start_minute = (int(item) for item in start_value.split(":")[:2])
+    end_hour, end_minute = (int(item) for item in end_value.split(":")[:2])
+    current_time = now.time().replace(tzinfo=None)
+    if time(start_hour, start_minute) <= current_time < time(end_hour, end_minute):
+        return "tail_window_live"
+    return "after_close_replay"
 
 
 def _score_candidate(stock: dict, kline: list[dict], market_score: float, config: dict) -> dict:

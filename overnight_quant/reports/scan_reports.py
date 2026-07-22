@@ -146,7 +146,7 @@ def write_preflight_report(result: dict, reports_dir: str, trade_date: str) -> s
     path.mkdir(parents=True, exist_ok=True)
     report_path = path / f"preflight_{trade_date}.md"
     lines = [
-        "# Live Scan Preflight",
+        "# 项目通路检测",
         "",
         f"status: {result.get('status', '')}",
         f"trade_date: {trade_date}",
@@ -156,10 +156,17 @@ def write_preflight_report(result: dict, reports_dir: str, trade_date: str) -> s
         f"config_ok: {'YES' if result.get('config_ok') else 'NO'}",
         f"records_writable: {'YES' if result.get('records_writable') else 'NO'}",
         f"reports_writable: {'YES' if result.get('reports_writable') else 'NO'}",
+        f"backtest_outputs_writable: {'YES' if result.get('backtest_outputs_writable') else 'NO'}",
+        f"cache_writable: {'YES' if result.get('cache_writable') else 'NO'}",
+        f"network_check_enabled: {'YES' if result.get('network_check_enabled') else 'NO'}",
         "",
-        "## Data Sources",
+        "## Workflow Checks",
         "",
     ]
+    for item in result.get("workflow_checks", []):
+        lines.append(f"- {item.get('name', '')}: {'OK' if item.get('ok') else 'FAIL'}, returncode={item.get('returncode', '')}, error={item.get('error', '')}")
+    parser_check = result.get("dashboard_parser") or {}
+    lines.extend(["", "## Dashboard Parser", "", f"- status: {'OK' if parser_check.get('ok') else 'FAIL'}, parsed_reports={parser_check.get('parsed_reports', 0)}, error={parser_check.get('error', '')}", "", "## Optional Data Sources", ""])
     for item in result.get("sources", []):
         status = "OK" if item.get("ok") else "FAIL"
         lines.append(f"- {item.get('source', '')}: {status}, rows={item.get('rows', 0)}, error={item.get('error', '')}")

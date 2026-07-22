@@ -50,6 +50,22 @@ def effective_after_close_trade_day(value: datetime) -> date | None:
     return None
 
 
+def effective_tail_observation_trade_day(value: datetime, live_start: str = "14:50") -> date | None:
+    """Trade date available to the tail-observation workflow.
+
+    Non-trading days replay the latest likely trade day. On a trading day the
+    workflow opens at the configured tail time and remains available after close.
+    """
+    current = value if value.tzinfo else value.replace(tzinfo=CN_TZ)
+    current = current.astimezone(CN_TZ)
+    if not is_likely_cn_trade_day(current):
+        return previous_likely_cn_trade_day(current)
+    hour, minute = (int(item) for item in str(live_start).split(":")[:2])
+    if current.time() >= time(hour, minute):
+        return current.date()
+    return None
+
+
 def get_session_state(now: datetime | None = None) -> str:
     current = now or datetime.now(CN_TZ)
     if current.tzinfo is None:

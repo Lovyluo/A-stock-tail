@@ -26,6 +26,31 @@ intraday:
   max_intraday_change_pct: 8.5
   min_limit_up_gap_pct: 1.2
   min_range_position: 0.52
+health_check:
+  enabled: true
+  show_in_dashboard: false
+auction:
+  enabled: true
+  live_start: "09:25"
+  live_end: "09:30"
+  max_candidates: 50
+  strong_gap_pct: 3.0
+  weak_gap_pct: -2.0
+  min_amount_wan: 1000
+news_briefing:
+  enabled: true
+  lookback_start_time: "15:00"
+  morning_end_time: "09:25"
+  max_global_news: 80
+  max_cls_news: 80
+  max_stock_news_per_code: 10
+tail_observation:
+  live_start: "14:50"
+  live_end: "15:00"
+  after_close_replay_enabled: true
+dashboard:
+  show_maintenance_actions: false
+  hide_live_dry_run: true
 chip_volume:
   enabled: true
   profile_lookback_days: 60

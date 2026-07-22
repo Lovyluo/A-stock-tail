@@ -73,6 +73,14 @@ def parse_intraday_report(path: Path) -> dict[str, str]:
     return _with_type(parse_key_value_md(path), "intraday")
 
 
+def parse_auction_report(path: Path) -> dict[str, str]:
+    return _with_type(parse_key_value_md(path), "auction")
+
+
+def parse_news_briefing_report(path: Path) -> dict[str, str]:
+    return _with_type(parse_key_value_md(path), "news_briefing")
+
+
 def parse_sell_plan_table(path: Path):
     return _parse_markdown_table_sections(
         Path(path),
