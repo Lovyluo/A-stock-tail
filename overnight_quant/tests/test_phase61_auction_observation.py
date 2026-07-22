@@ -15,6 +15,16 @@ class AuctionClient:
         return {"code": code, "name": code, "price": 10.15, "last_close": 10.0, "amount_wan": 1800, "vol_ratio": 1.4}
 
 
+class DemoFallbackAuctionClient(AuctionClient):
+    def __init__(self):
+        super().__init__()
+        self.fallback_messages = []
+
+    def get_current_price(self, code):
+        self.fallback_messages.append("live current price failed, fallback to demo")
+        return super().get_current_price(code)
+
+
 def test_live_outside_auction_window_is_blocked():
     result = AuctionObservationAnalyzer(AuctionClient(), load_auction_config(), "live", datetime(2026, 7, 22, 9, 20, tzinfo=CN_TZ), [{"code": "000001"}]).analyze()
     assert result["status"] == "NOT_AUCTION_WINDOW"
@@ -43,3 +53,19 @@ def test_market_direction_changes_action_bias():
     weak = AuctionObservationAnalyzer(AuctionClient(-0.8), config, "live", now, [{"code": "000001"}]).analyze()["rows"][0]
     assert strong["action_bias"] == "attack"
     assert weak["action_bias"] != "attack"
+
+
+def test_live_demo_quote_fallback_is_not_treated_as_auction_data():
+    result = AuctionObservationAnalyzer(
+        DemoFallbackAuctionClient(),
+        load_auction_config(),
+        "live",
+        datetime(2026, 7, 22, 9, 27, tzinfo=CN_TZ),
+        [{"code": "000001"}],
+    ).analyze()
+
+    assert result["status"] == "AUCTION_DATA_UNAVAILABLE"
+    assert result["valid_for_trading_observation"] == "NO"
+    assert result["rows"][0]["action_bias"] == "avoid"
+    assert "auction_quote_missing" in result["rows"][0]["risk_flags"]
+    assert any("demo_fallback" in error for error in result["source_errors"])

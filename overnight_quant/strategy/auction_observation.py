@@ -100,11 +100,16 @@ class AuctionObservationAnalyzer:
             result["status"] = "NOT_AUCTION_WINDOW"
             return result
 
+        fallback_offset = _fallback_message_count(self.client)
         try:
             market = self.client.get_market_snapshot()
         except Exception as exc:
             market = {}
             result["source_errors"].append(f"market_snapshot: {type(exc).__name__}: {exc}")
+        market_fallbacks = _fallback_messages_since(self.client, fallback_offset)
+        if self.mode == "live" and market_fallbacks:
+            market = {}
+            result["source_errors"].extend(f"market_snapshot_demo_fallback: {message}" for message in market_fallbacks)
         result["market_indices"] = market.get("indices") or {}
         result["market_auction_bias"] = market_auction_bias(market)
 
@@ -113,11 +118,16 @@ class AuctionObservationAnalyzer:
             code = _normalize_code(candidate.get("code"))
             if not code:
                 continue
+            fallback_offset = _fallback_message_count(self.client)
             try:
                 quote = self.client.get_current_price(code)
             except Exception as exc:
                 quote = {}
                 result["source_errors"].append(f"{code}: {type(exc).__name__}: {exc}")
+            quote_fallbacks = _fallback_messages_since(self.client, fallback_offset)
+            if self.mode == "live" and quote_fallbacks:
+                quote = {}
+                result["source_errors"].extend(f"{code}_demo_fallback: {message}" for message in quote_fallbacks)
             result["rows"].append(evaluate_auction_candidate(candidate, quote, result["market_auction_bias"], self.config))
 
         usable = [row for row in result["rows"] if float(row.get("auction_price") or 0) > 0]
@@ -247,6 +257,18 @@ def _as_float(value: Any, default: float | None = 0.0) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _fallback_message_count(client: Any) -> int:
+    messages = getattr(client, "fallback_messages", None)
+    return len(messages) if isinstance(messages, list) else 0
+
+
+def _fallback_messages_since(client: Any, offset: int) -> list[str]:
+    messages = getattr(client, "fallback_messages", None)
+    if not isinstance(messages, list):
+        return []
+    return [str(message) for message in messages[offset:]]
 
 
 def _deep_update(target: dict, source: dict) -> None:
