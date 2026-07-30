@@ -85,6 +85,61 @@ def parse_news_briefing_report(path: Path) -> dict[str, str]:
     return _with_type(parse_key_value_md(path), "news_briefing")
 
 
+def parse_news_briefing_sections(path: Path) -> dict[str, list[str]]:
+    sections = {
+        "sources": [],
+        "macro_news": [],
+        "policy_news": [],
+        "market_news": [],
+        "global_news": [],
+        "theme_news": [],
+        "stock_news": [],
+        "focus_directions": [],
+        "attack_plan": [],
+        "defence_plan": [],
+        "risk_notes": [],
+    }
+    path = Path(path)
+    if not path.exists():
+        return sections
+
+    title_map = {
+        "数据源清单和抓取时间": "sources",
+        "Data Sources": "sources",
+        "宏观消息": "macro_news",
+        "Macro News": "macro_news",
+        "政策/监管消息": "policy_news",
+        "Policy / Regulation": "policy_news",
+        "市场/资金消息": "market_news",
+        "Market / Capital Flow": "market_news",
+        "海外市场消息": "global_news",
+        "Global Markets": "global_news",
+        "产业/题材消息": "theme_news",
+        "Industry / Theme News": "theme_news",
+        "个股公告/新闻": "stock_news",
+        "Stock Announcements / News": "stock_news",
+        "今日关注方向": "focus_directions",
+        "Focus Directions": "focus_directions",
+        "分歧后的进攻方案": "attack_plan",
+        "Attack Plan": "attack_plan",
+        "分歧后的防御方案": "defence_plan",
+        "Defence Plan": "defence_plan",
+        "风险提示": "risk_notes",
+        "Risk Notes": "risk_notes",
+    }
+    active_key = ""
+    for raw_line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            active_key = title_map.get(line[3:].strip(), "")
+            continue
+        if active_key and line.startswith("- "):
+            value = line[2:].strip()
+            if value:
+                sections[active_key].append(value)
+    return sections
+
+
 def parse_sell_plan_table(path: Path):
     return _parse_markdown_table_sections(
         Path(path),

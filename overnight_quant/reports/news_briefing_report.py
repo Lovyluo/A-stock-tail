@@ -14,7 +14,9 @@ def write_news_briefing_report(result: dict, reports_dir: str) -> str:
         f"mode: {result.get('mode', '')}",
         f"status: {result.get('status', '')}",
         f"window_start: {result.get('window_start', '')}",
-        f"window_end: {result.get('window_end', '')}", "",
+        f"window_end: {result.get('window_end', '')}",
+        f"source_coverage: {result.get('source_coverage', '')}",
+        f"news_count: {result.get('news_count', 0)}", "",
         "## 数据源清单和抓取时间", "",
     ]
     for item in result.get("sources") or []:
@@ -23,6 +25,8 @@ def write_news_briefing_report(result: dict, reports_dir: str) -> str:
         lines.append("- 暂无可用来源。")
     _section(lines, "宏观消息", result.get("macro_news"))
     _section(lines, "政策/监管消息", result.get("policy_news"))
+    _section(lines, "市场/资金消息", result.get("market_news"))
+    _section(lines, "海外市场消息", result.get("global_news"))
     _section(lines, "产业/题材消息", result.get("theme_news"))
     _section(lines, "个股公告/新闻", result.get("stock_news"))
     _text_section(lines, "今日关注方向", result.get("focus_directions"))

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from overnight_quant.data.market_calendar import TAIL_SESSION, get_session_state
+from overnight_quant.data.position_accounting import summarize_order_rows
+from overnight_quant.data.stock_catalog import load_stock_catalog, resolve_stock_name
 from overnight_quant.ui.result_parser import (
     SimpleTable,
     find_latest_file,
@@ -20,6 +22,7 @@ from overnight_quant.ui.result_parser import (
     parse_key_value_md,
     parse_live_quality_report,
     parse_news_briefing_report,
+    parse_news_briefing_sections,
     parse_preflight_report,
     parse_sell_plan_table,
     parse_signals_csv,
@@ -614,7 +617,9 @@ ACTION_TEXT = {
         "demo_after_close": "演示：盘后观察池",
         "demo_auction": "演示：集合竞价",
         "demo_news": "演示：消息面",
+        "demo_intraday": "演示：盘中攻防",
         "demo_scan": "演示：Demo Scan",
+        "stock_catalog_update": "更新股票代码与名称",
     },
     "en": {
         "preflight": "Project Health Check",
@@ -629,6 +634,7 @@ ACTION_TEXT = {
         "demo_after_close": "Demo: After-Close",
         "demo_intraday": "Demo: Intraday VWAP",
         "demo_scan": "Demo: Scan",
+        "stock_catalog_update": "Update Stock Code / Name Catalog",
     },
 }
 
@@ -929,6 +935,7 @@ APPROVED_ACTIONS = {
     "demo_news": [sys.executable, "overnight_quant/scripts/run_news_briefing.py", "--mode", "demo"],
     "demo_after_close": [sys.executable, "overnight_quant/scripts/run_after_close_analysis.py", "--mode", "demo"],
     "demo_scan": [sys.executable, "overnight_quant/scripts/run_scan.py", "--mode", "demo"],
+    "stock_catalog_update": [sys.executable, "overnight_quant/scripts/run_stock_catalog_update.py"],
 }
 
 POSITION_UPDATE_COMMAND = [sys.executable, "overnight_quant/scripts/run_record_order.py", "--position-update"]
@@ -976,6 +983,8 @@ def status_badge(status: str) -> dict[str, str]:
         tone = "gray"
     elif "FALLBACK" in upper or "FAIL" in upper or "BLOCKED" in upper or "STALE" in upper or "UNKNOWN" in upper:
         tone = "red"
+    elif "PARTIAL" in upper:
+        tone = "yellow"
     elif (
         upper.startswith("NOT_")
         or "OUTSIDE" in upper
@@ -1000,7 +1009,16 @@ def primary_action_keys() -> list[str]:
 
 
 def maintenance_action_keys() -> list[str]:
-    return ["preflight", "live_dry_run", "demo_news", "demo_auction", "demo_intraday", "demo_after_close", "demo_scan"]
+    return [
+        "preflight",
+        "stock_catalog_update",
+        "live_dry_run",
+        "demo_news",
+        "demo_auction",
+        "demo_intraday",
+        "demo_after_close",
+        "demo_scan",
+    ]
 
 
 def render_badge_html(value: str) -> str:
@@ -1373,6 +1391,7 @@ def _action_success_message(action: str, language: str) -> str:
     if language == "en":
         messages = {
             "preflight": "Preflight completed. The latest parsed status is shown below.",
+            "news_live": "News briefing completed. The latest briefing is displayed below and in the News tab.",
             "intraday_live": "Intraday VWAP observation completed. Review the intraday signals below.",
             "live_dry_run": "Live Dry-run completed. Review Tail candidates, rejection audit, and live data quality below.",
             "formal_live_scan": "Formal Live scan completed. If a manual ticket was generated, the buy review details are shown below.",
@@ -1380,19 +1399,24 @@ def _action_success_message(action: str, language: str) -> str:
             "morning_replay_live": "Morning replay completed. Review the replay watchlist below.",
             "sell_plan_live": "Sell plan completed. Review the sell-plan section below.",
             "demo_intraday": "Demo intraday VWAP observation completed.",
+            "demo_news": "Demo news briefing completed. The latest briefing is displayed below.",
             "demo_after_close": "Demo after-close analysis completed.",
             "demo_scan": "Demo scan completed.",
+            "stock_catalog_update": "Stock code and name catalog updated.",
         }
     else:
         messages = {
             "preflight": "盘前检查已完成，最新状态已在下方展示。",
+            "news_live": "盘前消息面已生成，最新正文已显示在下方和“消息面”页签中。",
             "live_dry_run": "Live Dry-run 已完成。请查看下方尾盘候选、拒绝审计和数据质量。",
             "formal_live_scan": "正式 Live 已执行。如生成了人工买入票据，买入核对信息已在下方展示。",
             "after_close_live": "盘后观察池已生成，请查看下方观察池区域。",
             "morning_replay_live": "早盘 Replay 已完成，请查看下方 Replay 观察池。",
             "sell_plan_live": "卖出计划已生成，请查看下方卖出计划区域。",
+            "demo_news": "演示盘前消息面已生成，最新正文已显示在下方。",
             "demo_after_close": "演示盘后观察池已生成。",
             "demo_scan": "演示扫描已完成。",
+            "stock_catalog_update": "股票代码与名称目录已更新。",
         }
     return messages.get(action, "Action completed." if language == "en" else "动作已完成。")
 
@@ -1406,6 +1430,10 @@ def _action_failure_message(action: str, result: dict[str, Any], language: str) 
 
 def _action_success_warning_message(action: str, result: dict[str, Any], language: str) -> str:
     status = _command_output_field(result.get("stdout", ""), "Status")
+    if action in {"news_live", "demo_news"} and status in {"NEWS_BRIEFING_DEGRADED", "NEWS_BRIEFING_PARTIAL"}:
+        if language == "en":
+            return "News briefing was generated, but some data sources were unavailable. Available content and source errors are displayed below."
+        return "盘前消息面已生成，但部分数据源暂不可用。下方已展示可用内容和具体缺失来源。"
     if action == "after_close_live" and status in {"NOT_AFTER_CLOSE", "NOT_TRADING_DAY"}:
         session_state = _command_output_field(result.get("stdout", ""), "Session State") or "UNKNOWN"
         if language == "en":
@@ -1568,48 +1596,9 @@ def _command_output_reasons(stdout: str) -> list[str]:
     return reasons
 
 
-def build_position_summary_table(manual_orders) -> SimpleTable:
+def build_position_summary_table(manual_orders, stock_names: dict[str, str] | None = None) -> SimpleTable:
     rows = _table_records(manual_orders)
-    positions: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        code = _normalize_stock_code(row.get("code"))
-        if not code:
-            continue
-        side = str(row.get("side") or "BUY").upper()
-        qty = _as_int_value(row.get("qty") or row.get("quantity"))
-        price = _as_float_value(row.get("price") or row.get("buy_price"))
-        amount = _as_float_value(row.get("amount")) or round(qty * price, 2)
-        position = positions.setdefault(
-            code,
-            {
-                "code": code,
-                "name": row.get("name", ""),
-                "status": "OPEN",
-                "open_qty": 0,
-                "avg_buy_price": 0.0,
-                "buy_qty": 0,
-                "sell_qty": 0,
-                "buy_amount": 0.0,
-                "sell_amount": 0.0,
-                "realized_pnl": 0.0,
-                "stop_loss_price": _as_float_value(row.get("stop_loss_price")),
-                "last_buy_time": "",
-                "last_sell_time": "",
-            },
-        )
-        if row.get("name"):
-            position["name"] = row.get("name")
-        if side == "BUY":
-            position["buy_qty"] += qty
-            position["open_qty"] += qty
-            position["buy_amount"] += amount
-            position["last_buy_time"] = row.get("trade_time", "")
-            position["stop_loss_price"] = _as_float_value(row.get("stop_loss_price")) or position["stop_loss_price"]
-        elif side == "SELL":
-            position["sell_qty"] += qty
-            position["open_qty"] -= qty
-            position["sell_amount"] += amount
-            position["last_sell_time"] = row.get("trade_time", "")
+    canonical_names = stock_names or {}
     columns = [
         "code",
         "name",
@@ -1625,29 +1614,34 @@ def build_position_summary_table(manual_orders) -> SimpleTable:
         "last_buy_time",
         "last_sell_time",
     ]
-    summary_rows: list[dict[str, Any]] = []
-    for position in positions.values():
-        buy_qty = _as_int_value(position.get("buy_qty"))
-        sell_qty = _as_int_value(position.get("sell_qty"))
-        open_qty = _as_int_value(position.get("open_qty"))
-        avg_buy = round(_as_float_value(position.get("buy_amount")) / buy_qty, 4) if buy_qty else 0.0
-        position["avg_buy_price"] = avg_buy
-        position["realized_pnl"] = round(_as_float_value(position.get("sell_amount")) - avg_buy * min(sell_qty, buy_qty), 2)
-        position["status"] = _position_status_label(open_qty, buy_qty, sell_qty)
-        summary_rows.append({column: position.get(column, "") for column in columns})
-    return SimpleTable(summary_rows, columns)
+    summary_rows = summarize_order_rows(rows)
+    for position in summary_rows:
+        code = _normalize_stock_code(position.get("code"))
+        if canonical_names.get(code):
+            position["name"] = canonical_names[code]
+    return SimpleTable(
+        [{column: position.get(column, "") for column in columns} for position in summary_rows],
+        columns,
+    )
 
 
-def _position_status_label(open_qty: int, buy_qty: int, sell_qty: int) -> str:
-    if open_qty < 0 or sell_qty > buy_qty:
-        return "ERROR_OVER_SOLD"
-    if buy_qty > 0 and sell_qty == 0 and open_qty > 0:
-        return "OPEN"
-    if buy_qty > 0 and sell_qty > 0 and open_qty > 0:
-        return "PARTIALLY_CLOSED"
-    if buy_qty > 0 and sell_qty == buy_qty and open_qty == 0:
-        return "CLOSED"
-    return "OPEN"
+def split_position_summary_tables(position_summary) -> tuple[SimpleTable, SimpleTable]:
+    rows = _table_records(position_summary)
+    columns = list(getattr(position_summary, "columns", []) or [])
+    if not columns and rows:
+        columns = list(rows[0])
+    open_rows: list[dict[str, Any]] = []
+    closed_rows: list[dict[str, Any]] = []
+    for row in rows:
+        status = str(row.get("status") or "").upper()
+        open_qty = _as_int_value(row.get("open_qty"))
+        if status == "CLOSED" or (open_qty == 0 and _as_int_value(row.get("buy_qty")) > 0):
+            closed_rows.append(row)
+        else:
+            open_rows.append(row)
+    open_rows.sort(key=lambda row: str(row.get("code") or ""))
+    closed_rows.sort(key=lambda row: str(row.get("last_sell_time") or ""), reverse=True)
+    return SimpleTable(open_rows, columns), SimpleTable(closed_rows, columns)
 
 
 def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> dict[str, Any]:
@@ -1671,6 +1665,8 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
     signals_path = records / "signals.csv"
     signal_rejections_path = records / "signal_rejections.csv"
     manual_orders_path = records / "manual_orders.csv"
+    stock_catalog_path = package / "data" / "cache" / "stock_catalog.csv"
+    stock_catalog = load_stock_catalog(stock_catalog_path)
     buy_ticket_path = find_latest_file("manual_order_" + "ticket_*.md", reports)
     sell_plan_path = find_latest_file("sell_plan_*.md", reports)
     lifecycle_path = find_latest_file("trade_lifecycle_*.md", reports)
@@ -1680,10 +1676,14 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
         "mode": mode,
         "reports_dir": str(reports),
         "records_dir": str(records),
+        "stock_catalog_path": str(stock_catalog_path),
+        "stock_catalog": stock_catalog,
+        "stock_catalog_count": len(stock_catalog),
         "preflight": parse_preflight_report(preflight_path or reports / "preflight_missing.md"),
         "intraday": parse_intraday_report(intraday_path or reports / "intraday_missing.md"),
         "auction": parse_auction_report(auction_path or reports / "auction_missing.md"),
         "news_briefing": parse_news_briefing_report(news_path or reports / "news_briefing_missing.md"),
+        "news_briefing_sections": parse_news_briefing_sections(news_path or reports / "news_briefing_missing.md"),
         "dry_run": parse_dry_run_report(dry_run_path or reports / "dry_run_missing.md"),
         "quality": parse_live_quality_report(quality_path or reports / "quality_missing.md"),
         "after_close": parse_after_close_report(after_close_path or reports / "after_close_missing.md"),
@@ -1711,7 +1711,11 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
         "lifecycle": parse_key_value_md(lifecycle_path or reports / "lifecycle_missing.md"),
         "trade_review": parse_key_value_md(review_path or reports / "trade_review_missing.md"),
     }
-    state["position_summary"] = build_position_summary_table(state["manual_orders"])
+    state["position_summary"] = build_position_summary_table(
+        state["manual_orders"],
+        {code: row.get("name", "") for code, row in stock_catalog.items()},
+    )
+    state["open_positions"], state["closed_positions"] = split_position_summary_tables(state["position_summary"])
     state["reference_summary"] = live_reference_summary(state)
     state["conclusion"] = build_status_conclusion(state)
     return state
@@ -1893,7 +1897,11 @@ def main() -> None:
     _render_top_status_bar(st, state, language)
     _render_premium_hero(st, state, language)
     st.markdown(f'<div class="oq-risk">{html.escape(safety_notice(language))}</div>', unsafe_allow_html=True)
-    _render_action_feedback(st, st.session_state.get("last_action_feedback"), language)
+    last_action_feedback = st.session_state.get("last_action_feedback")
+    _render_action_feedback(st, last_action_feedback, language)
+    if (last_action_feedback or {}).get("action") in {"news_live", "demo_news"}:
+        st.markdown("### 最新盘前消息面" if language == "zh" else "### Latest News Briefing")
+        _render_news_briefing_content(st, state, language)
     _render_action_grid(st, language)
     _render_overview(st, state, language)
 
@@ -1901,7 +1909,7 @@ def main() -> None:
     with tabs[0]:
         _render_overview(st, state, language)
     with tabs[1]:
-        _render_report_section(st, "盘前消息面" if language == "zh" else "News Briefing", state["news_briefing"], language, "news_briefing")
+        _render_news_briefing_content(st, state, language)
     with tabs[2]:
         _render_report_section(st, "集合竞价" if language == "zh" else "Auction", state["auction"], language, "auction")
         render_table_or_empty(st, state["auction_rows"], language, t(language, "empty_table"))
@@ -1957,6 +1965,15 @@ def main() -> None:
             if cols[index % 3].button(action_label(language, action_key), use_container_width=True, key=f"maintenance_{action_key}"):
                 st.session_state["last_action_feedback"] = run_dashboard_action(action_key, language)
                 st.rerun()
+        catalog_count = int(state.get("stock_catalog_count") or 0)
+        catalog_path = str(state.get("stock_catalog_path") or "")
+        st.caption(
+            (
+                f"股票代码名称目录：{catalog_count} 条；缓存位置：{catalog_path}"
+                if language == "zh"
+                else f"Stock code/name catalog: {catalog_count} rows; cache: {catalog_path}"
+            )
+        )
         _render_report_section(st, "项目通路检测" if language == "zh" else "Project Health Check", state["preflight"], language, "preflight")
         _render_report_section(st, "尾盘审计" if language == "zh" else "Tail Audit", state["dry_run"], language, "dry_run")
         with st.expander(t(language, "audit_artifacts")):
@@ -2066,6 +2083,67 @@ def _render_report_section(st, title: str, data: dict[str, Any], language: str, 
         if data.get("path"):
             st.caption(f"{label_for(language, 'path')}: {data.get('path')}")
         st.json(data)
+
+
+def _render_news_briefing_content(st, state: dict[str, Any], language: str) -> None:
+    briefing = state.get("news_briefing", {})
+    sections = state.get("news_briefing_sections", {})
+    _render_report_section(
+        st,
+        "盘前消息面" if language == "zh" else "News Briefing",
+        briefing,
+        language,
+        "news_briefing",
+    )
+    if briefing.get("status") == "MISSING":
+        st.info("尚未生成盘前消息面，请点击“盘前消息面”运行。" if language == "zh" else "No news briefing has been generated. Run News Briefing first.")
+        return
+
+    sources = sections.get("sources", [])
+    missing_sources = [item for item in sources if "MISSING" in item.upper()]
+    with st.expander(
+        ("数据源状态" if language == "zh" else "Data Source Status") + f"（{len(sources)}）",
+        expanded=bool(missing_sources),
+    ):
+        _render_news_list(st, sources, language)
+
+    first_row = st.columns(2)
+    with first_row[0]:
+        _render_news_list_section(st, "宏观消息" if language == "zh" else "Macro News", sections.get("macro_news", []), language)
+    with first_row[1]:
+        _render_news_list_section(st, "政策/监管消息" if language == "zh" else "Policy / Regulation", sections.get("policy_news", []), language)
+    second_row = st.columns(2)
+    with second_row[0]:
+        _render_news_list_section(st, "市场/资金消息" if language == "zh" else "Market / Capital Flow", sections.get("market_news", []), language)
+    with second_row[1]:
+        _render_news_list_section(st, "海外市场消息" if language == "zh" else "Global Markets", sections.get("global_news", []), language)
+    third_row = st.columns(2)
+    with third_row[0]:
+        _render_news_list_section(st, "产业/题材消息" if language == "zh" else "Industry / Theme News", sections.get("theme_news", []), language)
+    with third_row[1]:
+        _render_news_list_section(st, "个股公告/新闻" if language == "zh" else "Stock Announcements / News", sections.get("stock_news", []), language)
+
+    _render_news_list_section(st, "今日关注方向" if language == "zh" else "Focus Directions", sections.get("focus_directions", []), language)
+    plans = st.columns(2)
+    with plans[0]:
+        _render_news_list_section(st, "分歧后的进攻观察" if language == "zh" else "Attack Observation", sections.get("attack_plan", []), language)
+    with plans[1]:
+        _render_news_list_section(st, "分歧后的防御观察" if language == "zh" else "Defence Observation", sections.get("defence_plan", []), language)
+    _render_news_list_section(st, "风险提示" if language == "zh" else "Risk Notes", sections.get("risk_notes", []), language)
+
+
+def _render_news_list_section(st, title: str, rows: list[str], language: str) -> None:
+    st.markdown(f"#### {title}")
+    _render_news_list(st, rows, language)
+
+
+def _render_news_list(st, rows: list[str], language: str) -> None:
+    visible_rows = [str(item).strip() for item in rows if str(item).strip()]
+    if not visible_rows:
+        st.caption("暂无已提取内容。" if language == "zh" else "No extracted items.")
+        return
+    for item in visible_rows:
+        st.markdown(f"- {html.escape(item)}")
 
 
 def _render_sell_plan_page(st, state: dict[str, Any], language: str, mode: str = DEFAULT_MODE) -> None:
@@ -2246,19 +2324,31 @@ def _render_position_update(st, state: dict[str, Any], language: str, mode: str)
         if language == "zh"
         else "Records only manually entered fills and position changes; it does not place orders or change strategy logic."
     )
+    identity_columns = st.columns([1, 2])
+    code = identity_columns[0].text_input(
+        "股票代码" if language == "zh" else "Code",
+        placeholder="000034",
+        max_chars=6,
+        key="position_update_code",
+    )
+    resolved_name = resolve_position_stock_name(code, state)
+    identity_columns[1].markdown(
+        (
+            f"**股票名称**\n\n{html.escape(resolved_name) if resolved_name else '输入完整的 6 位代码后自动识别'}"
+            if language == "zh"
+            else f"**Stock Name**\n\n{html.escape(resolved_name) if resolved_name else 'Enter a complete 6-digit code to resolve the name'}"
+        )
+    )
     with st.form("position_update_form"):
         col1, col2, col3 = st.columns(3)
-        code = col1.text_input("股票代码" if language == "zh" else "Code", placeholder="000034", max_chars=6)
-        name = col2.text_input("名称（可选）" if language == "zh" else "Name (optional)", placeholder="神州数码")
-        side = col3.selectbox(
+        side = col1.selectbox(
             "方向" if language == "zh" else "Side",
             ["BUY", "SELL"],
             format_func=lambda value: SIDE_LABELS_ZH.get(value, value) if language == "zh" else value,
         )
-        col4, col5, col6 = st.columns(3)
-        price = col4.number_input("成交价" if language == "zh" else "Fill Price", min_value=0.0, step=0.01, format="%.3f")
-        qty = col5.number_input("数量（股）" if language == "zh" else "Quantity (shares)", min_value=0, step=100)
-        stop_loss = col6.number_input("止损价（可选）" if language == "zh" else "Stop Loss (optional)", min_value=0.0, step=0.01, format="%.3f")
+        price = col2.number_input("成交价" if language == "zh" else "Fill Price", min_value=0.0, step=0.01, format="%.3f")
+        qty = col3.number_input("数量（股）" if language == "zh" else "Quantity (shares)", min_value=0, step=100)
+        stop_loss = st.number_input("止损价（可选）" if language == "zh" else "Stop Loss (optional)", min_value=0.0, step=0.01, format="%.3f")
         trade_time = st.text_input(
             "成交时间" if language == "zh" else "Trade Time",
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2266,7 +2356,7 @@ def _render_position_update(st, state: dict[str, Any], language: str, mode: str)
         notes = st.text_input("备注" if language == "zh" else "Notes", placeholder="已有持仓 / 尾盘买入 / 分批减仓")
         submitted = st.form_submit_button("保存持仓更新" if language == "zh" else "Save Position Update")
     if submitted:
-        validation_error = _position_form_validation_error(code, price, qty, trade_time, language)
+        validation_error = _position_form_validation_error(code, resolved_name, price, qty, trade_time, language)
         if validation_error:
             st.session_state["position_update_feedback"] = {
                 "ok": False,
@@ -2277,7 +2367,7 @@ def _render_position_update(st, state: dict[str, Any], language: str, mode: str)
         else:
             result = run_position_update_action(
                 code=code,
-                name=name,
+                name=resolved_name,
                 side=side,
                 price=price,
                 qty=int(qty),
@@ -2289,16 +2379,64 @@ def _render_position_update(st, state: dict[str, Any], language: str, mode: str)
             st.session_state["position_update_feedback"] = position_update_feedback(result, language)
         st.rerun()
     _render_action_feedback(st, st.session_state.get("position_update_feedback"), language)
-    st.markdown("#### 当前持仓" if language == "zh" else "#### Current Positions")
-    render_table_or_empty(st, state["position_summary"], language, t(language, "empty_table"))
-    st.markdown("#### 手工成交记录" if language == "zh" else "#### Manual Fill Records")
-    render_table_or_empty(st, state["manual_orders"], language, t(language, "empty_table"))
+    open_positions = state.get("open_positions") or SimpleTable([], [])
+    closed_positions = state.get("closed_positions") or SimpleTable([], [])
+    open_count = len(_table_records(open_positions))
+    closed_count = len(_table_records(closed_positions))
+    st.markdown((f"#### 当前持仓（{open_count}）" if language == "zh" else f"#### Current Positions ({open_count})"))
+    render_table_or_empty(st, open_positions, language, "当前没有持仓。" if language == "zh" else "No open positions.")
+    with st.expander(
+        (f"已清仓历史（{closed_count}）" if language == "zh" else f"Closed Position History ({closed_count})"),
+        expanded=False,
+    ):
+        render_table_or_empty(st, closed_positions, language, "暂无已清仓记录。" if language == "zh" else "No closed positions.")
+    manual_count = len(_table_records(state.get("manual_orders")))
+    with st.expander(
+        (f"手工成交记录（{manual_count}）" if language == "zh" else f"Manual Fill Records ({manual_count})"),
+        expanded=False,
+    ):
+        render_table_or_empty(st, state["manual_orders"], language, t(language, "empty_table"))
 
 
-def _position_form_validation_error(code: str, price: float, qty: int, trade_time: str, language: str) -> str:
+def resolve_position_stock_name(code: str, state: dict[str, Any], fetch_remote: bool = True) -> str:
+    normalized_code = _normalize_stock_code(code)
+    if not normalized_code.isdigit() or len(normalized_code) != 6:
+        return ""
+    catalog = state.get("stock_catalog") or {}
+    catalog_row = catalog.get(normalized_code) if isinstance(catalog, dict) else None
+    catalog_name = str((catalog_row or {}).get("name") or "") if isinstance(catalog_row, dict) else ""
+    if catalog_name:
+        return catalog_name
+    resolved = resolve_stock_name(
+        normalized_code,
+        state.get("stock_catalog_path"),
+        fetch_remote=fetch_remote,
+    )
+    if resolved:
+        return resolved
+    for row in _table_records(state.get("position_summary")):
+        if _normalize_stock_code(row.get("code")) == normalized_code and row.get("name"):
+            return str(row["name"])
+    return ""
+
+
+def _position_form_validation_error(
+    code: str,
+    stock_name: str,
+    price: float,
+    qty: int,
+    trade_time: str,
+    language: str,
+) -> str:
     normalized_code = _normalize_stock_code(code)
     if not normalized_code.isdigit() or len(normalized_code) != 6:
         return "请输入 6 位股票代码。" if language == "zh" else "Enter a 6-digit stock code."
+    if not str(stock_name or "").strip():
+        return (
+            "未识别该股票代码，请先在“审计与维护”中更新股票代码与名称。"
+            if language == "zh"
+            else "The stock code could not be resolved. Update the stock code/name catalog in Audit / Maintenance."
+        )
     if float(price) <= 0:
         return "成交价必须大于 0。" if language == "zh" else "Fill price must be greater than 0."
     if int(qty) <= 0 or int(qty) % 100 != 0:

@@ -121,6 +121,44 @@ def test_multiple_buys_and_sells_calculate_average_and_unrealized_pnl(tmp_path):
     assert summary["unrealized_pnl"] == 100.0
 
 
+def test_reopened_position_resets_cost_basis_and_cycle_status(tmp_path):
+    config = _tmp_config(tmp_path)
+    write_manual_orders(
+        [
+            _order_row("B1", "BUY", 10.0, 100, "2026-05-20 10:00:00"),
+            _order_row("S1", "SELL", 11.0, 100, "2026-05-21 10:00:00"),
+            _order_row("B2", "BUY", 20.0, 100, "2026-05-22 10:00:00"),
+        ],
+        config["paths"]["records_dir"],
+    )
+
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert summary["status"] == "OPEN"
+    assert summary["open_qty"] == 100
+    assert summary["avg_buy_price"] == 20.0
+    assert summary["realized_pnl"] == 100.0
+
+
+def test_partial_sell_then_add_uses_remaining_position_cost(tmp_path):
+    config = _tmp_config(tmp_path)
+    write_manual_orders(
+        [
+            _order_row("B1", "BUY", 10.0, 100, "2026-05-20 10:00:00"),
+            _order_row("S1", "SELL", 11.0, 50, "2026-05-21 10:00:00"),
+            _order_row("B2", "BUY", 20.0, 50, "2026-05-22 10:00:00"),
+        ],
+        config["paths"]["records_dir"],
+    )
+
+    summary = get_position_summaries(config["paths"]["records_dir"])[0]
+
+    assert summary["status"] == "PARTIALLY_CLOSED"
+    assert summary["open_qty"] == 100
+    assert summary["avg_buy_price"] == 15.0
+    assert summary["realized_pnl"] == 50.0
+
+
 def test_fees_and_stamp_tax_are_applied(tmp_path):
     config = _tmp_config(tmp_path)
     _write_ticket(tmp_path)
