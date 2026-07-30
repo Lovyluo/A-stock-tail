@@ -32,7 +32,9 @@ DEFAULT_CONFIG = {
         "morning_end_time": "09:25",
         "max_global_news": 80,
         "max_cls_news": 80,
+        "max_newsnow_items_per_source": 40,
         "max_stock_news_per_code": 10,
+        "newsnow_base_url": "https://newsnow.busiyi.world",
     },
     "tail_observation": {"live_start": "14:50", "live_end": "15:00", "after_close_replay_enabled": True},
     "dashboard": {"show_maintenance_actions": False, "hide_live_dry_run": True},
@@ -90,6 +92,7 @@ DEFAULT_CONFIG = {
         "records_dir": "overnight_quant/records",
         "reports_dir": "overnight_quant/reports",
         "examples_dir": "overnight_quant/examples",
+        "stock_catalog_path": "overnight_quant/data/cache/stock_catalog.csv",
     },
 }
 

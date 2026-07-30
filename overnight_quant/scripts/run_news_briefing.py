@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.data.stock_catalog import load_stock_catalog, normalize_stock_code
 from overnight_quant.execution.state_manager import config_for_mode
 from overnight_quant.reports.news_briefing_report import write_news_briefing_report
 from overnight_quant.strategy.auction_observation import load_trading_day_candidates
@@ -20,9 +21,18 @@ def run_news_briefing(mode: str = "demo", trade_date: str | None = None, config:
     runtime = config_for_mode(config or load_news_config(), mode)
     paths = runtime.get("paths", {})
     candidates = candidate_rows if candidate_rows is not None else load_trading_day_candidates(paths["records_dir"])
-    analyzer = NewsBriefingAnalyzer(runtime, mode, now, candidates, source_fetchers)
-    if mode == "demo" and source_fetchers is None:
-        analyzer.fetchers = _demo_fetchers()
+    catalog = load_stock_catalog(paths["stock_catalog_path"]) if paths.get("stock_catalog_path") else {}
+    if catalog:
+        candidates = [
+            {
+                **candidate,
+                "name": (catalog.get(normalize_stock_code(candidate.get("code"))) or {}).get("name")
+                or candidate.get("name", ""),
+            }
+            for candidate in candidates
+        ]
+    effective_fetchers = _demo_fetchers() if mode == "demo" and source_fetchers is None else source_fetchers
+    analyzer = NewsBriefingAnalyzer(runtime, mode, now, candidates, effective_fetchers)
     result = finalize_news_sources(analyzer, analyzer.analyze(trade_date))
     result["report_path"] = write_news_briefing_report(result, paths["reports_dir"])
     return result
@@ -32,7 +42,16 @@ def _demo_fetchers():
     stamp = datetime.now(CN_TZ).isoformat(timespec="seconds")
     broad = lambda **_: [{"title": "政策支持人工智能产业规范发展", "summary": "产业景气与风险并存", "published_at": stamp, "source": "demo"}]
     stock = lambda code="", **_: [{"title": f"{code} 发布经营进展公告", "published_at": stamp, "source": "demo"}]
-    return {"eastmoney_global_news": broad, "cls_telegraph": broad, "eastmoney_stock_news": stock, "cninfo_announcements": stock}
+    return {
+        "eastmoney_global_news": broad,
+        "cls_telegraph": broad,
+        "newsnow_cls_hot": broad,
+        "newsnow_wallstreetcn": broad,
+        "newsnow_jin10": broad,
+        "newsnow_xueqiu_hotstock": broad,
+        "eastmoney_stock_news": stock,
+        "cninfo_announcements": stock,
+    }
 
 
 def main() -> int:

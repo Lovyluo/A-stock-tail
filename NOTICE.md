@@ -34,3 +34,15 @@ This project does not automatically trade. It does not click brokerage software 
 
 References to `a-stock-data`, Simon 林, or the upstream repository do not imply endorsement of this repository by the upstream author.
 
+## News Aggregation Design Reference
+
+The multi-source news fallback design also references:
+
+- Project: `daily_stock_analysis`
+- Upstream URL: https://github.com/ZhuLinsen/daily_stock_analysis
+- License: MIT License
+- Reviewed commit: `aa68d45d7f9e86948a66393bb9edf443cfc92540`
+
+The reference project is not vendored into this repository. A-stock-tail keeps
+its own lightweight adapters and safety boundaries. This attribution does not
+imply endorsement by the reference project or its contributors.

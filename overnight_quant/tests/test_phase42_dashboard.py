@@ -143,6 +143,7 @@ def test_command_whitelist_contains_only_approved_actions():
         "demo_news",
         "demo_after_close",
         "demo_scan",
+        "stock_catalog_update",
     }
 
 
@@ -671,6 +672,71 @@ def test_load_dashboard_state_reads_manual_orders_and_position_summary(tmp_path)
     assert rows[0]["open_qty"] == 100
     assert rows[0]["avg_buy_price"] == 18.0
     assert rows[0]["realized_pnl"] == 100.0
+
+
+def test_load_dashboard_state_splits_open_and_closed_positions(tmp_path):
+    from overnight_quant.ui.dashboard import load_dashboard_state
+
+    records = tmp_path / "overnight_quant" / "records"
+    records.mkdir(parents=True)
+    (records / "manual_orders.csv").write_text(
+        "order_id,trade_date,trade_time,code,name,side,price,qty,amount,stop_loss_price,status\n"
+        "B1,2026-07-22,2026-07-22 10:00:00,600001,Open Stock,BUY,10.0,200,2000,9.5,FILLED\n"
+        "B2,2026-07-21,2026-07-21 10:00:00,000002,Closed Stock,BUY,20.0,100,2000,19.0,FILLED\n"
+        "S2,2026-07-22,2026-07-22 11:00:00,000002,Closed Stock,SELL,21.0,100,2100,,FILLED\n",
+        encoding="utf-8-sig",
+    )
+
+    state = load_dashboard_state(root=tmp_path)
+
+    assert [row["code"] for row in state["open_positions"].to_dict("records")] == ["600001"]
+    assert [row["code"] for row in state["closed_positions"].to_dict("records")] == ["000002"]
+    assert state["closed_positions"].to_dict("records")[0]["status"] == "CLOSED"
+
+
+def test_news_briefing_sections_are_loaded_for_dashboard(tmp_path):
+    from overnight_quant.ui.dashboard import load_dashboard_state
+
+    reports = tmp_path / "overnight_quant" / "reports"
+    reports.mkdir(parents=True)
+    (reports / "news_briefing_2026-07-24.md").write_text(
+        "# 盘前消息面汇总\n\n"
+        "status: NEWS_BRIEFING_DEGRADED\n"
+        "window_start: 2026-07-23T15:00+08:00\n"
+        "window_end: 2026-07-24T09:25+08:00\n\n"
+        "## 数据源清单和抓取时间\n\n"
+        "- cls_telegraph: MISSING, error=offline\n\n"
+        "## 宏观消息\n\n"
+        "- 央行发布最新政策信息\n\n"
+        "## 个股公告/新闻\n\n"
+        "- 600001 示例公司发布公告\n\n"
+        "## 分歧后的防御方案\n\n"
+        "- 指数转弱时降低观察等级\n",
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(root=tmp_path)
+    sections = state["news_briefing_sections"]
+
+    assert state["news_briefing"]["status"] == "NEWS_BRIEFING_DEGRADED"
+    assert sections["sources"] == ["cls_telegraph: MISSING, error=offline"]
+    assert sections["macro_news"] == ["央行发布最新政策信息"]
+    assert sections["stock_news"] == ["600001 示例公司发布公告"]
+    assert sections["defence_plan"] == ["指数转弱时降低观察等级"]
+
+
+def test_degraded_news_action_explains_that_available_content_is_visible():
+    from overnight_quant.ui.dashboard import action_feedback
+
+    feedback = action_feedback(
+        "news_live",
+        {"ok": True, "stdout": "Status: NEWS_BRIEFING_DEGRADED\n"},
+        "zh",
+    )
+
+    assert feedback["severity"] == "warning"
+    assert "已生成" in feedback["message"]
+    assert "缺失来源" in feedback["message"]
 
 
 def test_load_dashboard_state_reads_sell_plan_detail_table(tmp_path):

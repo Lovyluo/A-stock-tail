@@ -4,6 +4,7 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
+from overnight_quant.data.stock_catalog import catalog_path_from_config, resolve_stock_name
 from overnight_quant.execution.position_tracker import get_open_positions, read_order_rows
 from overnight_quant.reports.lifecycle_report import write_trade_lifecycle_report
 from overnight_quant.reports.trade_review import write_trade_review
@@ -89,6 +90,7 @@ def record_position_update(
     code = str(code).strip().zfill(6)
     side = str(side).upper()
     existing = read_order_rows(records_dir)
+    name = _canonical_position_name(config, existing, code, name)
     reasons = _validate_position_update(existing, code, price, qty, side, trade_time, records_dir)
     report_path = _write_record_report(reports_dir, code, side, trade_time, not reasons, reasons)
     if reasons:
@@ -124,6 +126,25 @@ def record_position_update(
         "lifecycle_report_path": lifecycle_report_path,
         "trade_review_report_path": review_report_path,
     }
+
+
+def _canonical_position_name(config: dict, existing: list[dict], code: str, supplied_name: str) -> str:
+    configured_catalog = config.get("paths", {}).get("stock_catalog_path")
+    catalog_name = (
+        resolve_stock_name(
+            code,
+            catalog_path_from_config(config),
+            fetch_remote=False,
+        )
+        if configured_catalog
+        else ""
+    )
+    if catalog_name:
+        return catalog_name
+    for row in reversed(existing):
+        if str(row.get("code") or "").zfill(6) == code and str(row.get("name") or "").strip():
+            return str(row["name"]).strip()
+    return str(supplied_name or "").strip()
 
 
 def find_latest_ticket(reports_dir: str, code: str | None = None) -> dict:
