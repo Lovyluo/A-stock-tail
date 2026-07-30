@@ -7,6 +7,7 @@ from typing import Any
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime
+from overnight_quant.data.close_confirmation_readiness import normalize_daily_bars
 from overnight_quant.strategy.chip_volume import calculate_chip_metrics
 
 
@@ -63,9 +64,17 @@ def build_close_confirmation_features(
     negative_announcements = [
         item for item in news if _is_negative_news(item) and str(item.get("kind") or "").lower() == "announcement"
     ]
-    daily_bars = stock.get("daily_bars") or []
+    daily_bars, daily_audit = normalize_daily_bars(
+        stock.get("daily_bars") or [],
+        decision,
+    )
     fund_flow = stock.get("fund_flow") or []
-    chip_data_ready = len(_valid_daily_bars(daily_bars)) >= 60 and _fund_flow_available(fund_flow)
+    chip_data_ready = bool(
+        len(daily_bars) >= 60
+        and str(daily_audit.get("adjustment") or "") == "qfq"
+        and not daily_audit.get("errors")
+        and _fund_flow_available(fund_flow)
+    )
     chip = (
         calculate_chip_metrics(daily_bars, current_price)
         if chip_data_ready and current_price
@@ -358,15 +367,6 @@ def _round_optional(value: float | None) -> float | None:
 
 def _metric_text(value: float | None) -> str:
     return f"{value:.2f}" if value is not None else "missing"
-
-
-def _valid_daily_bars(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        row
-        for row in rows
-        if (_optional_float(row.get("close")) or 0) > 0
-        and (_optional_float(row.get("volume", row.get("vol"))) or 0) > 0
-    ]
 
 
 def _fund_flow_available(rows: list[dict[str, Any]]) -> bool:

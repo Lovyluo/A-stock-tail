@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from overnight_quant.data.close_confirmation_readiness import (
+    SNAPSHOT_CONTRACT_VERSION,
+    filter_source_status_at,
     validate_close_confirmation_readiness,
 )
 from overnight_quant.data.market_calendar import CN_TZ
@@ -91,31 +93,33 @@ class CloseWindowCollector:
                 provider_rows = [dict(item) for item in provider(current)]
                 records.extend(provider_rows)
                 source_status.append(
-                    {
-                        "source": source,
-                        "status": "SUCCESS",
-                        "ok": True,
-                        "record_count": len(provider_rows),
-                        "data_types": sorted(
+                    _source_status_record(
+                        source=source,
+                        status="SUCCESS",
+                        ok=True,
+                        record_count=len(provider_rows),
+                        data_types=sorted(
                             {
                                 str(row.get("data_type") or "").strip().lower()
                                 for row in provider_rows
                                 if row.get("data_type")
                             }
                         ),
-                    }
+                        observed_at=current,
+                    )
                 )
             except Exception as exc:
                 errors.append({"source": source, "error": f"{type(exc).__name__}: {exc}"})
                 source_status.append(
-                    {
-                        "source": source,
-                        "status": "FAILED",
-                        "ok": False,
-                        "record_count": 0,
-                        "data_types": [],
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
+                    _source_status_record(
+                        source=source,
+                        status="FAILED",
+                        ok=False,
+                        record_count=0,
+                        data_types=[],
+                        observed_at=current,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                 )
         accepted, rejected = records_available_at(records, current)
         readiness = validate_close_confirmation_readiness(
@@ -141,7 +145,9 @@ class CloseWindowCollector:
                 "records": [],
                 "rejected_records": rejected,
                 "errors": errors,
-                "source_status": source_status,
+                "source_status": list(
+                    readiness["normalized_snapshot"].get("source_status") or []
+                ),
                 **_readiness_fields(readiness),
             }
         snapshot = {
@@ -153,7 +159,9 @@ class CloseWindowCollector:
             "records": accepted,
             "rejected_records": rejected,
             "errors": errors,
-            "source_status": source_status,
+            "source_status": list(
+                readiness["normalized_snapshot"].get("source_status") or []
+            ),
             "raw_hash": stable_hash(accepted),
             **_readiness_fields(readiness),
         }
@@ -171,10 +179,14 @@ class CloseWindowCollector:
         day = date.fromisoformat(str(trade_date)) if not isinstance(trade_date, date) else trade_date
         decision_time = datetime.combine(day, FREEZE_TIME, tzinfo=CN_TZ)
         accepted, rejected = records_available_at(records, decision_time)
+        accepted_source_status, rejected_source_status = filter_source_status_at(
+            source_status or [],
+            decision_time,
+        )
         readiness = validate_close_confirmation_readiness(
             {
                 "records": accepted,
-                "source_status": list(source_status or []),
+                "source_status": accepted_source_status,
                 "decision_time": decision_time.isoformat(timespec="seconds"),
             },
         )
@@ -189,24 +201,52 @@ class CloseWindowCollector:
                 "rejected_records": rejected,
                 "record_count": 0,
                 "rejected_count": len(rejected),
-                "source_status": list(source_status or []),
+                "source_status": accepted_source_status,
+                "rejected_source_status": rejected_source_status,
                 **_readiness_fields(readiness),
             }
+        decision_text = decision_time.isoformat(timespec="seconds")
+        snapshot_hash = close_snapshot_hash(
+            decision_time=decision_text,
+            records=accepted,
+            source_status=accepted_source_status,
+        )
         frozen = {
             "status": "FROZEN_1450",
             "execution_ok": True,
             "data_ready": readiness["data_ready"],
             "trade_date": day.isoformat(),
-            "decision_time": decision_time.isoformat(timespec="seconds"),
+            "decision_time": decision_text,
+            "snapshot_contract_version": SNAPSHOT_CONTRACT_VERSION,
             "records": accepted,
             "rejected_records": rejected,
             "record_count": len(accepted),
             "rejected_count": len(rejected),
-            "source_status": list(source_status or []),
-            "snapshot_hash": stable_hash(accepted),
+            "source_status": accepted_source_status,
+            "snapshot_hash": snapshot_hash,
             **_readiness_fields(readiness),
         }
         frozen["path"] = str(self.store.write_once("frozen_1450", day.isoformat(), frozen))
+        frozen["rejected_source_status"] = rejected_source_status
+        if rejected_source_status:
+            audit_payload = {
+                "trade_date": day.isoformat(),
+                "decision_time": decision_text,
+                "snapshot_contract_version": SNAPSHOT_CONTRACT_VERSION,
+                "rejected_source_status": rejected_source_status,
+                "audit_hash": stable_hash(rejected_source_status),
+            }
+            audit_id = (
+                f"{day.isoformat()}_"
+                f"{audit_payload['audit_hash'][:16]}"
+            )
+            frozen["source_status_audit_path"] = str(
+                self.store.write_once(
+                    "source_status_audit",
+                    audit_id,
+                    audit_payload,
+                )
+            )
         return frozen
 
 
@@ -216,11 +256,50 @@ def load_frozen_snapshot(path: str | Path, decision_time: str | datetime | None 
     if not decision:
         raise PointInTimeError("decision_time_missing")
     accepted, rejected = records_available_at(payload.get("records") or [], decision)
+    accepted_source_status, rejected_source_status = filter_source_status_at(
+        payload.get("source_status") or [],
+        decision,
+    )
+    if payload.get("snapshot_contract_version") == SNAPSHOT_CONTRACT_VERSION:
+        expected_hash = close_snapshot_hash(
+            decision_time=str(decision),
+            records=accepted,
+            source_status=accepted_source_status,
+        )
+        if str(payload.get("snapshot_hash") or "") != expected_hash:
+            raise ImmutableSnapshotError("snapshot_hash_mismatch")
     return {
         **payload,
         "records": accepted,
         "rejected_records": list(payload.get("rejected_records") or []) + rejected,
+        "source_status": accepted_source_status,
+        "rejected_source_status": (
+            list(payload.get("rejected_source_status") or [])
+            + rejected_source_status
+        ),
     }
+
+
+def close_snapshot_hash(
+    *,
+    decision_time: str,
+    records: list[dict[str, Any]],
+    source_status: list[dict[str, Any]],
+) -> str:
+    decision = parse_cn_datetime(decision_time)
+    decision_text = (
+        decision.isoformat(timespec="seconds")
+        if decision is not None
+        else str(decision_time)
+    )
+    return stable_hash(
+        {
+            "decision_time": decision_text,
+            "snapshot_contract_version": SNAPSHOT_CONTRACT_VERSION,
+            "records": records,
+            "source_status": source_status,
+        }
+    )
 
 
 def _coerce_cn(value: datetime) -> datetime:
@@ -234,4 +313,39 @@ def _readiness_fields(readiness: dict[str, Any]) -> dict[str, Any]:
         "critical_source_status": dict(readiness.get("critical_source_status") or {}),
         "eligible_stock_codes": list(readiness.get("eligible_stock_codes") or []),
         "stock_readiness": dict(readiness.get("stock_readiness") or {}),
+    }
+
+
+def _source_status_record(
+    *,
+    source: str,
+    status: str,
+    ok: bool,
+    record_count: int,
+    data_types: list[str],
+    observed_at: datetime,
+    error: str = "",
+) -> dict[str, Any]:
+    current = _coerce_cn(observed_at)
+    cutoff = datetime.combine(
+        current.date(),
+        FREEZE_TIME,
+        tzinfo=CN_TZ,
+    )
+    payload = {
+        "source": source,
+        "status": status,
+        "ok": ok,
+        "record_count": int(record_count),
+        "data_types": list(data_types),
+        "error": error,
+    }
+    return {
+        **payload,
+        "event_time": current.isoformat(timespec="seconds"),
+        "observed_at": current.isoformat(timespec="seconds"),
+        "available_at": current.isoformat(timespec="seconds"),
+        "decision_cutoff": cutoff.isoformat(timespec="seconds"),
+        "source_version": "close_window_collector_v1",
+        "raw_hash": stable_hash(payload),
     }

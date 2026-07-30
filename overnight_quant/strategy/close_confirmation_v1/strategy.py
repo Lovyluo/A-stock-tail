@@ -51,6 +51,7 @@ class CloseConfirmationStrategy:
             working_snapshot,
             decision_time=decision_time,
         )
+        working_snapshot = readiness["normalized_snapshot"]
         base_result = _base_result(readiness, mode, decision_time)
         input_demo_paths = (
             demo_field_paths(working_snapshot)

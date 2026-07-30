@@ -360,7 +360,16 @@ def _snapshot() -> dict:
         {
             "date": (first_daily_date + timedelta(days=index)).isoformat(),
             "close": 9.0 + index * 0.02,
+            "high": 9.05 + index * 0.02,
+            "low": 8.95 + index * 0.02,
             "volume": 100000 + index * 1000,
+            "adjustment": "qfq",
+            **_pit_meta(
+                event_time=f"{(first_daily_date + timedelta(days=index)).isoformat()}T15:00:00+08:00",
+                clock="14:30",
+                source="unit.daily_bar",
+                raw_hash=f"daily-{index}",
+            ),
         }
         for index in range(60)
     ]
@@ -397,16 +406,31 @@ def _snapshot() -> dict:
                 "is_limit_up": False,
                 "is_limit_down": False,
                 "industry_name": "银行",
-                "market": {"index_change_pct": 0.8, "breadth_ratio": 0.65},
+                **_pit_meta(clock="14:49", source="unit.quote", raw_hash="quote"),
+                "market": {
+                    "index_change_pct": 0.8,
+                    "breadth_ratio": 0.65,
+                    **_pit_meta(clock="14:49", source="unit.market", raw_hash="market"),
+                },
                 "industry": {
                     "name": "银行",
                     "change_pct": 1.5,
                     "relative_strength_pct": 1.0,
                     "breadth_ratio": 0.7,
+                    **_pit_meta(clock="14:49", source="unit.industry", raw_hash="industry"),
                 },
                 "intraday_bars": bars,
                 "daily_bars": daily,
-                "fund_flow": [{"main_net": 1000}],
+                "fund_flow": [
+                    {
+                        "main_net": 1000,
+                        **_pit_meta(
+                            clock="14:40",
+                            source="unit.fund_flow",
+                            raw_hash="fund-flow",
+                        ),
+                    }
+                ],
                 "news": news,
             }
         ],
@@ -421,6 +445,10 @@ def _bar(clock: str, price: float, volume: float) -> dict:
         "event_time": f"2026-07-30T{clock}:00+08:00",
         "observed_at": f"2026-07-30T{clock}:00+08:00",
         "available_at": f"2026-07-30T{clock}:00+08:00",
+        "decision_cutoff": "2026-07-30T14:50:00+08:00",
+        "source": "unit.minute_bar",
+        "source_version": "1",
+        "raw_hash": f"minute-{clock}",
         "price": price,
         "open": price,
         "high": price + 0.02,
@@ -429,6 +457,25 @@ def _bar(clock: str, price: float, volume: float) -> dict:
         "amount": price * volume,
         "bid_vol1": 500,
         "ask_vol1": 300,
+    }
+
+
+def _pit_meta(
+    *,
+    clock: str,
+    source: str,
+    raw_hash: str,
+    event_time: str | None = None,
+) -> dict:
+    instant = f"2026-07-30T{clock}:00+08:00"
+    return {
+        "event_time": event_time or instant,
+        "observed_at": instant,
+        "available_at": instant,
+        "decision_cutoff": "2026-07-30T14:50:00+08:00",
+        "source": source,
+        "source_version": "1",
+        "raw_hash": raw_hash,
     }
 
 

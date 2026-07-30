@@ -119,14 +119,7 @@ def test_missing_chip_inputs_receive_no_default_chip_score():
 
 def test_failed_news_source_is_distinct_from_successful_zero_news():
     zero_news = _complete_snapshot()
-    zero_news["source_status"] = [
-        {
-            "source": "unit.news",
-            "data_type": "news",
-            "status": "SUCCESS",
-            "record_count": 0,
-        }
-    ]
+    zero_news["source_status"] = [_source_status()]
     zero_result = CloseConfirmationStrategy({"min_shadow_score": 0}).evaluate_snapshot(
         zero_news,
         mode="shadow",
@@ -172,14 +165,7 @@ def test_complete_records_only_snapshot_is_scored():
         "trade_date": TRADE_DATE,
         "decision_time": DECISION_TIME,
         "records": _complete_records(),
-        "source_status": [
-            {
-                "source": "unit.news",
-                "data_type": "news",
-                "status": "SUCCESS",
-                "record_count": 0,
-            }
-        ],
+        "source_status": [_source_status()],
     }
 
     frozen = PointInTimeProvider([snapshot]).snapshot_at(TRADE_DATE, "14:50")
@@ -206,14 +192,7 @@ def test_records_after_1450_do_not_change_complete_records_only_score():
         "trade_date": TRADE_DATE,
         "decision_time": DECISION_TIME,
         "records": _complete_records(),
-        "source_status": [
-            {
-                "source": "unit.news",
-                "data_type": "news",
-                "status": "SUCCESS",
-                "record_count": 0,
-            }
-        ],
+        "source_status": [_source_status()],
     }
     changed_snapshot = deepcopy(base_snapshot)
     changed_snapshot["records"].append(
@@ -298,14 +277,7 @@ def test_incomplete_status_is_yellow_in_dashboard_and_degraded_in_preflight(
 def test_readiness_validator_reports_coverage_errors_and_source_states():
     snapshot = _complete_snapshot()
     snapshot["stocks"][0]["fund_flow"] = []
-    snapshot["source_status"] = [
-        {
-            "source": "unit.news",
-            "data_type": "news",
-            "status": "SUCCESS",
-            "record_count": 0,
-        }
-    ]
+    snapshot["source_status"] = [_source_status()]
 
     readiness = validate_close_confirmation_readiness(snapshot)
 
@@ -328,14 +300,45 @@ def _complete_snapshot() -> dict:
         "trade_date": TRADE_DATE,
         "decision_time": DECISION_TIME,
         "stocks": [_complete_stock()],
-        "source_status": [
-            {
-                "source": "unit.news",
-                "data_type": "news",
-                "status": "SUCCESS",
-                "record_count": 0,
-            }
-        ],
+        "source_status": [_source_status()],
+    }
+
+
+def _pit_meta(
+    *,
+    source: str,
+    raw_hash: str,
+    clock: str,
+    event_time: str | None = None,
+    cutoff: str = "14:50",
+) -> dict:
+    instant = f"{TRADE_DATE}T{clock}:00+08:00"
+    return {
+        "event_time": event_time or instant,
+        "observed_at": instant,
+        "available_at": instant,
+        "decision_cutoff": f"{TRADE_DATE}T{cutoff}:00+08:00",
+        "source": source,
+        "source_version": "1",
+        "raw_hash": raw_hash,
+    }
+
+
+def _source_status(
+    *,
+    status: str = "SUCCESS",
+    clock: str = "14:40",
+    data_type: str = "news",
+) -> dict:
+    return {
+        "data_type": data_type,
+        "status": status,
+        "record_count": 0,
+        **_pit_meta(
+            source=f"unit.{data_type}",
+            raw_hash=f"{data_type}-{status}-{clock}",
+            clock=clock,
+        ),
     }
 
 
@@ -348,6 +351,10 @@ def _complete_stock() -> dict:
                 "event_time": f"{TRADE_DATE}T14:{minute:02d}:00+08:00",
                 "observed_at": f"{TRADE_DATE}T14:{minute:02d}:00+08:00",
                 "available_at": f"{TRADE_DATE}T14:{minute:02d}:00+08:00",
+                "decision_cutoff": DECISION_TIME,
+                "source": "unit.minute_bar",
+                "source_version": "1",
+                "raw_hash": f"minute-{minute}",
                 "price": price,
                 "open": price,
                 "high": price + 0.01,
@@ -366,6 +373,13 @@ def _complete_stock() -> dict:
             "high": 9.05 + index * 0.02,
             "low": 8.95 + index * 0.02,
             "volume": 100000 + index * 1000,
+            "adjustment": "qfq",
+            **_pit_meta(
+                source="unit.daily_bar",
+                raw_hash=f"daily-{index}",
+                clock="14:30",
+                event_time=f"{(start + timedelta(days=index)).isoformat()}T15:00:00+08:00",
+            ),
         }
         for index in range(60)
     ]
@@ -381,16 +395,32 @@ def _complete_stock() -> dict:
         "is_limit_up": False,
         "is_limit_down": False,
         "industry_name": "银行",
-        "market": {"index_change_pct": 0.5, "breadth_ratio": 0.62},
+        **_pit_meta(source="unit.quote", raw_hash="quote", clock="14:49"),
+        "market": {
+            "index_change_pct": 0.5,
+            "breadth_ratio": 0.62,
+            **_pit_meta(source="unit.market", raw_hash="market", clock="14:49"),
+        },
         "industry": {
             "name": "银行",
             "change_pct": 1.0,
             "relative_strength_pct": 0.8,
             "breadth_ratio": 0.68,
+            **_pit_meta(source="unit.industry", raw_hash="industry", clock="14:49"),
         },
         "intraday_bars": bars,
         "daily_bars": daily_bars,
-        "fund_flow": [{"main_net": 1000000, "large_net": 600000}],
+        "fund_flow": [
+            {
+                "main_net": 1000000,
+                "large_net": 600000,
+                **_pit_meta(
+                    source="unit.fund_flow",
+                    raw_hash="fund-flow",
+                    clock="14:40",
+                ),
+            }
+        ],
         "news": [],
     }
 

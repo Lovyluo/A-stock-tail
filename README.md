@@ -99,6 +99,11 @@ be made until all gates in
 [the strategy design](overnight_quant/docs/phase7_0_close_confirmation_strategy_design.md)
 pass.
 
+PR #5 provides the research framework plus manual and replay snapshot entry points only.
+It does not include a real automated market-data collector, and it is not ready to begin the
+formal 60-trading-day shadow acceptance period. The production-grade point-in-time collector
+is deferred to a separate v0.4.1 phase.
+
 See also:
 
 - [Point-in-time data dictionary](overnight_quant/docs/phase7_0_point_in_time_data_dictionary.md)
