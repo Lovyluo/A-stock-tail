@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 import json
 from pathlib import Path
@@ -25,6 +26,30 @@ FREEZE_TIME = time(14, 50)
 
 class ImmutableSnapshotError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ProviderBatch:
+    records: list[dict[str, Any]] = field(default_factory=list)
+    data_types: list[str] = field(default_factory=list)
+    source_version: str = ""
+    raw_hash: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    callback: Callable[
+        [datetime],
+        list[dict[str, Any]] | ProviderBatch,
+    ]
+    data_types: list[str] = field(default_factory=list)
+    source_version: str = ""
+
+    def __call__(
+        self,
+        observed_at: datetime,
+    ) -> list[dict[str, Any]] | ProviderBatch:
+        return self.callback(observed_at)
 
 
 class ImmutableSnapshotStore:
@@ -57,7 +82,13 @@ class CloseWindowCollector:
     def __init__(
         self,
         store: ImmutableSnapshotStore,
-        providers: dict[str, Callable[[datetime], list[dict[str, Any]]]],
+        providers: dict[
+            str,
+            Callable[
+                [datetime],
+                list[dict[str, Any]] | ProviderBatch,
+            ],
+        ],
         *,
         clock: Callable[[], datetime] | None = None,
     ):
@@ -94,8 +125,42 @@ class CloseWindowCollector:
         completion_times: list[datetime] = [current]
         for source, provider in self.providers.items():
             started_at = _coerce_cn(self.clock())
+            expected_data_types = sorted(
+                {
+                    str(item).strip().lower()
+                    for item in getattr(provider, "data_types", [])
+                    if str(item).strip()
+                }
+            )
+            expected_source_version = str(
+                getattr(provider, "source_version", "")
+                or "close_window_collector_v1"
+            )
             try:
-                provider_rows = [dict(item) for item in provider(started_at)]
+                provider_result = provider(started_at)
+                if isinstance(provider_result, ProviderBatch):
+                    provider_rows = [
+                        dict(item) for item in provider_result.records
+                    ]
+                    declared_data_types = sorted(
+                        {
+                            str(item).strip().lower()
+                            for item in provider_result.data_types
+                            if str(item).strip()
+                        }
+                    )
+                    source_version = (
+                        provider_result.source_version
+                        or "close_window_collector_v1"
+                    )
+                    source_raw_hash = provider_result.raw_hash
+                else:
+                    provider_rows = [
+                        dict(item) for item in provider_result
+                    ]
+                    declared_data_types = []
+                    source_version = expected_source_version
+                    source_raw_hash = ""
                 completed_at = _coerce_cn(self.clock())
                 completion_times.append(completed_at)
                 provider_rows = [
@@ -114,7 +179,9 @@ class CloseWindowCollector:
                         ok=True,
                         record_count=len(provider_rows),
                         data_types=sorted(
-                            {
+                            set(expected_data_types)
+                            | set(declared_data_types)
+                            | {
                                 str(row.get("data_type") or "").strip().lower()
                                 for row in provider_rows
                                 if row.get("data_type")
@@ -122,6 +189,8 @@ class CloseWindowCollector:
                         ),
                         started_at=started_at,
                         completed_at=completed_at,
+                        source_version=source_version,
+                        raw_hash=source_raw_hash,
                     )
                 )
             except Exception as exc:
@@ -134,9 +203,10 @@ class CloseWindowCollector:
                         status="FAILED",
                         ok=False,
                         record_count=0,
-                        data_types=[],
+                        data_types=expected_data_types,
                         started_at=started_at,
                         completed_at=completed_at,
+                        source_version=expected_source_version,
                         error=f"{type(exc).__name__}: {exc}",
                     )
                 )
@@ -387,6 +457,8 @@ def _source_status_record(
     data_types: list[str],
     started_at: datetime,
     completed_at: datetime,
+    source_version: str = "close_window_collector_v1",
+    raw_hash: str = "",
     error: str = "",
 ) -> dict[str, Any]:
     started = _coerce_cn(started_at)
@@ -412,8 +484,8 @@ def _source_status_record(
         "started_at": started.isoformat(timespec="seconds"),
         "completed_at": completed.isoformat(timespec="seconds"),
         "decision_cutoff": cutoff.isoformat(timespec="seconds"),
-        "source_version": "close_window_collector_v1",
-        "raw_hash": stable_hash(payload),
+        "source_version": source_version,
+        "raw_hash": raw_hash or stable_hash(payload),
     }
 
 

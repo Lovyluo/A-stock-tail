@@ -12,7 +12,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.data.market_calendar import CN_TZ
-from overnight_quant.data.snapshot_store import CloseWindowCollector, ImmutableSnapshotStore
+from overnight_quant.data.real_point_in_time_collectors import (
+    RealPointInTimeCollectors,
+)
+from overnight_quant.data.snapshot_store import (
+    CloseWindowCollector,
+    ImmutableSnapshotStore,
+)
 
 
 def run_snapshot_collection(
@@ -22,6 +28,9 @@ def run_snapshot_collection(
     snapshot_root: str | Path = "overnight_quant/data/cache/close_confirmation_snapshots",
     freeze: bool = False,
     now: datetime | None = None,
+    live: bool = False,
+    codes: list[str] | None = None,
+    collectors: RealPointInTimeCollectors | None = None,
 ) -> dict:
     current = now or datetime.now(CN_TZ)
     records = []
@@ -44,9 +53,36 @@ def run_snapshot_collection(
             records = payload
         if not isinstance(records, list):
             records = []
-    providers = {"input_file": lambda observed_at: list(records)} if records else {}
+    if live and input_path:
+        return {
+            "status": "COLLECTOR_INPUT_CONFLICT",
+            "execution_ok": False,
+            "data_ready": False,
+            "records": [],
+        }
+    if live:
+        runtime_collectors = collectors or RealPointInTimeCollectors(
+            codes or []
+        )
+        providers = runtime_collectors.provider_map()
+    else:
+        providers = (
+            {"input_file": lambda observed_at: list(records)}
+            if records
+            else {}
+        )
     collector = CloseWindowCollector(ImmutableSnapshotStore(snapshot_root), providers)
     if freeze:
+        if live:
+            return {
+                "status": "LIVE_FREEZE_REQUIRES_COLLECTED_INPUT",
+                "execution_ok": False,
+                "data_ready": False,
+                "records": [],
+                "candidates": [],
+                "tickets": [],
+                "orders": [],
+            }
         return collector.freeze(
             trade_date or current.date().isoformat(),
             records,
@@ -61,6 +97,16 @@ def main() -> int:
     parser.add_argument("--trade-date", default=None)
     parser.add_argument("--snapshot-root", default="overnight_quant/data/cache/close_confirmation_snapshots")
     parser.add_argument("--freeze", action="store_true")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Use real providers. No demo fallback is available.",
+    )
+    parser.add_argument(
+        "--codes",
+        default="",
+        help="Comma-separated stock codes for real provider collection.",
+    )
     args = parser.parse_args()
 
     result = run_snapshot_collection(
@@ -68,6 +114,12 @@ def main() -> int:
         trade_date=args.trade_date,
         snapshot_root=args.snapshot_root,
         freeze=args.freeze,
+        live=args.live,
+        codes=[
+            item.strip()
+            for item in str(args.codes).split(",")
+            if item.strip()
+        ],
     )
     print(f"Status: {result['status']}")
     print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")

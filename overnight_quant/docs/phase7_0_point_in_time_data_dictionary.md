@@ -199,3 +199,22 @@ PR #5 只提供研发框架，以及手工快照和回放快照入口，尚未�
 
 `CloseWindowCollector` 支持注入 clock 以进行确定性测试。该能力不代表已接入真实
 联网自动采集器；真实采集器仍属于独立 v0.4.1 范围。
+
+## 13. v0.4.1 真实来源附加字段
+
+真实 provider 的业务 payload 可以包含：
+
+| 字段 | 含义 |
+|---|---|
+| `field_units` | 各来源字段的原始单位，例如 `CNY`、`CNY_10k`、`vendor_lot`、`percent` |
+| `adjustment_evidence` | 前复权证明，当前要求请求为 qfq 且响应键为 qfqday |
+| `fallback_from` | 主来源失败时实际启用的主来源名称 |
+| `fallback_reason` | 主来源失败的脱敏异常类型和原因 |
+| `timestamp_quality` | 来源时间质量；无来源时间的快照不得伪装成来源事件时间 |
+
+`ProviderBatch` 必须声明 `data_types`、`source_version` 和批次 `raw_hash`。即使
+provider 失败，`ProviderSpec` 仍保留预期数据类型和版本，使 `FAILED` 不会被误解释为
+合法的 `AVAILABLE_EMPTY`。
+
+来源验证结果本身始终 `data_ready=false`，只用于验证真实字段、时间和连通性，不是
+冻结快照，也不会生成评分、候选、票据或订单。

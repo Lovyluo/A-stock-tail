@@ -105,9 +105,16 @@ It does not include a real automated market-data collector, and it is not ready 
 formal 60-trading-day shadow acceptance period. The production-grade point-in-time collector
 is deferred to a separate v0.4.1 phase.
 
+v0.4.1 now includes real-source provider interfaces and a validation matrix. Eastmoney
+`push2` stability, a verified industry-breadth backup, and the exact availability semantics of
+the 14:50 minute event remain blockers. These providers therefore do not yet authorize the
+formal 60-trading-day shadow acceptance period.
+
 See also:
 
 - [Point-in-time data dictionary](overnight_quant/docs/phase7_0_point_in_time_data_dictionary.md)
+- [v0.4.1 real collector design](overnight_quant/docs/phase7_1_real_point_in_time_collectors_design.md)
+- [v0.4.1 source validation matrix](overnight_quant/docs/phase7_1_source_validation_matrix.md)
 - [v0.4 safety boundary](overnight_quant/docs/phase7_0_safety_boundary.md)
 
 ## Common Commands
@@ -121,6 +128,12 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_scan.py --mode d
 
 # Freeze point-in-time records at 14:50
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --input snapshot_records.json --freeze --trade-date 2026-07-30
+
+# Validate real providers without writing a snapshot
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_source_validation.py --codes 000001
+
+# Collect real provider records during the close window; no demo fallback
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --live --codes 000001
 
 # Run the new strategy in shadow mode
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_confirmation.py --mode shadow --date 2026-07-30
