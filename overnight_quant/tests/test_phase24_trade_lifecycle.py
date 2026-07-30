@@ -1,9 +1,14 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from overnight_quant.execution.order_recorder import record_manual_order, record_position_update
 from overnight_quant.execution.position_tracker import get_open_positions
-from overnight_quant.scripts.run_sell_plan import _realtime_trigger_cn, _sell_trigger_cn, generate_sell_plan
+from overnight_quant.scripts.run_sell_plan import (
+    _fresh_fund_rows,
+    _realtime_trigger_cn,
+    _sell_trigger_cn,
+    generate_sell_plan,
+)
 from overnight_quant.strategy.yang_yongxing_overnight import load_config
 
 
@@ -226,6 +231,35 @@ def test_sell_plan_falls_back_to_eastmoney_core_theme_and_sina_funds(tmp_path):
     assert "当日主力流入" in row["today_main_fund_cn"]
 
 
+def test_fund_rows_are_fresh_at_twenty_days():
+    rows = [{"time": "2026-05-04", "main_net": 1}]
+
+    result = _fresh_fund_rows(
+        rows,
+        as_of_date=date(2026, 5, 24),
+    )
+
+    assert result == rows
+
+
+def test_fund_rows_are_stale_at_twenty_one_days():
+    result = _fresh_fund_rows(
+        [{"time": "2026-05-03", "main_net": 1}],
+        as_of_date=date(2026, 5, 24),
+    )
+
+    assert result == []
+
+
+def test_future_fund_rows_are_rejected():
+    result = _fresh_fund_rows(
+        [{"time": "2026-05-25", "main_net": 1}],
+        as_of_date=date(2026, 5, 24),
+    )
+
+    assert result == []
+
+
 def test_no_open_position_returns_no_open_position(tmp_path):
     config = _tmp_config(tmp_path)
 
@@ -429,8 +463,8 @@ class _fallback_data_client(_price_client):
 
     def _sina_money_flow_history(self, code):
         return [
-            {"time": f"2026-07-{day:02d}", "main_net": 10_000_000}
-            for day in range(1, 11)
+            {"time": f"2026-05-{day:02d}", "main_net": 10_000_000}
+            for day in range(15, 25)
         ]
 
     def _safe_quote_fund_flow(self, codes):
