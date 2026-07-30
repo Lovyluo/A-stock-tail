@@ -8,6 +8,9 @@ from typing import Any, Iterable
 from overnight_quant.data.close_confirmation_readiness import (
     normalize_close_confirmation_snapshot,
 )
+from overnight_quant.data.close_time_contract import (
+    normalize_close_time_contract,
+)
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime
 from overnight_quant.data.snapshot_store import load_frozen_snapshot
@@ -46,6 +49,20 @@ class PointInTimeProvider:
             matching,
             key=lambda item: _timestamp_value(item.get("frozen_at") or item.get("decision_time")),
         )
+        time_contract = normalize_close_time_contract(
+            snapshot.get("time_contract"),
+            fallback_decision_time=decision,
+        )
+        if (
+            time_contract is not None
+            and time_contract.contract_version
+            != "legacy_single_cutoff_v1"
+        ):
+            contract_decision = parse_cn_datetime(
+                time_contract.decision_time
+            )
+            if contract_decision is not None:
+                decision = contract_decision
         result = deepcopy(snapshot)
         result = normalize_close_confirmation_snapshot(
             result,

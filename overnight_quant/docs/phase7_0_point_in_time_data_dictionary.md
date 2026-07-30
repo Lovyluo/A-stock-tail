@@ -18,12 +18,21 @@
 | `data_type` | `market`、`industry`、`quote`、`minute_bar`、`fund_flow`、`news` 等 |
 | `payload` | 业务字段 |
 
-统一过滤条件：
+v0.4.1 将原来的单一 `decision_time` 拆分为四个时点：
+
+| 字段 | 含义 |
+|---|---|
+| `feature_event_cutoff` | 特征允许使用的最晚市场事件时间，固定为 14:50:00 |
+| `collection_deadline` | 网络响应完成并解析的最晚时间 |
+| `decision_time` | 生成影子决策的时间 |
+| `execution_not_before` | 事件回测或纯模拟允许开始成交的最早时间 |
+
+新合同的统一过滤条件：
 
 ```text
-event_time <= decision_time
-observed_at <= decision_time
-available_at <= decision_time
+event_time <= feature_event_cutoff
+observed_at <= collection_deadline
+available_at <= collection_deadline
 available_at >= observed_at
 decision_time <= decision_cutoff
 ```
@@ -32,8 +41,12 @@ decision_time <= decision_cutoff
 
 ```text
 published_at is not empty
-published_at <= decision_time
+published_at <= feature_event_cutoff
 ```
+
+旧手工/回放快照没有显式四时点合同时继续使用原单截止语义，不会被自动升级。
+真实采集记录必须显式携带四时点合同。来源状态不参与特征事件截止判断，但其完成时间
+仍必须不晚于 `collection_deadline`。
 
 ## 2. 冻结快照
 
@@ -41,7 +54,10 @@ published_at <= decision_time
 |---|---|
 | `status` | `FROZEN_1450` |
 | `trade_date` | 交易日期 |
-| `decision_time` | 固定为当日 14:50 |
+| `feature_event_cutoff` | 固定为当日 14:50 |
+| `collection_deadline` | 由已验证的分钟标签语义确定 |
+| `decision_time` | 晚于采集截止，用于生成影子决策 |
+| `execution_not_before` | 晚于决策时间 |
 | `records` | 通过时点合同的记录 |
 | `rejected_records` | 被拒绝记录及原因 |
 | `record_count` | 可用记录数 |
@@ -101,7 +117,8 @@ published_at <= decision_time
 | `blocked_reason` | 停牌、涨跌停等受阻原因 |
 | `blocked_days` | 无法退出累计天数 |
 
-日线收盘价不得用来补充 14:51-14:55 的成交。
+日线收盘价不得用来补充分钟成交。事件成交必须同时满足配置的成交窗口和快照内的
+`execution_not_before`。
 
 ## 6. 完整性与就绪状态
 
@@ -135,11 +152,25 @@ published_at <= decision_time
 
 `source_status` 与业务记录使用相同的时点合同，必须包含 `event_time`、
 `observed_at`、`available_at`、`decision_cutoff`、`source`、
-`source_version` 和 `raw_hash`。14:50 后才成功的来源状态不得改变当日就绪状态，
-只能写入独立审计记录。
+`source_version` 和 `raw_hash`。来源状态可在 14:50 后完成，但必须不晚于
+`collection_deadline`；超过该时点只能写入独立审计记录。
 
-`snapshot_hash` 覆盖决策时间、合同版本、截至决策时点有效的 records 和有效的
+`snapshot_hash` 覆盖四时点合同、决策时间、合同版本、有效 records 和有效的
 source status。冻结后到达的来源状态不能改变已冻结快照及其哈希。
+
+## 7.1 分钟标签验证
+
+真实交易日必须在 `14:49:55`、`14:50:05`、`14:50:30`、`14:51:05`
+采样同一供应商接口并比较标记为 14:50 的 OHLCV：
+
+- 14:50 记录在 14:50 分钟内变化、14:51 后稳定：按分钟开始标签处理，
+  采集截止为 14:51:05，决策为 14:51:10，模拟成交不早于 14:52；
+- 14:50 记录从 14:50 初始采样起稳定：可作为分钟结束标签候选，但仍需使用多只
+  高流动性股票复核；
+- 样本缺失或变化模式不明确：`minute_label_semantics=unverified`，
+  `data_ready=false`。
+
+当前四时点实盘采样尚未完成，因此不得宣称 14:50 SLA 已通过。
 
 ## 8. 60 日筹码代理日线合同
 
@@ -152,6 +183,19 @@ source status。冻结后到达的来源状态不能改变已冻结快照及其�
 - 59 个唯一交易日、60 条同日重复记录或任何决策后可见日线均不能通过完整性门禁。
 
 筹码成本和主力资金字段始终是代理指标，不代表真实持仓成本或真实主力仓位。
+
+资金流记录还必须包含：
+
+| 字段 | 含义 |
+|---|---|
+| `semantic_class` | 数据语义类别 |
+| `timestamp_quality` | 时间戳质量 |
+| `is_proxy` | 是否为代理数据 |
+| `eligible_for_hard_gate` | 是否可满足正式资金流门禁 |
+| `field_definition_version` | 字段定义版本 |
+
+东财分钟资金流是正式主源。新浪当前资金快照在字段等价性未证明前固定为 proxy，
+不能单独满足正式门禁，也不能改变正式评分或 `decision_hash`。
 
 ## 9. PR #5 范围
 

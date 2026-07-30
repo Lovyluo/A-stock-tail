@@ -86,12 +86,15 @@ The former `yang_yongxing_overnight_v1` entry is preserved as
 
 `close_confirmation_v1` is currently **research / shadow simulation only**:
 
-- freezes point-in-time data at 14:50;
+- uses a four-stage point-in-time contract: feature cutoff, collection deadline,
+  decision time, and execution-not-before;
 - scores market, industry, relative strength, price/volume, sourced catalysts, and chip proxies;
-- starts event fills at 14:51 and cancels remaining quantity at 14:56;
+- starts event fills no earlier than the contract's execution time and cancels remaining
+  quantity at 14:56;
 - applies partial fills, date-aware price limits, suspension, T+1, slippage, impact, and 100-share lots;
 - never substitutes daily close data for missing minute data;
 - requires a versioned exchange-calendar or benchmark-index trading-date record for 60-day chip inputs;
+- treats Sina fund-flow data as an audit proxy that cannot satisfy the formal fund-flow gate;
 - never uses demo fallback fields in live, shadow, paper, or replay results.
 
 The historical and shadow acceptance thresholds have not yet been met because the required
@@ -109,6 +112,11 @@ v0.4.1 now includes real-source provider interfaces and a validation matrix. Eas
 `push2` stability, a verified industry-breadth backup, and the exact availability semantics of
 the 14:50 minute event remain blockers. These providers therefore do not yet authorize the
 formal 60-trading-day shadow acceptance period.
+
+The current conservative contract keeps `feature_event_cutoff=14:50:00`, waits until
+`collection_deadline=14:51:05`, decides at `14:51:10`, and permits simulated fills no earlier
+than `14:52:00`. This is not a claim that the supplier's 14:50 minute label has been verified.
+Until the four-point real-session probe succeeds, minute-label readiness remains blocked.
 
 See also:
 
@@ -134,6 +142,12 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_source_vali
 
 # Collect real provider records during the close window; no demo fallback
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --live --codes 000001
+
+# Probe the supplier's 14:50 minute-label semantics at four real-session times
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py
+
+# Benchmark real providers for 1/10/30/50 stocks without writing snapshots
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_collector_stress.py --sizes 1,10,30,50 --deadline-seconds 8
 
 # Run the new strategy in shadow mode
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_confirmation.py --mode shadow --date 2026-07-30

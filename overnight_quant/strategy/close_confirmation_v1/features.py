@@ -5,6 +5,10 @@ import math
 from statistics import mean, pstdev
 from typing import Any
 
+from overnight_quant.data.close_time_contract import (
+    contract_datetimes,
+    normalize_close_time_contract,
+)
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime
 from overnight_quant.data.close_confirmation_readiness import normalize_daily_bars
@@ -29,10 +33,27 @@ def build_close_confirmation_features(
     decision = parse_cn_datetime(decision_time)
     if decision is None:
         raise ValueError("decision_time_invalid")
-    bars = bars_available_at(stock.get("intraday_bars") or [], decision)
+    time_contract = normalize_close_time_contract(
+        stock.get("_time_contract"),
+        fallback_decision_time=decision,
+    )
+    contract_times = contract_datetimes(time_contract) if time_contract else {}
+    feature_cutoff = contract_times.get("feature_event_cutoff", decision)
+    collection_deadline = contract_times.get(
+        "collection_deadline",
+        decision,
+    )
+    bars = bars_available_at(
+        stock.get("intraday_bars") or [],
+        feature_cutoff,
+    )
     market = stock.get("market") or {}
     industry = stock.get("industry") or {}
-    news = news_available_at(stock.get("news") or [], decision)
+    news = news_available_at(
+        stock.get("news") or [],
+        feature_cutoff,
+        collection_deadline=collection_deadline,
+    )
     current_price = _bar_price(bars[-1]) if bars else 0.0
     vwap_values = _rolling_vwap(bars)
     latest_vwap = vwap_values[-1] if vwap_values else 0.0
@@ -68,8 +89,12 @@ def build_close_confirmation_features(
         stock.get("daily_bars") or [],
         decision,
         calendar_contract=stock.get("trading_calendar_contract") or {},
+        time_contract=time_contract,
     )
-    fund_flow = stock.get("fund_flow") or []
+    all_fund_flow = stock.get("fund_flow") or []
+    fund_flow = [
+        row for row in all_fund_flow if _eligible_fund_flow_row(row)
+    ]
     chip_data_ready = bool(
         len(daily_bars) >= 60
         and str(daily_audit.get("adjustment") or "") == "qfq"
@@ -86,7 +111,7 @@ def build_close_confirmation_features(
         bars
         and parse_cn_datetime(bars[-1].get("_pit_time"))
         and parse_cn_datetime(bars[-1].get("_pit_time")).replace(second=0, microsecond=0)
-        >= decision.replace(second=0, microsecond=0)
+        >= feature_cutoff.replace(second=0, microsecond=0)
     )
     price_volume = (
         _price_volume_score(
@@ -114,6 +139,13 @@ def build_close_confirmation_features(
     )
     return {
         "decision_time": decision.isoformat(timespec="seconds"),
+        "feature_event_cutoff": feature_cutoff.isoformat(
+            timespec="seconds"
+        ),
+        "execution_not_before": contract_times.get(
+            "execution_not_before",
+            decision,
+        ).isoformat(timespec="seconds"),
         "minute_bar_count": len(bars),
         "last_bar_time": _bar_time_text(bars[-1]) if bars else "",
         "current_price": round(current_price, 4),
@@ -130,6 +162,7 @@ def build_close_confirmation_features(
         "catalyst_score": _round_optional(catalyst),
         "negative_announcement_count": len(negative_announcements),
         "eligible_news_count": len(news),
+        "formal_fund_flow_count": len(fund_flow),
         "chip_avg_cost_20d": _optional_float(chip.get("chip_avg_cost_20d")),
         "chip_avg_cost_60d": _optional_float(chip.get("chip_avg_cost_60d")),
         "overhead_pressure_ratio": _optional_float(chip.get("overhead_pressure_ratio")),
@@ -176,14 +209,23 @@ def bars_available_at(rows: list[dict[str, Any]], decision_time: datetime) -> li
     return sorted(selected, key=lambda item: item["_pit_time"])
 
 
-def news_available_at(rows: list[dict[str, Any]], decision_time: datetime) -> list[dict[str, Any]]:
+def news_available_at(
+    rows: list[dict[str, Any]],
+    decision_time: datetime,
+    *,
+    collection_deadline: datetime | None = None,
+) -> list[dict[str, Any]]:
     selected = []
+    availability_cutoff = collection_deadline or decision_time
     for row in rows:
         published = parse_cn_datetime(row.get("published_at"))
         available = parse_cn_datetime(row.get("available_at") or row.get("published_at"))
         if published is None or available is None:
             continue
-        if published <= decision_time and available <= decision_time:
+        if (
+            published <= decision_time
+            and available <= availability_cutoff
+        ):
             selected.append(dict(row))
     return selected
 
@@ -372,12 +414,20 @@ def _metric_text(value: float | None) -> str:
 
 def _fund_flow_available(rows: list[dict[str, Any]]) -> bool:
     return any(
-        any(
+        _eligible_fund_flow_row(row)
+        and any(
             _optional_float(row.get(field)) is not None
             for field in ("main_net", "large_net", "super_net")
         )
         for row in rows
     )
+
+
+def _eligible_fund_flow_row(row: dict[str, Any]) -> bool:
+    source = str(row.get("source") or "").lower()
+    if bool(row.get("is_proxy")) or "sina_money_flow" in source:
+        return False
+    return row.get("eligible_for_hard_gate") is not False
 
 
 def _quote_fields_available(stock: dict[str, Any]) -> bool:

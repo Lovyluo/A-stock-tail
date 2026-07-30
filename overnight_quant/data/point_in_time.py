@@ -6,6 +6,11 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from overnight_quant.data.close_time_contract import (
+    CloseTimeContract,
+    contract_datetimes,
+    normalize_close_time_contract,
+)
 from overnight_quant.data.market_calendar import CN_TZ
 
 
@@ -40,6 +45,13 @@ class PointInTimeRecord:
     raw_hash: str
     payload: dict[str, Any]
     data_type: str = "market"
+    feature_event_cutoff: str = ""
+    collection_deadline: str = ""
+    decision_time: str = ""
+    execution_not_before: str = ""
+    time_contract_version: str = ""
+    minute_label_semantics: str = ""
+    minute_label_validation_status: str = ""
 
     def available_for(self, decision_time: str | datetime) -> bool:
         accepted, _ = records_available_at(
@@ -66,8 +78,11 @@ def build_point_in_time_record(
     request: Any = None,
     raw: Any = None,
     data_type: str = "market",
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> PointInTimeRecord:
     published = normalize_datetime_text(published_at)
+    contract = normalize_close_time_contract(time_contract)
+    contract_fields = _point_in_time_contract_fields(contract)
     return PointInTimeRecord(
         event_time=normalize_datetime_text(event_time),
         published_at=published,
@@ -80,6 +95,7 @@ def build_point_in_time_record(
         raw_hash=stable_hash(raw if raw is not None else payload),
         payload=dict(payload),
         data_type=str(data_type or "market"),
+        **contract_fields,
     )
 
 
@@ -88,6 +104,7 @@ def records_available_at(
     decision_time: str | datetime,
     *,
     require_published_at_for_news: bool = True,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     decision = parse_cn_datetime(decision_time)
     if decision is None:
@@ -96,6 +113,27 @@ def records_available_at(
     rejected: list[dict[str, Any]] = []
     for item in records:
         row = item.as_dict() if isinstance(item, PointInTimeRecord) else dict(item)
+        row_contract = normalize_close_time_contract(
+            time_contract or _row_time_contract(row),
+            fallback_decision_time=decision,
+        )
+        contract_times = (
+            contract_datetimes(row_contract)
+            if row_contract is not None
+            else {}
+        )
+        uses_split_contract = bool(
+            row_contract
+            and row_contract.contract_version != "legacy_single_cutoff_v1"
+        )
+        feature_cutoff = contract_times.get(
+            "feature_event_cutoff",
+            decision,
+        )
+        collection_deadline = contract_times.get(
+            "collection_deadline",
+            decision,
+        )
         missing = [field for field in REQUIRED_TEMPORAL_FIELDS if field not in row]
         reason = ""
         if missing:
@@ -110,24 +148,93 @@ def records_available_at(
             published = parse_cn_datetime(row.get("published_at")) if row.get("published_at") else None
             if event is None or observed is None or available is None or cutoff is None:
                 reason = "temporal_contract_invalid"
-            elif event > decision:
-                reason = "event_after_decision"
-            elif observed > decision:
-                reason = "observed_after_decision"
-            elif available > decision:
-                reason = "available_after_decision"
+            elif event > feature_cutoff:
+                reason = (
+                    "event_after_feature_cutoff"
+                    if uses_split_contract
+                    else "event_after_decision"
+                )
+            elif observed > collection_deadline:
+                reason = (
+                    "observed_after_collection_deadline"
+                    if uses_split_contract
+                    else "observed_after_decision"
+                )
+            elif available > collection_deadline:
+                reason = (
+                    "available_after_collection_deadline"
+                    if uses_split_contract
+                    else "available_after_decision"
+                )
             elif available < observed:
                 reason = "available_before_observed"
             elif decision > cutoff:
                 reason = "decision_after_cutoff"
-            elif row.get("data_type") == "news" and published and published > decision:
-                reason = "news_published_after_decision"
+            elif (
+                row.get("data_type") == "news"
+                and published
+                and published > feature_cutoff
+            ):
+                reason = (
+                    "news_published_after_feature_cutoff"
+                    if uses_split_contract
+                    else "news_published_after_decision"
+                )
         if reason:
             row["pit_reject_reason"] = reason
             rejected.append(row)
         else:
             accepted.append(row)
     return accepted, rejected
+
+
+def _row_time_contract(row: dict[str, Any]) -> dict[str, Any] | None:
+    fields = {
+        "feature_event_cutoff": row.get("feature_event_cutoff"),
+        "collection_deadline": row.get("collection_deadline"),
+        "decision_time": row.get("decision_time"),
+        "execution_not_before": row.get("execution_not_before"),
+        "contract_version": row.get("time_contract_version"),
+        "minute_label_semantics": row.get("minute_label_semantics"),
+        "minute_label_validation_status": row.get(
+            "minute_label_validation_status"
+        ),
+    }
+    return fields if all(
+        fields.get(key)
+        for key in (
+            "feature_event_cutoff",
+            "collection_deadline",
+            "decision_time",
+            "execution_not_before",
+        )
+    ) else None
+
+
+def _point_in_time_contract_fields(
+    contract: CloseTimeContract | None,
+) -> dict[str, str]:
+    if contract is None:
+        return {
+            "feature_event_cutoff": "",
+            "collection_deadline": "",
+            "decision_time": "",
+            "execution_not_before": "",
+            "time_contract_version": "",
+            "minute_label_semantics": "",
+            "minute_label_validation_status": "",
+        }
+    return {
+        "feature_event_cutoff": contract.feature_event_cutoff,
+        "collection_deadline": contract.collection_deadline,
+        "decision_time": contract.decision_time,
+        "execution_not_before": contract.execution_not_before,
+        "time_contract_version": contract.contract_version,
+        "minute_label_semantics": contract.minute_label_semantics,
+        "minute_label_validation_status": (
+            contract.minute_label_validation_status
+        ),
+    }
 
 
 def demo_field_paths(value: Any, prefix: str = "") -> list[str]:

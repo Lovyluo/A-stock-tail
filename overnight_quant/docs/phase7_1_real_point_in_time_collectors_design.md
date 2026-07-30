@@ -109,20 +109,67 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_c
 `--live --freeze` 被禁止。冻结必须使用已采集并经过审计的显式输入，避免在冻结时临时
 联网并把截止后数据误写成当日有效数据。
 
-## 9. 当前阻断
+## 9. 四阶段时间合同
 
-2026-07-30 的真实验证在盘后执行，不能证明来源在 14:50 前完成。东财 `push2`
-曾成功返回市场宽度和 241 根分钟线（含 14:50），随后连续请求出现断连；板块和资金
-接口也出现相同问题。
+v0.4.1 不再把市场事件、网络完成、决策和模拟成交压在同一个 14:50 时点：
 
-更重要的是，当前合同同时要求“存在完整的 14:50 事件分钟”和
-`available_at <= 14:50:00`。对于需要在 14:50 分钟结束后才能形成的完整分钟 K 线，
-这两个条件可能无法由真实 HTTP 来源同时满足。v0.4.1 不伪造提前可用时间，也不放宽
-截止时间。正式影子验收前必须在真实交易时段测量来源事件语义，并由 PM 决定采用：
+1. `feature_event_cutoff=14:50:00`；
+2. `collection_deadline` 限制所有网络响应完成和解析时间；
+3. `decision_time` 在采集截止后生成冻结决策；
+4. `execution_not_before` 限制事件回测和纯模拟的最早成交。
 
-- 14:50 时点快照/逐笔累计值；或
-- 完整 14:49 分钟 + 14:50 实时报价；或
-- 将完整 14:50 分钟决策定义为 14:51 可用。
+过滤器没有放宽 `available_at`，而是分别执行：
 
-在该决定和真实 14:40-14:50 SLA 验证完成前，不得宣称数据已经就绪，也不得开始正式
-60 日影子验收。
+```text
+event_time <= feature_event_cutoff
+available_at <= collection_deadline
+decision generated at decision_time
+fill event_time >= execution_not_before
+```
+
+分钟标签待验证时使用保守时间轴：
+
+```text
+feature_event_cutoff  14:50:00
+collection_deadline   14:51:05
+decision_time         14:51:10
+execution_not_before  14:52:00
+```
+
+但 `minute_label_semantics=unverified` 会使 `data_ready=false`。保守时间轴不是
+供应商语义已经验证的声明。
+
+## 10. 四时点采样
+
+`run_minute_label_probe.py` 在真实交易日采样：
+
+- 14:49:55；
+- 14:50:05；
+- 14:50:30；
+- 14:51:05。
+
+脚本比较同一批高流动性股票的 14:50 OHLCV 哈希。14:50 记录若在该分钟内变化并在
+14:51 后稳定，按分钟开始标签处理；若从 14:50 初始采样起稳定，可作为分钟结束标签
+候选；缺样本或变化不明确则保持 `unverified`。脚本不写策略快照，不产生任何候选、
+票据或订单。
+
+## 11. 资金语义、并发和全局 deadline
+
+- 东财分钟资金流：`is_proxy=false`、`eligible_for_hard_gate=true`；
+- 新浪当前资金快照：`is_proxy=true`、`eligible_for_hard_gate=false`；
+- 东财成功时不调用新浪；东财失败时只返回一份新浪 proxy，禁止重复计数；
+- proxy 可进入审计和 Dashboard 说明，但不进入正式筹码评分或 `decision_hash`。
+
+独立 provider 使用受控并发；同一主机仍由传输层按 0.25 秒间隔排队。全局 deadline
+到达后不再启动新请求，未完成来源记为 `DEADLINE_EXCEEDED`，后到结果只进入审计。
+provider 结果统一按来源和规范化记录排序，线程完成顺序不影响 readiness、
+`snapshot_hash` 或 `decision_hash`。
+
+## 12. 当前阻断
+
+2026-07-30 的真实验证和压力测试均在盘后执行，因此不能证明 14:50 SLA。东财
+`push2` 行情、分钟、行业主源及 a-stock-data Skill 提供的行业列表备用端点在本机
+代理链路上仍出现断连；行业备用源未通过真实连通验证。
+
+四时点分钟标签采样尚未在真实交易日完成。完成该采样、盘中 deadline 压测和行业宽度
+备用源连通验证前，不得宣称数据已就绪，也不得开始正式 60 日影子验收。

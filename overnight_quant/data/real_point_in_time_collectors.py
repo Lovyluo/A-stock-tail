@@ -5,6 +5,7 @@ from datetime import datetime, time
 import hashlib
 import json
 import math
+import threading
 import time as time_module
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
@@ -12,6 +13,11 @@ from urllib.parse import urlparse
 import requests
 
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.data.close_time_contract import (
+    CloseTimeContract,
+    build_close_time_contract,
+    normalize_close_time_contract,
+)
 from overnight_quant.data.point_in_time import (
     parse_cn_datetime,
     stable_hash,
@@ -46,6 +52,9 @@ EASTMONEY_INDUSTRY_MAP_URL = (
 EASTMONEY_BOARD_URL = (
     "https://push2.eastmoney.com/api/qt/stock/get"
 )
+EASTMONEY_INDUSTRY_LIST_URL = (
+    "https://push2.eastmoney.com/api/qt/clist/get"
+)
 SINA_FUND_URL = (
     "https://vip.stock.finance.sina.com.cn/quotes_service/"
     "api/json_v2.php/MoneyFlow.ssl_bkzj_ssggzj"
@@ -71,6 +80,9 @@ SOURCE_VERSIONS = {
     "eastmoney_market": "push2_index_breadth_v2026-07-30",
     "eastmoney_minute": "push2_trends2_fields_v2026-07-30",
     "eastmoney_industry": "emweb_core+push2_board_v2026-07-30",
+    "eastmoney_industry_list": (
+        "push2_industry_clist_breadth_v2026-07-30"
+    ),
     "eastmoney_fund": "push2_fflow_kline_v2026-07-30",
     "sina_fund": "sina_moneyflow_current_v2026-07-30",
     "selected_fund": "eastmoney_primary_sina_backup_v2026-07-30",
@@ -86,6 +98,10 @@ class RealSourceError(RuntimeError):
 
 
 class SourceContractError(RealSourceError):
+    pass
+
+
+class GlobalDeadlineExceeded(RealSourceError):
     pass
 
 
@@ -127,6 +143,33 @@ class RequestsTransport:
         self.sleep = sleep
         self.monotonic = monotonic
         self._last_host_request: dict[str, float] = {}
+        self._state_lock = threading.Lock()
+        self._global_deadline: float | None = None
+        self._metrics = {
+            "request_count": 0,
+            "retry_count": 0,
+            "failure_count": 0,
+            "rate_limit_wait_count": 0,
+            "deadline_trigger_count": 0,
+        }
+
+    def set_global_deadline(self, deadline: float | None) -> None:
+        with self._state_lock:
+            self._global_deadline = deadline
+
+    def reset_metrics(self) -> None:
+        with self._state_lock:
+            self._metrics = {
+                "request_count": 0,
+                "retry_count": 0,
+                "failure_count": 0,
+                "rate_limit_wait_count": 0,
+                "deadline_trigger_count": 0,
+            }
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        with self._state_lock:
+            return dict(self._metrics)
 
     def request(
         self,
@@ -139,8 +182,29 @@ class RequestsTransport:
     ) -> RawHttpResponse:
         last_error: Exception | None = None
         for attempt in range(self.max_attempts):
+            remaining = self._deadline_remaining()
+            if remaining is not None and remaining <= 0:
+                self._increment_metric("deadline_trigger_count")
+                raise GlobalDeadlineExceeded(
+                    "global_collection_deadline_exceeded"
+                )
             self._respect_host_interval(url)
             started = self.monotonic()
+            remaining = self._deadline_remaining()
+            if remaining is not None and remaining <= 0:
+                self._increment_metric("deadline_trigger_count")
+                raise GlobalDeadlineExceeded(
+                    "global_collection_deadline_exceeded"
+                )
+            read_timeout = self.timeout_seconds
+            connect_timeout = 4.0
+            if remaining is not None:
+                read_timeout = max(0.1, min(read_timeout, remaining))
+                connect_timeout = max(
+                    0.1,
+                    min(connect_timeout, remaining),
+                )
+            self._increment_metric("request_count")
             try:
                 response = self.session.request(
                     method,
@@ -148,7 +212,7 @@ class RequestsTransport:
                     params=params,
                     data=data,
                     headers=headers,
-                    timeout=(4.0, self.timeout_seconds),
+                    timeout=(connect_timeout, read_timeout),
                 )
                 response.raise_for_status()
                 return RawHttpResponse(
@@ -163,9 +227,11 @@ class RequestsTransport:
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt + 1 < self.max_attempts:
+                    self._increment_metric("retry_count")
                     self.sleep(
                         self.backoff_seconds * (2**attempt)
                     )
+        self._increment_metric("failure_count")
         raise RealSourceError(
             f"http_request_failed:{type(last_error).__name__}:"
             f"{last_error}"
@@ -174,15 +240,40 @@ class RequestsTransport:
     def _respect_host_interval(self, url: str) -> None:
         host = urlparse(url).netloc.lower()
         current = self.monotonic()
-        previous = self._last_host_request.get(host)
-        if previous is not None:
-            remaining = (
-                self.min_host_interval_seconds
-                - (current - previous)
+        with self._state_lock:
+            previous = self._last_host_request.get(host)
+            reserved = max(
+                current,
+                (
+                    previous + self.min_host_interval_seconds
+                    if previous is not None
+                    else current
+                ),
             )
-            if remaining > 0:
-                self.sleep(remaining)
-        self._last_host_request[host] = self.monotonic()
+            self._last_host_request[host] = reserved
+        wait_seconds = reserved - current
+        if wait_seconds > 0:
+            self._increment_metric("rate_limit_wait_count")
+            remaining = self._deadline_remaining()
+            if remaining is not None and wait_seconds >= remaining:
+                self._increment_metric("deadline_trigger_count")
+                raise GlobalDeadlineExceeded(
+                    "global_collection_deadline_exceeded"
+                )
+            self.sleep(wait_seconds)
+
+    def _deadline_remaining(self) -> float | None:
+        with self._state_lock:
+            deadline = self._global_deadline
+        return (
+            None
+            if deadline is None
+            else deadline - self.monotonic()
+        )
+
+    def _increment_metric(self, name: str) -> None:
+        with self._state_lock:
+            self._metrics[name] = int(self._metrics.get(name, 0)) + 1
 
 
 class RealPointInTimeCollectors:
@@ -192,11 +283,18 @@ class RealPointInTimeCollectors:
         *,
         transport: RequestsTransport | Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        time_contract: dict[str, Any] | CloseTimeContract | None = None,
+        minute_label_semantics: str = "unverified",
+        minute_label_verified: bool = False,
     ):
         self.codes = _normalize_codes(codes)
         self.transport = transport or RequestsTransport()
         self.clock = clock or (lambda: datetime.now(CN_TZ))
         self._industry_mapping_cache: dict[str, dict[str, Any]] = {}
+        self._industry_list_cache: dict[str, Any] | None = None
+        self.time_contract = normalize_close_time_contract(time_contract)
+        self.minute_label_semantics = minute_label_semantics
+        self.minute_label_verified = bool(minute_label_verified)
 
     def provider_map(
         self,
@@ -679,6 +777,12 @@ class RealPointInTimeCollectors:
                                 "volume": "vendor_lot",
                                 "amount": "CNY",
                             },
+                            "minute_label_semantics": (
+                                self.minute_label_semantics
+                            ),
+                            "minute_label_verified": (
+                                self.minute_label_verified
+                            ),
                         },
                         data_type="minute_bar",
                         event_time=event,
@@ -721,19 +825,18 @@ class RealPointInTimeCollectors:
                 observed_at=observed_at,
             )
             raw_hashes.append(mapping["raw_hash"])
-            response = self.transport.request(
-                "GET",
-                EASTMONEY_BOARD_URL,
-                params={
-                    "secid": f"90.{mapping['board_code']}",
-                    "fields": "f57,f58,f170,f104,f105,f106",
-                },
-                headers=_eastmoney_headers(),
+            (
+                item,
+                completed,
+                board_raw_hash,
+                board_source,
+                board_source_version,
+                primary_error,
+            ) = self._fetch_industry_board(mapping)
+            raw_hashes.append(board_raw_hash)
+            change_pct = _number(
+                item.get("change_pct")
             )
-            completed = self._now()
-            raw_hashes.append(response.raw_hash)
-            item = response.json().get("data") or {}
-            change_pct = _number(item.get("f170")) / 100.0
             up_count = int(item.get("f104") or 0)
             down_count = int(item.get("f105") or 0)
             flat_count = int(item.get("f106") or 0)
@@ -753,6 +856,12 @@ class RealPointInTimeCollectors:
                 "up_count": up_count,
                 "down_count": down_count,
                 "flat_count": flat_count,
+                "industry_source_role": (
+                    "backup"
+                    if board_source == "eastmoney_industry_clist"
+                    else "primary"
+                ),
+                "primary_error": primary_error,
                 "field_units": {
                     "change_pct": "percent",
                     "relative_strength_pct": "percent",
@@ -766,12 +875,8 @@ class RealPointInTimeCollectors:
                     event_time=completed,
                     observed_at=observed_at,
                     available_at=completed,
-                    source=(
-                        "eastmoney_industry_board+tencent_market"
-                    ),
-                    source_version=SOURCE_VERSIONS[
-                        "eastmoney_industry"
-                    ],
+                    source=f"{board_source}+tencent_market",
+                    source_version=board_source_version,
                     request={
                         "stock_code": code,
                         "board_code": mapping["board_code"],
@@ -779,7 +884,7 @@ class RealPointInTimeCollectors:
                     raw_hash=stable_hash(
                         [
                             mapping["raw_hash"],
-                            response.raw_hash,
+                            board_raw_hash,
                             market_raw_hash,
                         ]
                     ),
@@ -840,6 +945,17 @@ class RealPointInTimeCollectors:
                                 "large_net": "CNY",
                                 "super_net": "CNY",
                             },
+                            "semantic_class": (
+                                "formal_minute_main_force_flow"
+                            ),
+                            "timestamp_quality": (
+                                "source_minute_event_time"
+                            ),
+                            "is_proxy": False,
+                            "eligible_for_hard_gate": True,
+                            "field_definition_version": (
+                                "eastmoney_fflow_f51_f56_v1"
+                            ),
                         },
                         data_type="fund_flow",
                         event_time=event,
@@ -908,6 +1024,17 @@ class RealPointInTimeCollectors:
                             "main_net": "CNY",
                             "large_net": "CNY",
                         },
+                        "semantic_class": (
+                            "current_snapshot_money_flow_proxy"
+                        ),
+                        "timestamp_quality": (
+                            "collector_completion_only"
+                        ),
+                        "is_proxy": True,
+                        "eligible_for_hard_gate": False,
+                        "field_definition_version": (
+                            "sina_r0_net_netamount_unverified_v1"
+                        ),
                         "timestamp_quality": (
                             "project_observed_snapshot_only"
                         ),
@@ -1325,6 +1452,128 @@ class RealPointInTimeCollectors:
         self._industry_mapping_cache[code] = result
         return result
 
+    def _fetch_industry_board(
+        self,
+        mapping: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        datetime,
+        str,
+        str,
+        str,
+        str,
+    ]:
+        primary_error = ""
+        try:
+            response = self.transport.request(
+                "GET",
+                EASTMONEY_BOARD_URL,
+                params={
+                    "secid": f"90.{mapping['board_code']}",
+                    "fields": "f57,f58,f170,f104,f105,f106",
+                },
+                headers=_eastmoney_headers(),
+            )
+            completed = self._now()
+            item = response.json().get("data") or {}
+            total = sum(
+                int(item.get(field) or 0)
+                for field in ("f104", "f105", "f106")
+            )
+            if total <= 0 or item.get("f170") in (None, ""):
+                raise SourceContractError(
+                    "industry_primary_fields_missing"
+                )
+            return (
+                {
+                    **item,
+                    "change_pct": _number(item.get("f170")) / 100.0,
+                },
+                completed,
+                response.raw_hash,
+                "eastmoney_industry_board",
+                SOURCE_VERSIONS["eastmoney_industry"],
+                "",
+            )
+        except RealSourceError as exc:
+            primary_error = f"{type(exc).__name__}: {exc}"
+
+        backup = self._get_industry_list()
+        item = (
+            backup["items"].get(mapping["board_code"])
+            or backup["items"].get(mapping["name"])
+        )
+        if not item:
+            raise SourceContractError(
+                f"industry_backup_mapping_missing:"
+                f"{mapping['board_code']}"
+            )
+        return (
+            item,
+            backup["completed_at"],
+            backup["raw_hash"],
+            "eastmoney_industry_clist",
+            SOURCE_VERSIONS["eastmoney_industry_list"],
+            primary_error,
+        )
+
+    def _get_industry_list(self) -> dict[str, Any]:
+        if self._industry_list_cache is not None:
+            return self._industry_list_cache
+        response = self.transport.request(
+            "GET",
+            EASTMONEY_INDUSTRY_LIST_URL,
+            params={
+                "pn": "1",
+                "pz": "100",
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fs": "m:90+t:2",
+                "fields": (
+                    "f3,f12,f14,f104,f105,f106"
+                ),
+            },
+            headers=_eastmoney_headers(),
+        )
+        completed = self._now()
+        rows = (
+            (response.json().get("data") or {}).get("diff")
+            or []
+        )
+        items: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            board_code = str(row.get("f12") or "").strip()
+            name = str(row.get("f14") or "").strip()
+            total = sum(
+                int(row.get(field) or 0)
+                for field in ("f104", "f105", "f106")
+            )
+            if (
+                not board_code
+                or not name
+                or row.get("f3") in (None, "")
+                or total <= 0
+            ):
+                continue
+            normalized = {
+                **row,
+                "change_pct": _number(row.get("f3")),
+            }
+            items[board_code] = normalized
+            items[name] = normalized
+        if not items:
+            raise SourceContractError(
+                "industry_backup_fields_missing"
+            )
+        self._industry_list_cache = {
+            "items": items,
+            "completed_at": completed,
+            "raw_hash": response.raw_hash,
+        }
+        return self._industry_list_cache
+
     def _fetch_market_change_pct(self) -> tuple[float, str]:
         response = self.transport.request(
             "GET",
@@ -1450,10 +1699,10 @@ class RealPointInTimeCollectors:
     ) -> dict[str, Any]:
         observed = _as_cn(observed_at)
         available = _as_cn(available_at)
-        cutoff = datetime.combine(
+        contract = self.time_contract or build_close_time_contract(
             observed.date(),
-            time(14, 50),
-            tzinfo=CN_TZ,
+            minute_label_semantics=self.minute_label_semantics,
+            verified=self.minute_label_verified,
         )
         event = _as_cn(event_time)
         published = (
@@ -1466,8 +1715,17 @@ class RealPointInTimeCollectors:
             "published_at": published,
             "observed_at": observed.isoformat(timespec="seconds"),
             "available_at": available.isoformat(timespec="seconds"),
-            "decision_cutoff": cutoff.isoformat(
-                timespec="seconds"
+            "decision_cutoff": contract.decision_time,
+            "feature_event_cutoff": contract.feature_event_cutoff,
+            "collection_deadline": contract.collection_deadline,
+            "decision_time": contract.decision_time,
+            "execution_not_before": contract.execution_not_before,
+            "time_contract_version": contract.contract_version,
+            "minute_label_semantics": (
+                contract.minute_label_semantics
+            ),
+            "minute_label_validation_status": (
+                contract.minute_label_validation_status
             ),
             "source": source,
             "source_version": source_version,

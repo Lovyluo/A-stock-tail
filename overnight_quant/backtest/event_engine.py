@@ -57,6 +57,11 @@ def simulate_entry_fill(
         return {"fills": [], "filled_quantity": 0, "unfilled_quantity": 0, "status": "INVALID_QUANTITY"}
     day = date.fromisoformat(str(signal["trade_date"]))
     start = datetime.combine(day, _parse_clock(cfg.entry_start), tzinfo=CN_TZ)
+    contract_start = parse_cn_datetime(
+        signal.get("execution_not_before")
+    )
+    if contract_start is not None:
+        start = max(start, contract_start)
     cancel = datetime.combine(day, _parse_clock(cfg.cancel_at), tzinfo=CN_TZ)
     fills: list[Fill] = []
     remaining = target_quantity
@@ -102,6 +107,7 @@ def simulate_entry_fill(
         "filled_quantity": target_quantity - remaining,
         "unfilled_quantity": remaining,
         "status": "FILLED" if remaining == 0 else ("PARTIAL" if fills else "UNFILLED"),
+        "execution_not_before": start.isoformat(),
         "cancel_at": cancel.isoformat(),
     }
 
