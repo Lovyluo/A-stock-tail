@@ -25,9 +25,10 @@ def run_snapshot_collection(
 ) -> dict:
     current = now or datetime.now(CN_TZ)
     records = []
+    source_status = []
     if input_path:
         try:
-            records = json.loads(Path(input_path).read_text(encoding="utf-8"))
+            payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return {
                 "status": "NO_VALID_RECORDS",
@@ -36,14 +37,21 @@ def run_snapshot_collection(
                 "records": [],
                 "input_error": f"{type(exc).__name__}: {exc}",
             }
-        if isinstance(records, dict):
-            records = records.get("records") or []
+        if isinstance(payload, dict):
+            records = payload.get("records") or []
+            source_status = list(payload.get("source_status") or [])
+        else:
+            records = payload
         if not isinstance(records, list):
             records = []
     providers = {"input_file": lambda observed_at: list(records)} if records else {}
     collector = CloseWindowCollector(ImmutableSnapshotStore(snapshot_root), providers)
     if freeze:
-        return collector.freeze(trade_date or current.date().isoformat(), records)
+        return collector.freeze(
+            trade_date or current.date().isoformat(),
+            records,
+            source_status=source_status,
+        )
     return collector.collect(current)
 
 
@@ -64,6 +72,9 @@ def main() -> int:
     print(f"Status: {result['status']}")
     print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")
     print(f"data_ready: {str(bool(result.get('data_ready'))).lower()}")
+    print(f"coverage_by_type: {json.dumps(result.get('coverage_by_type') or {}, ensure_ascii=False, sort_keys=True)}")
+    print(f"readiness_errors: {json.dumps(result.get('readiness_errors') or [], ensure_ascii=False)}")
+    print(f"critical_source_status: {json.dumps(result.get('critical_source_status') or {}, ensure_ascii=False, sort_keys=True)}")
     if result.get("path"):
         print(f"Snapshot: {result['path']}")
     return 0 if result.get("execution_ok") and result.get("data_ready") else 2

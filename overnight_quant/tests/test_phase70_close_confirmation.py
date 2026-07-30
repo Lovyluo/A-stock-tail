@@ -12,7 +12,7 @@ from overnight_quant.backtest.event_engine import (
     simulate_entry_fill,
     simulate_exit_fill,
 )
-from overnight_quant.backtest.point_in_time_provider import PointInTimeDataError, PointInTimeProvider
+from overnight_quant.backtest.point_in_time_provider import PointInTimeProvider
 from overnight_quant.backtest.research_metrics import (
     calculate_research_metrics,
     evaluate_historical_acceptance,
@@ -73,6 +73,7 @@ def test_formal_modes_reject_any_demo_field_and_clear_candidate_outputs():
     guarded = enforce_formal_no_demo(
         {
             "status": "DATA_FALLBACK_DEMO",
+            "data_ready": True,
             "shadow_candidates": [{"code": "000001"}],
             "selected": [{"code": "000001"}],
             "paper_intents": [{"code": "000001"}],
@@ -82,6 +83,7 @@ def test_formal_modes_reject_any_demo_field_and_clear_candidate_outputs():
     )
 
     assert guarded["status"] == "FORMAL_DATA_REJECTED"
+    assert guarded["data_ready"] is False
     assert guarded["demo_field_count"] > 0
     assert guarded["shadow_candidates"] == []
     assert guarded["selected"] == []
@@ -94,8 +96,16 @@ def test_missing_minute_data_never_falls_back_to_daily_data():
     snapshot["stocks"][0]["intraday_bars"] = []
     provider = PointInTimeProvider([snapshot])
 
-    with pytest.raises(PointInTimeDataError, match="MINUTE_DATA_REQUIRED"):
-        provider.snapshot_at("2026-07-30", "14:50")
+    frozen = provider.snapshot_at("2026-07-30", "14:50")
+    result = CloseConfirmationStrategy({"min_shadow_score": 0}).evaluate_snapshot(
+        frozen,
+        mode="shadow",
+    )
+
+    assert result["status"] == "POINT_IN_TIME_DATA_INCOMPLETE"
+    assert result["data_ready"] is False
+    assert "000001:minute_bar_count_below_minimum" in result["readiness_errors"]
+    assert result["shadow_candidates"] == []
 
 
 def test_news_without_publication_time_is_not_scored():
@@ -345,9 +355,14 @@ def _evaluate(snapshot: dict, mode: str) -> dict:
 
 def _snapshot() -> dict:
     bars = [_bar(f"14:{minute:02d}", 10.0 + (minute - 30) * 0.02, 1000 + minute * 10) for minute in range(30, 51)]
+    first_daily_date = date(2026, 4, 1)
     daily = [
-        {"date": f"2026-06-{index + 1:02d}", "close": 9.0 + index * 0.02, "volume": 100000 + index * 1000}
-        for index in range(20)
+        {
+            "date": (first_daily_date + timedelta(days=index)).isoformat(),
+            "close": 9.0 + index * 0.02,
+            "volume": 100000 + index * 1000,
+        }
+        for index in range(60)
     ]
     news = [
         {
@@ -373,12 +388,22 @@ def _snapshot() -> dict:
             {
                 "code": "000001",
                 "name": "样本",
+                "price": bars[-1]["price"],
                 "prev_close": 9.8,
                 "change_pct": 4.0,
                 "amount_wan": 30000,
                 "turnover_pct": 8.0,
+                "suspended": False,
+                "is_limit_up": False,
+                "is_limit_down": False,
+                "industry_name": "银行",
                 "market": {"index_change_pct": 0.8, "breadth_ratio": 0.65},
-                "industry": {"change_pct": 1.5, "relative_strength_pct": 1.0, "breadth_ratio": 0.7},
+                "industry": {
+                    "name": "银行",
+                    "change_pct": 1.5,
+                    "relative_strength_pct": 1.0,
+                    "breadth_ratio": 0.7,
+                },
                 "intraday_bars": bars,
                 "daily_bars": daily,
                 "fund_flow": [{"main_net": 1000}],

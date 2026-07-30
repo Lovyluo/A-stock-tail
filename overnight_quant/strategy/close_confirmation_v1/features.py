@@ -42,23 +42,65 @@ def build_close_confirmation_features(
     order_imbalance = _order_imbalance(bars[-1] if bars else {})
     market_strength = _market_strength(market)
     industry_strength = _industry_strength(industry)
-    industry_breadth = _clamp(_float(industry.get("breadth_ratio"), 0.0))
-    stock_return = _float(stock.get("change_pct"), _pct(current_price, _float(stock.get("prev_close"), 0)))
-    industry_return = _float(industry.get("change_pct"), 0.0)
-    relative_to_industry = stock_return - industry_return
-    catalyst = _catalyst_score(news)
+    industry_breadth_value = _optional_float(industry.get("breadth_ratio"))
+    industry_breadth = (
+        _clamp(industry_breadth_value)
+        if industry_breadth_value is not None
+        else None
+    )
+    stock_return = _optional_float(stock.get("change_pct"))
+    if stock_return is None and current_price > 0:
+        prev_close = _optional_float(stock.get("prev_close"))
+        stock_return = _pct(current_price, prev_close) if prev_close else None
+    industry_return = _optional_float(industry.get("change_pct"))
+    relative_to_industry = (
+        stock_return - industry_return
+        if stock_return is not None and industry_return is not None
+        else None
+    )
+    news_source_ready = bool(stock.get("_news_source_ready", bool(news)))
+    catalyst = _catalyst_score(news) if news_source_ready else None
     negative_announcements = [
         item for item in news if _is_negative_news(item) and str(item.get("kind") or "").lower() == "announcement"
     ]
     daily_bars = stock.get("daily_bars") or []
-    chip = calculate_chip_metrics(daily_bars, current_price) if daily_bars and current_price else {}
-    chip_proxy = _chip_proxy_score(chip, stock.get("fund_flow") or [])
-    price_volume = _price_volume_score(
-        vwap_position_pct,
-        vwap_slope_pct,
-        support_score,
-        abnormal_volume_z,
-        order_imbalance,
+    fund_flow = stock.get("fund_flow") or []
+    chip_data_ready = len(_valid_daily_bars(daily_bars)) >= 60 and _fund_flow_available(fund_flow)
+    chip = (
+        calculate_chip_metrics(daily_bars, current_price)
+        if chip_data_ready and current_price
+        else {}
+    )
+    chip_proxy = _chip_proxy_score(chip, fund_flow) if chip_data_ready else None
+    minute_data_ready = len(bars) >= 12 and bool(
+        bars
+        and parse_cn_datetime(bars[-1].get("_pit_time"))
+        and parse_cn_datetime(bars[-1].get("_pit_time")).replace(second=0, microsecond=0)
+        >= decision.replace(second=0, microsecond=0)
+    )
+    price_volume = (
+        _price_volume_score(
+            vwap_position_pct,
+            vwap_slope_pct,
+            support_score,
+            abnormal_volume_z,
+            order_imbalance,
+        )
+        if minute_data_ready
+        else None
+    )
+    market_data_ready = market_strength is not None
+    industry_data_ready = industry_strength is not None and industry_breadth is not None
+    quote_data_ready = _quote_fields_available(stock)
+    industry_confirmation = (
+        _clamp(0.55 * industry_strength + 0.45 * industry_breadth)
+        if industry_data_ready
+        else None
+    )
+    stock_relative_strength = (
+        _clamp(0.5 + relative_to_industry / 10.0)
+        if relative_to_industry is not None
+        else None
     )
     return {
         "decision_time": decision.isoformat(timespec="seconds"),
@@ -71,22 +113,30 @@ def build_close_confirmation_features(
         "tail_support_score": round(support_score, 4),
         "abnormal_volume_z": round(abnormal_volume_z, 4),
         "extreme_order_imbalance": round(order_imbalance, 4),
-        "market_strength": round(market_strength, 4),
-        "industry_relative_strength": round(industry_strength, 4),
-        "industry_breadth": round(industry_breadth, 4),
-        "stock_relative_to_industry_pct": round(relative_to_industry, 4),
-        "catalyst_score": round(catalyst, 4),
+        "market_strength": _round_optional(market_strength),
+        "industry_relative_strength": _round_optional(industry_strength),
+        "industry_breadth": _round_optional(industry_breadth),
+        "stock_relative_to_industry_pct": _round_optional(relative_to_industry),
+        "catalyst_score": _round_optional(catalyst),
         "negative_announcement_count": len(negative_announcements),
         "eligible_news_count": len(news),
-        "chip_avg_cost_20d": _float(chip.get("chip_avg_cost_20d"), 0.0),
-        "chip_avg_cost_60d": _float(chip.get("chip_avg_cost_60d"), 0.0),
-        "overhead_pressure_ratio": _float(chip.get("overhead_pressure_ratio"), 0.0),
-        "downside_support_ratio": _float(chip.get("downside_support_ratio"), 0.0),
-        "main_force_chip_proxy": _float(chip.get("main_force_chip_proxy"), 0.0),
+        "chip_avg_cost_20d": _optional_float(chip.get("chip_avg_cost_20d")),
+        "chip_avg_cost_60d": _optional_float(chip.get("chip_avg_cost_60d")),
+        "overhead_pressure_ratio": _optional_float(chip.get("overhead_pressure_ratio")),
+        "downside_support_ratio": _optional_float(chip.get("downside_support_ratio")),
+        "main_force_chip_proxy": _optional_float(chip.get("main_force_chip_proxy")),
+        "feature_availability": {
+            "market": market_data_ready,
+            "industry": industry_data_ready,
+            "quote": quote_data_ready,
+            "minute": minute_data_ready,
+            "chip": chip_data_ready,
+            "news_source": news_source_ready,
+        },
         "component_inputs": {
             "market_confirmation": market_strength,
-            "industry_confirmation": _clamp(0.55 * industry_strength + 0.45 * industry_breadth),
-            "stock_relative_strength": _clamp(0.5 + relative_to_industry / 10.0),
+            "industry_confirmation": industry_confirmation,
+            "stock_relative_strength": stock_relative_strength,
             "price_volume_confirmation": price_volume,
             "catalyst_quality": catalyst,
             "chip_structure_proxy": chip_proxy,
@@ -171,15 +221,22 @@ def _order_imbalance(row: dict[str, Any]) -> float:
     return (bid - ask) / (bid + ask)
 
 
-def _market_strength(market: dict[str, Any]) -> float:
-    index_change = _float(market.get("index_change_pct"), 0.0)
-    breadth = _clamp(_float(market.get("breadth_ratio"), 0.5))
+def _market_strength(market: dict[str, Any]) -> float | None:
+    index_change = _optional_float(market.get("index_change_pct"))
+    breadth_value = _optional_float(market.get("breadth_ratio"))
+    if index_change is None or breadth_value is None:
+        return None
+    breadth = _clamp(breadth_value)
     return _clamp(0.5 + index_change / 4.0) * 0.55 + breadth * 0.45
 
 
-def _industry_strength(industry: dict[str, Any]) -> float:
-    change = _float(industry.get("change_pct"), 0.0)
-    relative = _float(industry.get("relative_strength_pct"), change)
+def _industry_strength(industry: dict[str, Any]) -> float | None:
+    change = _optional_float(industry.get("change_pct"))
+    relative = _optional_float(industry.get("relative_strength_pct"))
+    if relative is None:
+        relative = change
+    if relative is None:
+        return None
     return _clamp(0.5 + relative / 6.0)
 
 
@@ -199,20 +256,22 @@ def _price_volume_score(
 
 def _catalyst_score(news: list[dict[str, Any]]) -> float:
     if not news:
-        return 0.4
+        return 0.0
     positive = sum(1 for item in news if _is_positive_news(item))
     negative = sum(1 for item in news if _is_negative_news(item))
     sourced = sum(1 for item in news if item.get("source"))
     return _clamp(0.45 + 0.12 * positive - 0.2 * negative + 0.02 * sourced)
 
 
-def _chip_proxy_score(chip: dict[str, Any], fund_flow: list[dict[str, Any]]) -> float:
-    pressure = _float(chip.get("overhead_pressure_ratio"), 0.5)
-    support = _float(chip.get("downside_support_ratio"), 0.5)
+def _chip_proxy_score(chip: dict[str, Any], fund_flow: list[dict[str, Any]]) -> float | None:
+    pressure = _optional_float(chip.get("overhead_pressure_ratio"))
+    support = _optional_float(chip.get("downside_support_ratio"))
+    if pressure is None or support is None:
+        return None
     flow_values = [_float(item.get("main_net"), 0.0) for item in fund_flow if item.get("main_net") is not None]
-    flow = 0.5
-    if flow_values:
-        flow = _clamp(0.5 + sum(flow_values[-5:]) / max(1.0, sum(abs(v) for v in flow_values[-5:])) * 0.5)
+    if not flow_values:
+        return None
+    flow = _clamp(0.5 + sum(flow_values[-5:]) / max(1.0, sum(abs(v) for v in flow_values[-5:])) * 0.5)
     return _clamp(0.45 * support + 0.3 * (1.0 - pressure) + 0.25 * flow)
 
 
@@ -222,8 +281,8 @@ def _feature_reasons(
     support: float,
     volume_z: float,
     imbalance: float,
-    relative: float,
-    catalyst: float,
+    relative: float | None,
+    catalyst: float | None,
 ) -> list[str]:
     return [
         f"vwap_position_pct:{vwap_position:.2f}",
@@ -231,8 +290,8 @@ def _feature_reasons(
         f"tail_support:{support:.2f}",
         f"abnormal_volume_z:{volume_z:.2f}",
         f"order_imbalance:{imbalance:.2f}",
-        f"stock_vs_industry_pct:{relative:.2f}",
-        f"catalyst_quality:{catalyst:.2f}",
+        f"stock_vs_industry_pct:{_metric_text(relative)}",
+        f"catalyst_quality:{_metric_text(catalyst)}",
     ]
 
 
@@ -281,6 +340,55 @@ def _float(value: Any, default: float = 0.0) -> float:
         return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, "", "-"):
+        return None
+    try:
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _round_optional(value: float | None) -> float | None:
+    return round(value, 4) if value is not None else None
+
+
+def _metric_text(value: float | None) -> str:
+    return f"{value:.2f}" if value is not None else "missing"
+
+
+def _valid_daily_bars(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if (_optional_float(row.get("close")) or 0) > 0
+        and (_optional_float(row.get("volume", row.get("vol"))) or 0) > 0
+    ]
+
+
+def _fund_flow_available(rows: list[dict[str, Any]]) -> bool:
+    return any(
+        any(
+            _optional_float(row.get(field)) is not None
+            for field in ("main_net", "large_net", "super_net")
+        )
+        for row in rows
+    )
+
+
+def _quote_fields_available(stock: dict[str, Any]) -> bool:
+    return bool(
+        (_optional_float(stock.get("price")) or 0) > 0
+        and (_optional_float(stock.get("prev_close")) or 0) > 0
+        and _optional_float(stock.get("amount_wan")) is not None
+        and _optional_float(stock.get("turnover_pct")) is not None
+        and "suspended" in stock
+        and "is_limit_up" in stock
+        and "is_limit_down" in stock
+    )
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:

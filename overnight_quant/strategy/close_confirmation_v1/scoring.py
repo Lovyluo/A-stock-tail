@@ -10,12 +10,15 @@ def score_close_confirmation(features: dict[str, Any]) -> dict[str, Any]:
     components = {}
     total = 0.0
     for name, weight in SCORE_WEIGHTS.items():
-        raw = max(0.0, min(1.0, float(inputs.get(name, 0.0) or 0.0)))
+        input_value = inputs.get(name)
+        available = input_value is not None
+        raw = max(0.0, min(1.0, float(input_value))) if available else 0.0
         points = round(raw * weight, 4)
         components[name] = {
             "raw": round(raw, 4),
             "weight": weight,
             "points": points,
+            "available": available,
         }
         total += points
     return {

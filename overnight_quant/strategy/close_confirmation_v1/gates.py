@@ -37,33 +37,49 @@ def evaluate_hard_gates(
         >= decision.time().replace(second=0, microsecond=0)
     )
     demo_paths = demo_field_paths(stock) if str(mode).lower() in {"live", "shadow", "paper", "replay"} else []
+    availability = features.get("feature_availability") or {}
+    market_available = bool(availability.get("market"))
+    industry_available = bool(availability.get("industry"))
+    quote_available = bool(availability.get("quote"))
+    minute_available = bool(availability.get("minute"))
+    chip_available = bool(availability.get("chip"))
+    news_source_available = bool(availability.get("news_source"))
     gates = {
         "market": _gate(
-            features.get("market_strength", 0) >= float(settings["min_market_strength"]),
-            "market_too_weak",
+            market_available
+            and _at_least(features.get("market_strength"), settings["min_market_strength"]),
+            "market_data_missing" if not market_available else "market_too_weak",
         ),
         "industry": _gate(
-            features.get("industry_relative_strength", 0) >= float(settings["min_industry_strength"])
-            and features.get("industry_breadth", 0) >= float(settings["min_industry_breadth"]),
-            "industry_resonance_missing",
+            industry_available
+            and _at_least(features.get("industry_relative_strength"), settings["min_industry_strength"])
+            and _at_least(features.get("industry_breadth"), settings["min_industry_breadth"]),
+            "industry_data_missing" if not industry_available else "industry_resonance_missing",
         ),
         "liquidity": _gate(
-            not bool(stock.get("suspended"))
+            quote_available
+            and not bool(stock.get("suspended"))
             and float(stock.get("amount_wan") or 0) >= float(settings["min_amount_wan"])
             and float(settings["min_turnover_pct"])
             <= float(stock.get("turnover_pct") or 0)
             <= float(settings["max_turnover_pct"])
             and not bool(stock.get("is_limit_up") or stock.get("is_limit_down")),
-            "liquidity_or_tradeability_failed",
+            "quote_data_missing" if not quote_available else "liquidity_or_tradeability_failed",
         ),
         "news_risk": _gate(
-            int(features.get("negative_announcement_count") or 0)
+            news_source_available
+            and int(features.get("negative_announcement_count") or 0)
             <= int(settings["max_negative_announcements"]),
-            "negative_announcement",
+            "news_source_unavailable" if not news_source_available else "negative_announcement",
         ),
         "data_quality": _gate(
             not demo_paths
-            and int(features.get("minute_bar_count") or 0) > 0
+            and market_available
+            and industry_available
+            and quote_available
+            and minute_available
+            and chip_available
+            and news_source_available
             and (minute_complete or not settings.get("require_1450_minute", True)),
             "point_in_time_data_incomplete",
         ),
@@ -83,3 +99,10 @@ def evaluate_hard_gates(
 
 def _gate(passed: bool, reason: str) -> dict[str, Any]:
     return {"pass": bool(passed), "reason": "" if passed else reason}
+
+
+def _at_least(value: Any, minimum: Any) -> bool:
+    try:
+        return value is not None and float(value) >= float(minimum)
+    except (TypeError, ValueError):
+        return False

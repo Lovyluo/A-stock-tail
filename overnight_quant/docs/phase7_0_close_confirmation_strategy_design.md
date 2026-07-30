@@ -99,3 +99,21 @@
 
 本策略不构成投资建议，不保证收益。所有结果仅用于研究观察和风险复核。
 详细边界见 `phase7_0_safety_boundary.md`。
+
+## 10. 输入完整性门禁
+
+冻结快照与策略入口共同调用统一 readiness validator。市场、行业、完整 quote、
+14:50 分钟线、60 日量价历史、资金流代理和新闻来源状态缺一时，
+`execution_ok=true` 但 `data_ready=false`，状态为
+`POINT_IN_TIME_DATA_INCOMPLETE`。
+
+缺失数据不使用中性默认分：
+
+- 市场或行业字段缺失时对应分量 unavailable，相关硬门禁失败；
+- 新闻源成功但零条催化时催化分为 0；
+- 新闻源失败属于数据不完整，不等同于零新闻；
+- 日线或资金流不足时筹码代理分为 unavailable；
+- demo 字段触发 `FORMAL_DATA_REJECTED`，同时强制 `data_ready=false`。
+
+只有完整输入至少完成一只股票的实际评分后，状态才允许为
+`SHADOW_SIMULATION_READY` 或 `NO_SHADOW_CONFIRMATION`。

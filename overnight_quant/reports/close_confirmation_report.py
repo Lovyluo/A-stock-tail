@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,9 @@ def write_close_confirmation_report(
         f"status: {result.get('status', 'UNKNOWN')}",
         f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}",
         f"data_ready: {str(bool(result.get('data_ready'))).lower()}",
+        f"coverage_by_type: {json.dumps(result.get('coverage_by_type') or {}, ensure_ascii=False, sort_keys=True)}",
+        f"readiness_errors: {json.dumps(result.get('readiness_errors') or [], ensure_ascii=False)}",
+        f"critical_source_status: {json.dumps(result.get('critical_source_status') or {}, ensure_ascii=False, sort_keys=True)}",
         f"strategy_name: {result.get('strategy_name', 'close_confirmation_v1')}",
         f"strategy_phase: {result.get('strategy_phase', 'research_shadow')}",
         f"decision_time: {result.get('decision_time', '')}",

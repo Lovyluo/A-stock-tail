@@ -47,8 +47,8 @@ def run_close_confirmation(
             snapshot,
             mode=mode,
         )
-        result["execution_ok"] = True
-        result["data_ready"] = True
+        result.setdefault("execution_ok", True)
+        result.setdefault("data_ready", False)
     except (FileNotFoundError, PointInTimeDataError, ValueError) as exc:
         result = enforce_formal_no_demo(
             {

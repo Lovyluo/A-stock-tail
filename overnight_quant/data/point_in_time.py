@@ -155,6 +155,7 @@ def enforce_formal_no_demo(result: dict[str, Any], mode: str) -> dict[str, Any]:
     fallback_status = str(guarded.get("status") or "").upper() == "DATA_FALLBACK_DEMO"
     if paths or fallback_status:
         guarded["status"] = "FORMAL_DATA_REJECTED"
+        guarded["data_ready"] = False
         guarded["selected"] = []
         guarded["shadow_candidates"] = []
         guarded["paper_intents"] = []

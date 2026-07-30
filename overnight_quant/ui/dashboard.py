@@ -347,6 +347,7 @@ POSITION_STATUS_LABELS_ZH = {
 
 SYSTEM_STATUS_LABELS_ZH = {
     "POINT_IN_TIME_DATA_UNAVAILABLE": "数据未就绪",
+    "POINT_IN_TIME_DATA_INCOMPLETE": "数据未就绪",
     "NO_DATA_SOURCE": "数据源未配置",
     "NO_VALID_RECORDS": "无有效时点数据",
 }
@@ -1021,6 +1022,7 @@ def status_badge(status: str) -> dict[str, str]:
             "NO_INTRADAY_CANDIDATES",
             "MARKET_BLOCKED",
             "POINT_IN_TIME_DATA_UNAVAILABLE",
+            "POINT_IN_TIME_DATA_INCOMPLETE",
             "NO_DATA_SOURCE",
             "NO_VALID_RECORDS",
         }
