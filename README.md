@@ -91,6 +91,7 @@ The former `yang_yongxing_overnight_v1` entry is preserved as
 - starts event fills at 14:51 and cancels remaining quantity at 14:56;
 - applies partial fills, date-aware price limits, suspension, T+1, slippage, impact, and 100-share lots;
 - never substitutes daily close data for missing minute data;
+- requires a versioned exchange-calendar or benchmark-index trading-date record for 60-day chip inputs;
 - never uses demo fallback fields in live, shadow, paper, or replay results.
 
 The historical and shadow acceptance thresholds have not yet been met because the required

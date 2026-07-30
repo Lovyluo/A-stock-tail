@@ -26,6 +26,7 @@ from overnight_quant.ui.dashboard import localize_table_value, status_badge
 
 TRADE_DATE = "2026-07-30"
 DECISION_TIME = f"{TRADE_DATE}T14:50:00+08:00"
+UNIT_CLOSED_DATES = {"2026-05-01"}
 
 
 def test_market_only_frozen_snapshot_is_not_data_ready(tmp_path):
@@ -289,6 +290,7 @@ def test_readiness_validator_reports_coverage_errors_and_source_states():
         "daily_bar",
         "fund_flow",
         "news",
+        "trading_calendar",
     }
     assert readiness["critical_source_status"]["news"]["status"] == "AVAILABLE_EMPTY"
     assert "000001:fund_flow_missing" in readiness["readiness_errors"]
@@ -300,6 +302,7 @@ def _complete_snapshot() -> dict:
         "trade_date": TRADE_DATE,
         "decision_time": DECISION_TIME,
         "stocks": [_complete_stock()],
+        "trading_calendar": _trading_calendar_snapshot(),
         "source_status": [_source_status()],
     }
 
@@ -342,6 +345,49 @@ def _source_status(
     }
 
 
+def _prior_trading_dates() -> list[str]:
+    current = date.fromisoformat(TRADE_DATE) - timedelta(days=1)
+    days = []
+    while len(days) < 60:
+        if (
+            current.weekday() < 5
+            and current.isoformat() not in UNIT_CLOSED_DATES
+        ):
+            days.append(current.isoformat())
+        current -= timedelta(days=1)
+    return list(reversed(days))
+
+
+def _trading_calendar_snapshot() -> dict:
+    dates = _prior_trading_dates()
+    return {
+        "calendar_kind": "benchmark_index_trade_dates",
+        "calendar_name": "unit_sh000001_trade_dates",
+        "trade_dates": dates,
+        "latest_completed_trade_date": max(dates),
+        **_pit_meta(
+            source="unit.trading_calendar",
+            raw_hash="calendar",
+            clock="14:20",
+        ),
+    }
+
+
+def _trading_calendar_contract() -> dict:
+    dates = _prior_trading_dates()
+    return {
+        "available": True,
+        "calendar_kind": "benchmark_index_trade_dates",
+        "calendar_name": "unit_sh000001_trade_dates",
+        "source": "unit.trading_calendar",
+        "source_version": "1",
+        "raw_hash": "calendar",
+        "confirmed_trade_dates": dates,
+        "latest_completed_trade_date": max(dates),
+        "errors": [],
+    }
+
+
 def _complete_stock() -> dict:
     bars = []
     for minute in range(39, 51):
@@ -365,10 +411,10 @@ def _complete_stock() -> dict:
                 "ask_vol1": 300,
             }
         )
-    start = date(2026, 4, 1)
+    trade_dates = _prior_trading_dates()
     daily_bars = [
         {
-            "date": (start + timedelta(days=index)).isoformat(),
+            "date": trade_day,
             "close": 9.0 + index * 0.02,
             "high": 9.05 + index * 0.02,
             "low": 8.95 + index * 0.02,
@@ -378,10 +424,10 @@ def _complete_stock() -> dict:
                 source="unit.daily_bar",
                 raw_hash=f"daily-{index}",
                 clock="14:30",
-                event_time=f"{(start + timedelta(days=index)).isoformat()}T15:00:00+08:00",
+                event_time=f"{trade_day}T15:00:00+08:00",
             ),
         }
-        for index in range(60)
+        for index, trade_day in enumerate(trade_dates)
     ]
     return {
         "code": "000001",
@@ -422,12 +468,25 @@ def _complete_stock() -> dict:
             }
         ],
         "news": [],
+        "trading_calendar_contract": _trading_calendar_contract(),
     }
 
 
 def _complete_records() -> list[dict]:
     stock = _complete_stock()
     records = [
+        _record(
+            "trading_calendar",
+            {
+                "calendar_kind": "benchmark_index_trade_dates",
+                "calendar_name": "unit_sh000001_trade_dates",
+                "trade_dates": _prior_trading_dates(),
+                "latest_completed_trade_date": max(
+                    _prior_trading_dates()
+                ),
+            },
+            "14:20",
+        ),
         _record(
             "market",
             stock["market"],

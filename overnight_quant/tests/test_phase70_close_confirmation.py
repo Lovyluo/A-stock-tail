@@ -38,6 +38,9 @@ from overnight_quant.strategy.legacy_frozen_baseline import (
 from overnight_quant.strategy.registry import ensure_default_strategies_registered, get_strategy_registration
 
 
+UNIT_CLOSED_DATES = {"2026-05-01"}
+
+
 def test_1451_data_cannot_change_1450_decision():
     snapshot = _snapshot()
     base = _evaluate(snapshot, "shadow")
@@ -179,6 +182,10 @@ def test_1440_to_1450_collector_persists_input_and_freeze_excludes_late_records(
     collector = CloseWindowCollector(
         ImmutableSnapshotStore(tmp_path),
         {"test": lambda observed_at: [on_time, late]},
+        clock=_clock(
+            "2026-07-30T14:45:00+08:00",
+            "2026-07-30T14:45:01+08:00",
+        ),
     )
 
     collected = collector.collect(datetime.fromisoformat("2026-07-30T14:45:00+08:00"))
@@ -353,25 +360,53 @@ def _evaluate(snapshot: dict, mode: str) -> dict:
     return CloseConfirmationStrategy({"min_shadow_score": 0}).evaluate_snapshot(frozen, mode=mode)
 
 
+def _prior_trading_dates() -> list[str]:
+    current = date(2026, 7, 29)
+    days = []
+    while len(days) < 60:
+        if (
+            current.weekday() < 5
+            and current.isoformat() not in UNIT_CLOSED_DATES
+        ):
+            days.append(current.isoformat())
+        current -= timedelta(days=1)
+    return list(reversed(days))
+
+
+def _trading_calendar_snapshot() -> dict:
+    dates = _prior_trading_dates()
+    return {
+        "calendar_kind": "benchmark_index_trade_dates",
+        "calendar_name": "unit_sh000001_trade_dates",
+        "trade_dates": dates,
+        "latest_completed_trade_date": max(dates),
+        **_pit_meta(
+            clock="14:20",
+            source="unit.trading_calendar",
+            raw_hash="calendar",
+        ),
+    }
+
+
 def _snapshot() -> dict:
     bars = [_bar(f"14:{minute:02d}", 10.0 + (minute - 30) * 0.02, 1000 + minute * 10) for minute in range(30, 51)]
-    first_daily_date = date(2026, 4, 1)
+    trading_dates = _prior_trading_dates()
     daily = [
         {
-            "date": (first_daily_date + timedelta(days=index)).isoformat(),
+            "date": trade_day,
             "close": 9.0 + index * 0.02,
             "high": 9.05 + index * 0.02,
             "low": 8.95 + index * 0.02,
             "volume": 100000 + index * 1000,
             "adjustment": "qfq",
             **_pit_meta(
-                event_time=f"{(first_daily_date + timedelta(days=index)).isoformat()}T15:00:00+08:00",
+                event_time=f"{trade_day}T15:00:00+08:00",
                 clock="14:30",
                 source="unit.daily_bar",
                 raw_hash=f"daily-{index}",
             ),
         }
-        for index in range(60)
+        for index, trade_day in enumerate(trading_dates)
     ]
     news = [
         {
@@ -393,6 +428,7 @@ def _snapshot() -> dict:
         "status": "FROZEN_1450",
         "trade_date": "2026-07-30",
         "decision_time": "2026-07-30T14:50:00+08:00",
+        "trading_calendar": _trading_calendar_snapshot(),
         "stocks": [
             {
                 "code": "000001",
@@ -477,6 +513,11 @@ def _pit_meta(
         "source_version": "1",
         "raw_hash": raw_hash,
     }
+
+
+def _clock(*values: str):
+    moments = iter(datetime.fromisoformat(value) for value in values)
+    return lambda: next(moments)
 
 
 def _execution_bar(clock: str, price: float, volume: float, *, day: str = "2026-07-30") -> dict:

@@ -8,13 +8,13 @@ from typing import Any, Callable
 from overnight_quant.data.close_confirmation_readiness import (
     SNAPSHOT_CONTRACT_VERSION,
     filter_source_status_at,
+    normalize_point_in_time_records,
     validate_close_confirmation_readiness,
 )
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import (
     PointInTimeError,
     parse_cn_datetime,
-    records_available_at,
     stable_hash,
 )
 
@@ -58,9 +58,12 @@ class CloseWindowCollector:
         self,
         store: ImmutableSnapshotStore,
         providers: dict[str, Callable[[datetime], list[dict[str, Any]]]],
+        *,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.store = store
         self.providers = dict(providers)
+        self.clock = clock or (lambda: datetime.now(CN_TZ))
 
     def collect(self, observed_at: datetime) -> dict[str, Any]:
         current = _coerce_cn(observed_at)
@@ -88,9 +91,21 @@ class CloseWindowCollector:
         records: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         source_status: list[dict[str, Any]] = []
+        completion_times: list[datetime] = [current]
         for source, provider in self.providers.items():
+            started_at = _coerce_cn(self.clock())
             try:
-                provider_rows = [dict(item) for item in provider(current)]
+                provider_rows = [dict(item) for item in provider(started_at)]
+                completed_at = _coerce_cn(self.clock())
+                completion_times.append(completed_at)
+                provider_rows = [
+                    _stamp_provider_completion(
+                        row,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    )
+                    for row in provider_rows
+                ]
                 records.extend(provider_rows)
                 source_status.append(
                     _source_status_record(
@@ -105,10 +120,13 @@ class CloseWindowCollector:
                                 if row.get("data_type")
                             }
                         ),
-                        observed_at=current,
+                        started_at=started_at,
+                        completed_at=completed_at,
                     )
                 )
             except Exception as exc:
+                completed_at = _coerce_cn(self.clock())
+                completion_times.append(completed_at)
                 errors.append({"source": source, "error": f"{type(exc).__name__}: {exc}"})
                 source_status.append(
                     _source_status_record(
@@ -117,19 +135,34 @@ class CloseWindowCollector:
                         ok=False,
                         record_count=0,
                         data_types=[],
-                        observed_at=current,
+                        started_at=started_at,
+                        completed_at=completed_at,
                         error=f"{type(exc).__name__}: {exc}",
                     )
                 )
-        accepted, rejected = records_available_at(records, current)
+        freeze_cutoff = datetime.combine(
+            current.date(),
+            FREEZE_TIME,
+            tzinfo=CN_TZ,
+        )
+        collection_completed_at = max(completion_times)
+        effective_decision_time = min(
+            collection_completed_at,
+            freeze_cutoff,
+        )
         readiness = validate_close_confirmation_readiness(
             {
-                "records": accepted,
+                "records": records,
                 "source_status": source_status,
-                "decision_time": current.isoformat(timespec="seconds"),
+                "decision_time": effective_decision_time.isoformat(
+                    timespec="seconds"
+                ),
             },
         )
-        if current.time() < FREEZE_TIME:
+        normalized = readiness["normalized_snapshot"]
+        accepted = list(normalized.get("records") or [])
+        rejected = list(normalized.get("rejected_records") or [])
+        if effective_decision_time.time() < FREEZE_TIME:
             readiness["data_ready"] = False
             readiness["readiness_errors"] = list(
                 dict.fromkeys(
@@ -142,11 +175,17 @@ class CloseWindowCollector:
                 "execution_ok": True,
                 "data_ready": False,
                 "observed_at": current.isoformat(timespec="seconds"),
+                "completed_at": collection_completed_at.isoformat(
+                    timespec="seconds"
+                ),
                 "records": [],
                 "rejected_records": rejected,
                 "errors": errors,
                 "source_status": list(
-                    readiness["normalized_snapshot"].get("source_status") or []
+                    normalized.get("source_status") or []
+                ),
+                "rejected_source_status": list(
+                    normalized.get("rejected_source_status") or []
                 ),
                 **_readiness_fields(readiness),
             }
@@ -155,14 +194,22 @@ class CloseWindowCollector:
             "execution_ok": True,
             "data_ready": readiness["data_ready"],
             "observed_at": current.isoformat(timespec="seconds"),
-            "decision_time": current.isoformat(timespec="seconds"),
+            "completed_at": collection_completed_at.isoformat(
+                timespec="seconds"
+            ),
+            "decision_time": effective_decision_time.isoformat(
+                timespec="seconds"
+            ),
             "records": accepted,
             "rejected_records": rejected,
             "errors": errors,
             "source_status": list(
                 readiness["normalized_snapshot"].get("source_status") or []
             ),
-            "raw_hash": stable_hash(accepted),
+            "rejected_source_status": list(
+                normalized.get("rejected_source_status") or []
+            ),
+            "ingest_hash": stable_hash(records),
             **_readiness_fields(readiness),
         }
         snapshot_id = current.strftime("%Y%m%d_%H%M%S")
@@ -178,17 +225,21 @@ class CloseWindowCollector:
     ) -> dict[str, Any]:
         day = date.fromisoformat(str(trade_date)) if not isinstance(trade_date, date) else trade_date
         decision_time = datetime.combine(day, FREEZE_TIME, tzinfo=CN_TZ)
-        accepted, rejected = records_available_at(records, decision_time)
-        accepted_source_status, rejected_source_status = filter_source_status_at(
-            source_status or [],
-            decision_time,
-        )
         readiness = validate_close_confirmation_readiness(
             {
-                "records": accepted,
-                "source_status": accepted_source_status,
+                "records": records,
+                "source_status": source_status or [],
                 "decision_time": decision_time.isoformat(timespec="seconds"),
             },
+        )
+        normalized = readiness["normalized_snapshot"]
+        accepted = list(normalized.get("records") or [])
+        rejected = list(normalized.get("rejected_records") or [])
+        accepted_source_status = list(
+            normalized.get("source_status") or []
+        )
+        rejected_source_status = list(
+            normalized.get("rejected_source_status") or []
         )
         if not accepted:
             return {
@@ -255,7 +306,10 @@ def load_frozen_snapshot(path: str | Path, decision_time: str | datetime | None 
     decision = decision_time or payload.get("decision_time")
     if not decision:
         raise PointInTimeError("decision_time_missing")
-    accepted, rejected = records_available_at(payload.get("records") or [], decision)
+    accepted, rejected, _ = normalize_point_in_time_records(
+        payload.get("records") or [],
+        decision,
+    )
     accepted_source_status, rejected_source_status = filter_source_status_at(
         payload.get("source_status") or [],
         decision,
@@ -292,12 +346,20 @@ def close_snapshot_hash(
         if decision is not None
         else str(decision_time)
     )
+    normalized_records, _, _ = normalize_point_in_time_records(
+        records,
+        decision_text,
+    )
+    normalized_source_status, _ = filter_source_status_at(
+        source_status,
+        decision_text,
+    )
     return stable_hash(
         {
             "decision_time": decision_text,
             "snapshot_contract_version": SNAPSHOT_CONTRACT_VERSION,
-            "records": records,
-            "source_status": source_status,
+            "records": normalized_records,
+            "source_status": normalized_source_status,
         }
     )
 
@@ -323,12 +385,14 @@ def _source_status_record(
     ok: bool,
     record_count: int,
     data_types: list[str],
-    observed_at: datetime,
+    started_at: datetime,
+    completed_at: datetime,
     error: str = "",
 ) -> dict[str, Any]:
-    current = _coerce_cn(observed_at)
+    started = _coerce_cn(started_at)
+    completed = _coerce_cn(completed_at)
     cutoff = datetime.combine(
-        current.date(),
+        started.date(),
         FREEZE_TIME,
         tzinfo=CN_TZ,
     )
@@ -342,10 +406,36 @@ def _source_status_record(
     }
     return {
         **payload,
-        "event_time": current.isoformat(timespec="seconds"),
-        "observed_at": current.isoformat(timespec="seconds"),
-        "available_at": current.isoformat(timespec="seconds"),
+        "event_time": completed.isoformat(timespec="seconds"),
+        "observed_at": started.isoformat(timespec="seconds"),
+        "available_at": completed.isoformat(timespec="seconds"),
+        "started_at": started.isoformat(timespec="seconds"),
+        "completed_at": completed.isoformat(timespec="seconds"),
         "decision_cutoff": cutoff.isoformat(timespec="seconds"),
         "source_version": "close_window_collector_v1",
         "raw_hash": stable_hash(payload),
     }
+
+
+def _stamp_provider_completion(
+    row: dict[str, Any],
+    *,
+    started_at: datetime,
+    completed_at: datetime,
+) -> dict[str, Any]:
+    stamped = dict(row)
+    original_available = parse_cn_datetime(stamped.get("available_at"))
+    effective_available = max(
+        completed_at,
+        original_available or completed_at,
+    )
+    stamped["available_at"] = effective_available.isoformat(
+        timespec="seconds"
+    )
+    stamped["provider_started_at"] = started_at.isoformat(
+        timespec="seconds"
+    )
+    stamped["provider_completed_at"] = completed_at.isoformat(
+        timespec="seconds"
+    )
+    return stamped

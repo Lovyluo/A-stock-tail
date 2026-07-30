@@ -111,10 +111,11 @@ published_at <= decision_time
 完整输入至少要求：
 
 - 市场快照含指数强度与市场广度；
-- 至少一只股票具备完整 quote、12 根以上截至 14:50 的分钟线；
+- 至少一只股票具备完整 quote、12 个不同事件分钟，且明确存在
+  `event_time=14:50` 的分钟线；
 - quote 含价格、昨收、成交额、换手率、停牌及涨跌停状态；
 - 个股具备匹配的行业强度与行业广度；
-- 筹码代理至少有 60 根有效日线及可用资金流记录；
+- 筹码代理至少有 60 根已被可信交易日历确认的有效日线及可用资金流记录；
 - 新闻源明确返回成功；成功但零条新闻记为 `AVAILABLE_EMPTY`，来源失败记为
   `FAILED`。
 
@@ -122,7 +123,7 @@ published_at <= decision_time
 
 | 字段 | 含义 |
 |---|---|
-| `coverage_by_type` | market、industry、quote、minute_bar、daily_bar、fund_flow、news 覆盖数量 |
+| `coverage_by_type` | market、industry、quote、minute_bar、daily_bar、fund_flow、news、trading_calendar 覆盖数量 |
 | `readiness_errors` | 阻断 `data_ready` 的机器可解析错误列表 |
 | `critical_source_status` | 各关键数据类型的来源状态、记录数与来源名称 |
 | `stock_readiness` | 逐股完整性状态、分钟数、日线数及缺失原因 |
@@ -143,7 +144,7 @@ source status。冻结后到达的来源状态不能改变已冻结快照及其�
 ## 8. 60 日筹码代理日线合同
 
 - 至少 60 个不同的已完成交易日期，按日期升序规范化；
-- 重复日期采用确定性去重，并在 `daily_bar_audit` 中记录重复日期和拒绝原因；
+- 重复日期采用确定性去重，并在记录规范化审计或 `daily_bar_audit` 中记录拒绝原因；
 - 统一使用前复权数据，逐条记录 `adjustment=qfq`；
 - 复权方式未知、未复权或混用时，筹码维度不可用；
 - 默认只使用决策日前已经完成的日线，当日 14:50 部分日线不得冒充收盘日线；
@@ -157,3 +158,44 @@ source status。冻结后到达的来源状态不能改变已冻结快照及其�
 PR #5 只提供研发框架，以及手工快照和回放快照入口，尚未接入真实自动采集器。
 因此本阶段不得宣称已经可以开始正式 60 个交易日影子验收。真实时点采集器计划在
 独立的 v0.4.1 阶段实现。
+
+## 10. 分钟事件与记录确定性
+
+分钟线完整性只按 `event_time` 判断，`available_at` 只表示系统何时可以使用记录。
+14:49 分钟线即使在 14:50 到达，也不能代替 14:50 事件分钟。分钟线按
+`event_time` 排序，同一股票同一事件分钟采用 `available_at`、`source` 和
+`raw_hash` 确定性决胜，重复项进入审计。
+
+所有有效 records 在物化前统一排序和去重：
+
+- quote、market 和 industry 选择决策前最新事件；
+- minute_bar 按股票代码和事件分钟唯一化；
+- daily_bar 按股票代码和交易日期唯一化；
+- fund_flow 按事件时间稳定升序；
+- news 按发布时间、可用时间、来源和哈希稳定排序；
+- source_status 按数据类型、来源和完成时间稳定排序。
+
+相同有效记录集合的输入顺序不得改变 readiness、评分、`decision_hash` 或
+`snapshot_hash`。原始调用顺序如需审计，只记录在独立 `ingest_hash`，不得进入
+决策快照哈希。
+
+## 11. 可信交易日历合同
+
+60 日筹码日线必须同时提供 `trading_calendar` 时点记录。该记录应来自交易所日历
+或基准指数交易日期集合，并具备 `calendar_kind`、`calendar_name`、
+`trade_dates`、`source`、`source_version` 和 `raw_hash`。
+
+只有日历明确列出的开市日期才可计入 60 日。周末、法定休市日和日历未知日期均
+不得计数；最新日线不得晚于日历确认的决策日前最后一个已完成交易日。缺少可信
+日历时，筹码维度和 `data_ready` 同时失败。日历记录属于有效 records，因此纳入
+`snapshot_hash`。
+
+## 12. Provider 完成时间
+
+手工 provider 调用记录 `started_at` 和 `completed_at`。来源状态的
+`available_at` 使用 provider 返回并完成解析后的真实完成时间；provider 返回记录
+的系统 `available_at` 不得早于该完成时间。14:50 后完成的来源状态和记录只能进入
+拒绝审计，不能进入当日冻结快照。
+
+`CloseWindowCollector` 支持注入 clock 以进行确定性测试。该能力不代表已接入真实
+联网自动采集器；真实采集器仍属于独立 v0.4.1 范围。

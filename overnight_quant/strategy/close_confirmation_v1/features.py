@@ -67,6 +67,7 @@ def build_close_confirmation_features(
     daily_bars, daily_audit = normalize_daily_bars(
         stock.get("daily_bars") or [],
         decision,
+        calendar_contract=stock.get("trading_calendar_contract") or {},
     )
     fund_flow = stock.get("fund_flow") or []
     chip_data_ready = bool(
@@ -305,7 +306,7 @@ def _feature_reasons(
 
 
 def _bar_datetime(row: dict[str, Any], decision: datetime) -> datetime | None:
-    value = row.get("datetime") or row.get("time") or row.get("event_time")
+    value = row.get("event_time") or row.get("datetime") or row.get("time")
     text = str(value or "")
     if len(text) <= 8 and ":" in text:
         parsed_time = _parse_clock(text)
