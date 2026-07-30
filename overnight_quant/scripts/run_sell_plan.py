@@ -75,6 +75,9 @@ def run_sell_plan(mode: str = "demo", trade_date: str | None = None, config: dic
 
 def generate_sell_plan(config: dict, client, mode: str = "demo", trade_date: str | None = None) -> dict:
     trade_date = trade_date or date.today().isoformat()
+    evaluation_date = _parse_date(trade_date)
+    if evaluation_date is None:
+        raise ValueError(f"invalid trade_date: {trade_date}")
     records_dir = config.get("paths", {}).get("records_dir", "overnight_quant/records")
     reports_dir = config.get("paths", {}).get("reports_dir", "overnight_quant/reports")
     positions = get_open_positions(records_dir)
@@ -96,7 +99,12 @@ def generate_sell_plan(config: dict, client, mode: str = "demo", trade_date: str
                 config,
             )
         intraday_context = _intraday_context(client, position["code"], current)
-        environment_context = _environment_context(client, position["code"], current)
+        environment_context = _environment_context(
+            client,
+            position["code"],
+            current,
+            as_of_date=evaluation_date,
+        )
         detail = _sell_plan_detail(position, current, decision, config, intraday_context, environment_context)
         rows.append(
             {
@@ -176,12 +184,18 @@ def _intraday_context(client, code: str, current: dict) -> dict:
     }
 
 
-def _environment_context(client, code: str, current: dict) -> dict:
+def _environment_context(
+    client,
+    code: str,
+    current: dict,
+    *,
+    as_of_date: date,
+) -> dict:
     context: dict = {}
     steps = [
         (_market_context, (client,)),
         (_theme_context, (client, code)),
-        (_multi_day_fund_context, (client, code)),
+        (_multi_day_fund_context, (client, code, as_of_date)),
         (_minute_fund_context, (client, code)),
         (_today_main_fund_context, (client, code)),
         (_volume_trend_context, (client, code, current)),
@@ -336,7 +350,11 @@ def _theme_context(client, code: str) -> dict:
     }
 
 
-def _multi_day_fund_context(client, code: str) -> dict:
+def _multi_day_fund_context(
+    client,
+    code: str,
+    as_of_date: date,
+) -> dict:
     if not hasattr(client, "_eastmoney_fund_flow_daily"):
         return {
             "fund_context_cn": "多日资金流数据暂缺，不作为硬卖出条件",
@@ -357,7 +375,10 @@ def _multi_day_fund_context(client, code: str) -> dict:
             continue
         try:
             if fetcher_name == "_sina_money_flow_history":
-                candidate_rows = _fresh_fund_rows(fetcher(code))
+                candidate_rows = _fresh_fund_rows(
+                    fetcher(code),
+                    as_of_date=as_of_date,
+                )
                 if not candidate_rows:
                     errors.append(f"{source_name}:stale_or_empty")
                     continue
@@ -913,19 +934,24 @@ def _average(values: list[float]) -> float:
     return sum(cleaned) / len(cleaned) if cleaned else 0.0
 
 
-def _fresh_fund_rows(rows: list[dict], max_stale_days: int = 20) -> list[dict]:
+def _fresh_fund_rows(
+    rows: list[dict],
+    *,
+    as_of_date: date,
+    max_stale_days: int = 20,
+) -> list[dict]:
     cleaned = list(rows or [])
     if not cleaned:
         return []
     dated = []
     for row in cleaned:
         row_date = _parse_date(str(row.get("time", "")))
-        if row_date:
+        if row_date and row_date <= as_of_date:
             dated.append((row_date, row))
     if not dated:
         return []
     latest = max(item[0] for item in dated)
-    if (date.today() - latest).days > max_stale_days:
+    if (as_of_date - latest).days > max_stale_days:
         return []
     recent = [(row_date, row) for row_date, row in dated if (latest - row_date).days <= max_stale_days]
     return [row for row_date, row in sorted(recent, key=lambda item: item[0])]
