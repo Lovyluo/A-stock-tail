@@ -694,6 +694,28 @@ def test_load_dashboard_state_splits_open_and_closed_positions(tmp_path):
     assert state["closed_positions"].to_dict("records")[0]["status"] == "CLOSED"
 
 
+def test_dashboard_reopened_position_uses_new_cycle_cost(tmp_path):
+    from overnight_quant.ui.dashboard import load_dashboard_state
+
+    records = tmp_path / "overnight_quant" / "records"
+    records.mkdir(parents=True)
+    (records / "manual_orders.csv").write_text(
+        "order_id,trade_date,trade_time,code,name,side,price,qty,amount,stop_loss_price,status\n"
+        "B1,2026-07-20,2026-07-20 10:00:00,000001,平安银行,BUY,10.0,100,1000,9.5,FILLED\n"
+        "S1,2026-07-21,2026-07-21 10:00:00,000001,平安银行,SELL,11.0,100,1100,,FILLED\n"
+        "B2,2026-07-22,2026-07-22 10:00:00,000001,平安银行,BUY,20.0,100,2000,19.0,FILLED\n",
+        encoding="utf-8-sig",
+    )
+
+    state = load_dashboard_state(root=tmp_path)
+    row = state["open_positions"].to_dict("records")[0]
+
+    assert row["status"] == "OPEN"
+    assert row["open_qty"] == 100
+    assert row["avg_buy_price"] == 20.0
+    assert state["closed_positions"].empty
+
+
 def test_news_briefing_sections_are_loaded_for_dashboard(tmp_path):
     from overnight_quant.ui.dashboard import load_dashboard_state
 

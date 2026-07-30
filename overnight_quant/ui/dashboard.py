@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from overnight_quant.data.market_calendar import TAIL_SESSION, get_session_state
+from overnight_quant.data.position_accounting import summarize_order_rows
 from overnight_quant.data.stock_catalog import load_stock_catalog, resolve_stock_name
 from overnight_quant.ui.result_parser import (
     SimpleTable,
@@ -1598,48 +1599,6 @@ def _command_output_reasons(stdout: str) -> list[str]:
 def build_position_summary_table(manual_orders, stock_names: dict[str, str] | None = None) -> SimpleTable:
     rows = _table_records(manual_orders)
     canonical_names = stock_names or {}
-    positions: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        code = _normalize_stock_code(row.get("code"))
-        if not code:
-            continue
-        side = str(row.get("side") or "BUY").upper()
-        qty = _as_int_value(row.get("qty") or row.get("quantity"))
-        price = _as_float_value(row.get("price") or row.get("buy_price"))
-        amount = _as_float_value(row.get("amount")) or round(qty * price, 2)
-        position = positions.setdefault(
-            code,
-            {
-                "code": code,
-                "name": canonical_names.get(code) or row.get("name", ""),
-                "status": "OPEN",
-                "open_qty": 0,
-                "avg_buy_price": 0.0,
-                "buy_qty": 0,
-                "sell_qty": 0,
-                "buy_amount": 0.0,
-                "sell_amount": 0.0,
-                "realized_pnl": 0.0,
-                "stop_loss_price": _as_float_value(row.get("stop_loss_price")),
-                "last_buy_time": "",
-                "last_sell_time": "",
-            },
-        )
-        if canonical_names.get(code):
-            position["name"] = canonical_names[code]
-        elif row.get("name"):
-            position["name"] = row.get("name")
-        if side == "BUY":
-            position["buy_qty"] += qty
-            position["open_qty"] += qty
-            position["buy_amount"] += amount
-            position["last_buy_time"] = row.get("trade_time", "")
-            position["stop_loss_price"] = _as_float_value(row.get("stop_loss_price")) or position["stop_loss_price"]
-        elif side == "SELL":
-            position["sell_qty"] += qty
-            position["open_qty"] -= qty
-            position["sell_amount"] += amount
-            position["last_sell_time"] = row.get("trade_time", "")
     columns = [
         "code",
         "name",
@@ -1655,17 +1614,15 @@ def build_position_summary_table(manual_orders, stock_names: dict[str, str] | No
         "last_buy_time",
         "last_sell_time",
     ]
-    summary_rows: list[dict[str, Any]] = []
-    for position in positions.values():
-        buy_qty = _as_int_value(position.get("buy_qty"))
-        sell_qty = _as_int_value(position.get("sell_qty"))
-        open_qty = _as_int_value(position.get("open_qty"))
-        avg_buy = round(_as_float_value(position.get("buy_amount")) / buy_qty, 4) if buy_qty else 0.0
-        position["avg_buy_price"] = avg_buy
-        position["realized_pnl"] = round(_as_float_value(position.get("sell_amount")) - avg_buy * min(sell_qty, buy_qty), 2)
-        position["status"] = _position_status_label(open_qty, buy_qty, sell_qty)
-        summary_rows.append({column: position.get(column, "") for column in columns})
-    return SimpleTable(summary_rows, columns)
+    summary_rows = summarize_order_rows(rows)
+    for position in summary_rows:
+        code = _normalize_stock_code(position.get("code"))
+        if canonical_names.get(code):
+            position["name"] = canonical_names[code]
+    return SimpleTable(
+        [{column: position.get(column, "") for column in columns} for position in summary_rows],
+        columns,
+    )
 
 
 def split_position_summary_tables(position_summary) -> tuple[SimpleTable, SimpleTable]:
@@ -1685,18 +1642,6 @@ def split_position_summary_tables(position_summary) -> tuple[SimpleTable, Simple
     open_rows.sort(key=lambda row: str(row.get("code") or ""))
     closed_rows.sort(key=lambda row: str(row.get("last_sell_time") or ""), reverse=True)
     return SimpleTable(open_rows, columns), SimpleTable(closed_rows, columns)
-
-
-def _position_status_label(open_qty: int, buy_qty: int, sell_qty: int) -> str:
-    if open_qty < 0 or sell_qty > buy_qty:
-        return "ERROR_OVER_SOLD"
-    if buy_qty > 0 and sell_qty == 0 and open_qty > 0:
-        return "OPEN"
-    if buy_qty > 0 and sell_qty > 0 and open_qty > 0:
-        return "PARTIALLY_CLOSED"
-    if buy_qty > 0 and sell_qty == buy_qty and open_qty == 0:
-        return "CLOSED"
-    return "OPEN"
 
 
 def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> dict[str, Any]:
