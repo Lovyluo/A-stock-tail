@@ -1,8 +1,48 @@
 strategy:
-  name: yang_yongxing_overnight_v1
+  name: legacy_frozen_baseline
   mode: conservative
   min_total_score: 75
   final_pick_count: 1
+  active_research_strategy: close_confirmation_v1
+  phase: frozen
+  formal_signal_enabled: false
+  ticket_enabled: false
+  legacy_baseline: legacy_frozen_baseline
+close_confirmation:
+  min_shadow_score: 70
+  decision_cutoff: "14:50"
+  collection_start: "14:40"
+  entry_start: "14:51"
+  cancel_at: "14:56"
+  gates:
+    min_market_strength: 0.35
+    min_industry_strength: 0.40
+    min_industry_breadth: 0.45
+    min_amount_wan: 15000
+    min_turnover_pct: 1.0
+    max_turnover_pct: 25.0
+    require_1450_minute: true
+    max_negative_announcements: 0
+  scoring_weights:
+    market_confirmation: 15
+    industry_confirmation: 20
+    stock_relative_strength: 15
+    price_volume_confirmation: 25
+    catalyst_quality: 10
+    chip_structure_proxy: 15
+paper:
+  initial_cash: 100000
+  max_position_ratio: 0.10
+  max_total_exposure_ratio: 0.30
+  max_positions: 3
+  per_position_risk_ratio: 0.005
+validation:
+  train_months: 36
+  validation_months: 6
+  test_months: 6
+  purge_days: 5
+  embargo_days: 5
+  sealed_recent_months: 12
 scan:
   default_mode: demo
   max_candidates: 100

@@ -15,7 +15,12 @@ from overnight_quant.data.market_calendar import CN_TZ, get_session_state, is_li
 from overnight_quant.reports.scan_reports import write_preflight_report
 from overnight_quant.strategy.yang_yongxing_overnight import load_config
 from overnight_quant.strategy.news_briefing import fetch_cls_telegraph, fetch_eastmoney_global_news
-from overnight_quant.ui.result_parser import find_latest_file, parse_after_close_report, parse_intraday_report
+from overnight_quant.ui.result_parser import (
+    find_latest_file,
+    parse_after_close_report,
+    parse_intraday_report,
+    parse_key_value_md,
+)
 
 
 def run_preflight(config: dict | None = None, client: AStockClient | None = None, now: datetime | None = None, trade_date: str | None = None, check_network: bool = False) -> dict:
@@ -37,17 +42,31 @@ def run_preflight(config: dict | None = None, client: AStockClient | None = None
     sources = _check_sources(client) if check_network else []
     workflows = [] if explicit_client else _check_demo_workflows()
     parser_check = _check_dashboard_parser(Path(reports_dir))
-    degraded = any(not item.get("ok") for item in sources) or any(not item.get("ok") for item in workflows) or not parser_check["ok"]
+    infrastructure_ok = all([config_ok, records_writable, reports_writable, backtest_writable, cache_writable])
+    workflows_execution_ok = all(item.get("execution_ok", item.get("ok", False)) for item in workflows)
+    execution_ok = infrastructure_ok and workflows_execution_ok and parser_check["ok"]
+    readiness_checks = [
+        item.get("data_ready")
+        for item in workflows
+        if item.get("data_ready") is not None
+    ]
+    if parser_check.get("data_ready") is not None:
+        readiness_checks.append(parser_check["data_ready"])
+    if check_network:
+        readiness_checks.extend(bool(item.get("ok")) for item in sources)
+    data_ready = execution_ok and all(readiness_checks)
 
-    if not all([config_ok, records_writable, reports_writable, backtest_writable, cache_writable]):
+    if not execution_ok:
         status = "PROJECT_HEALTH_FAILED"
-    elif degraded:
+    elif not data_ready:
         status = "PROJECT_HEALTH_DEGRADED"
     else:
         status = "PROJECT_HEALTHY"
 
     result = {
         "status": status,
+        "execution_ok": execution_ok,
+        "data_ready": data_ready,
         "trade_date": trade_date,
         "run_time": current.isoformat(),
         "session_state": session_state,
@@ -74,6 +93,8 @@ def main() -> int:
     config = load_config()
     result = run_preflight(config=config, trade_date=args.date, check_network=args.network)
     print(result["status"])
+    print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")
+    print(f"data_ready: {str(bool(result.get('data_ready'))).lower()}")
     print(f"session_state: {result['session_state']}")
     print(f"Health Check Report: {result['report_path']}")
     return 0
@@ -99,17 +120,46 @@ def _check_sources(client: AStockClient) -> list[dict]:
 
 def _check_demo_workflows() -> list[dict]:
     commands = [
-        ("demo_scan", [sys.executable, "overnight_quant/scripts/run_scan.py", "--mode", "demo", "--dry-run"]),
-        ("after_close_demo", [sys.executable, "overnight_quant/scripts/run_after_close_analysis.py", "--mode", "demo"]),
-        ("intraday_demo", [sys.executable, "overnight_quant/scripts/run_intraday_observation.py", "--mode", "demo"]),
+        ("demo_scan", [sys.executable, "overnight_quant/scripts/run_scan.py", "--mode", "demo", "--dry-run"], False),
+        ("after_close_demo", [sys.executable, "overnight_quant/scripts/run_after_close_analysis.py", "--mode", "demo"], False),
+        ("intraday_demo", [sys.executable, "overnight_quant/scripts/run_intraday_observation.py", "--mode", "demo"], False),
+        (
+            "close_confirmation_shadow",
+            [sys.executable, "overnight_quant/scripts/run_close_confirmation.py", "--mode", "shadow"],
+            True,
+        ),
     ]
     rows = []
-    for name, command in commands:
+    for name, command, requires_data in commands:
         try:
             completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=90, shell=False)
-            rows.append({"name": name, "ok": completed.returncode == 0, "returncode": completed.returncode, "error": completed.stderr[-300:] if completed.returncode else ""})
+            execution_ok = _stdout_bool(completed.stdout, "execution_ok")
+            data_ready = _stdout_bool(completed.stdout, "data_ready")
+            if execution_ok is None:
+                execution_ok = completed.returncode == 0
+            if data_ready is None:
+                data_ready = execution_ok if not requires_data else False
+            rows.append(
+                {
+                    "name": name,
+                    "ok": execution_ok,
+                    "execution_ok": execution_ok,
+                    "data_ready": data_ready,
+                    "returncode": completed.returncode,
+                    "error": completed.stderr[-300:] if not execution_ok else "",
+                }
+            )
         except Exception as exc:
-            rows.append({"name": name, "ok": False, "returncode": -1, "error": f"{type(exc).__name__}: {exc}"})
+            rows.append(
+                {
+                    "name": name,
+                    "ok": False,
+                    "execution_ok": False,
+                    "data_ready": False,
+                    "returncode": -1,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     return rows
 
 
@@ -117,14 +167,50 @@ def _check_dashboard_parser(reports_dir: Path) -> dict:
     try:
         after_path = find_latest_file("after_close_analysis_*.md", reports_dir)
         intraday_path = find_latest_file("intraday_observation_*.md", reports_dir)
+        close_confirmation_path = find_latest_file("close_confirmation_shadow_*.md", reports_dir)
         parsed = []
         if after_path:
             parsed.append(parse_after_close_report(after_path).get("status"))
         if intraday_path:
             parsed.append(parse_intraday_report(intraday_path).get("status"))
-        return {"ok": True, "parsed_reports": len(parsed), "statuses": [item for item in parsed if item], "error": ""}
+        data_ready = None
+        if close_confirmation_path:
+            close_confirmation = parse_key_value_md(close_confirmation_path)
+            parsed.append(close_confirmation.get("status"))
+            data_ready = _value_bool(close_confirmation.get("data_ready"))
+        return {
+            "ok": True,
+            "parsed_reports": len(parsed),
+            "statuses": [item for item in parsed if item],
+            "data_ready": data_ready,
+            "error": "",
+        }
     except Exception as exc:
-        return {"ok": False, "parsed_reports": 0, "statuses": [], "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False,
+            "parsed_reports": 0,
+            "statuses": [],
+            "data_ready": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _stdout_bool(stdout: str, label: str) -> bool | None:
+    prefix = f"{label}:"
+    for raw_line in str(stdout or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith(prefix):
+            return _value_bool(line.split(":", 1)[1].strip())
+    return None
+
+
+def _value_bool(value: object) -> bool | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return None
 
 
 def _config_readable() -> bool:

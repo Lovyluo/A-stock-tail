@@ -60,8 +60,8 @@ TEXT = {
         "empty_table": "暂无可展示表格行。",
         "live_reference": "正式 live 观察参考",
         "demo_only": "演示 / 测试模式",
-        "safe_actions_caption": "仅可运行白名单命令；正式 Live 带尾盘门禁。",
-        "formal_live_help": "正式 Live 只在 14:25-14:55 尾盘窗口可运行；会生成人工核对票据，但不会自动下单。",
+        "safe_actions_caption": "仅可运行白名单命令；新策略当前处于影子验证阶段。",
+        "formal_live_help": "行业共振尾盘确认策略仅做影子研究，不生成正式信号或票据。",
         "latest_action": "最近执行结果",
         "audit_artifacts": "审计文件",
         "audit_artifacts_help": "报告和 records 仍会保留用于复盘、追溯和排错；网页主界面直接展示解析后的结果。",
@@ -93,8 +93,8 @@ TEXT = {
         "empty_table": "No table rows available.",
         "live_reference": "Live reference observation",
         "demo_only": "Demo / test mode",
-        "safe_actions_caption": "Only whitelisted commands are available; Formal Live is tail-session gated.",
-        "formal_live_help": "Formal Live is allowed only during the 14:25-14:55 tail window; it can generate a manual review ticket but never places orders.",
+        "safe_actions_caption": "Only whitelisted commands are available; the new strategy remains in shadow validation.",
+        "formal_live_help": "The close-confirmation strategy is research-only and does not generate formal signals or tickets.",
         "latest_action": "Latest Action Result",
         "audit_artifacts": "Audit Artifacts",
         "audit_artifacts_help": "Reports and records are still retained for review, traceability, and debugging; the main page shows parsed results directly.",
@@ -106,6 +106,8 @@ TEXT = {
 
 FIELD_LABELS = {
     "zh": {
+        "execution_ok": "程序执行成功",
+        "data_ready": "数据就绪",
         "status": "状态",
         "trade_date": "交易日期",
         "run_time": "运行时间",
@@ -134,6 +136,8 @@ FIELD_LABELS = {
         "path": "文件路径",
     },
     "en": {
+        "execution_ok": "Execution OK",
+        "data_ready": "Data Ready",
         "status": "Status",
         "trade_date": "Trade Date",
         "run_time": "Run Time",
@@ -341,6 +345,13 @@ POSITION_STATUS_LABELS_ZH = {
     "FILLED": "已记录",
 }
 
+SYSTEM_STATUS_LABELS_ZH = {
+    "POINT_IN_TIME_DATA_UNAVAILABLE": "数据未就绪",
+    "POINT_IN_TIME_DATA_INCOMPLETE": "数据未就绪",
+    "NO_DATA_SOURCE": "数据源未配置",
+    "NO_VALID_RECORDS": "无有效时点数据",
+}
+
 REASON_LABELS_ZH = {
     "prev_day_high_volume": "前一交易日阶段高量",
     "today_volume_confirm": "当日放量确认",
@@ -524,6 +535,18 @@ INLINE_SECTION_FIELDS = {
         "demo_candidate_count",
         "fallback_to_demo",
     ],
+    "close_confirmation": [
+        "status",
+        "execution_ok",
+        "data_ready",
+        "strategy_name",
+        "strategy_phase",
+        "decision_time",
+        "demo_field_count",
+        "formal_signal_enabled",
+        "ticket_enabled",
+        "shadow_candidate_count",
+    ],
     "after_close": [
         "status",
         "trade_date",
@@ -553,6 +576,7 @@ AUDIT_SECTION_TITLES = {
     "preflight": "Preflight",
     "intraday": "Intraday",
     "dry_run": "Live Dry-run",
+    "close_confirmation": "Close Confirmation Shadow",
     "quality": "Live Data Quality",
     "after_close": "After-Close",
     "morning_replay": "Morning Replay",
@@ -610,7 +634,7 @@ ACTION_TEXT = {
         "auction_live": "集合竞价观察",
         "intraday_live": "盘中攻防",
         "live_dry_run": "Live Dry-run",
-        "formal_live_scan": "尾盘策略",
+        "formal_live_scan": "行业共振尾盘确认（影子）",
         "after_close_live": "盘后观察池",
         "morning_replay_live": "早盘 Replay",
         "sell_plan_live": "卖出计划",
@@ -627,7 +651,7 @@ ACTION_TEXT = {
         "auction_live": "Auction Observation",
         "intraday_live": "Intraday VWAP",
         "live_dry_run": "Live Dry-run",
-        "formal_live_scan": "Formal Live Tail Scan",
+        "formal_live_scan": "Close Confirmation (Shadow)",
         "after_close_live": "After-Close Watchlist",
         "morning_replay_live": "Morning Replay",
         "sell_plan_live": "Sell Plan",
@@ -920,7 +944,7 @@ APPROVED_ACTIONS = {
     "auction_live": [sys.executable, "overnight_quant/scripts/run_auction_observation.py", "--mode", "live"],
     "intraday_live": [sys.executable, "overnight_quant/scripts/run_intraday_observation.py", "--mode", "live"],
     "live_dry_run": [sys.executable, "overnight_quant/scripts/run_scan.py", "--mode", "live", "--dry-run"],
-    "formal_live_scan": [sys.executable, "overnight_quant/scripts/run_scan.py", "--mode", "live"],
+    "formal_live_scan": [sys.executable, "overnight_quant/scripts/run_close_confirmation.py", "--mode", "shadow"],
     "after_close_live": [sys.executable, "overnight_quant/scripts/run_after_close_analysis.py", "--mode", "live"],
     "morning_replay_live": [
         sys.executable,
@@ -977,6 +1001,7 @@ def status_badge(status: str) -> dict[str, str]:
         "AUCTION_OBSERVATION_READY",
         "DEMO_AUCTION_OBSERVATION",
         "NEWS_BRIEFING_READY",
+        "SHADOW_SIMULATION_READY",
     }:
         tone = "green"
     elif upper in {"MISSING", "UNKNOWN", "NO_OPEN_POSITION"}:
@@ -990,7 +1015,17 @@ def status_badge(status: str) -> dict[str, str]:
         or "OUTSIDE" in upper
         or "NO_TRADE" in upper
         or "NO_WATCHLIST" in upper
-        or upper in {"INTRADAY_WATCH_ONLY", "INTRADAY_NO_SIGNAL", "NO_INTRADAY_CANDIDATES", "MARKET_BLOCKED"}
+        or upper
+        in {
+            "INTRADAY_WATCH_ONLY",
+            "INTRADAY_NO_SIGNAL",
+            "NO_INTRADAY_CANDIDATES",
+            "MARKET_BLOCKED",
+            "POINT_IN_TIME_DATA_UNAVAILABLE",
+            "POINT_IN_TIME_DATA_INCOMPLETE",
+            "NO_DATA_SOURCE",
+            "NO_VALID_RECORDS",
+        }
     ):
         tone = "yellow"
     else:
@@ -1000,8 +1035,8 @@ def status_badge(status: str) -> dict[str, str]:
 
 def premium_tab_labels(language: str) -> list[str]:
     if language == "en":
-        return ["Today", "News", "Auction", "Intraday", "Tail Strategy", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
-    return ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘策略", "盘后观察池", "持仓/卖出计划", "审计与维护"]
+        return ["Today", "News", "Auction", "Intraday", "Close Confirmation", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
+    return ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘确认（影子）", "盘后观察池", "持仓/卖出计划", "审计与维护"]
 
 
 def primary_action_keys() -> list[str]:
@@ -1055,14 +1090,25 @@ def localize_table_value(field: str, value: Any, language: str) -> Any:
     if field_name == "side":
         return SIDE_LABELS_ZH.get(str(value).upper(), str(value))
     if field_name == "status":
-        return POSITION_STATUS_LABELS_ZH.get(str(value).upper(), str(value))
+        upper_value = str(value).upper()
+        return SYSTEM_STATUS_LABELS_ZH.get(
+            upper_value,
+            POSITION_STATUS_LABELS_ZH.get(upper_value, str(value)),
+        )
     if field_name in {"decision", "final_advice"}:
         return DECISION_LABELS_ZH.get(str(value), str(value))
     if field_name == "chip_peak_type":
         return CHIP_PEAK_LABELS_ZH.get(str(value), str(value))
     if field_name == "volume_signal":
         return VOLUME_SIGNAL_LABELS_ZH.get(str(value), str(value))
-    if field_name in {"estimated_capital_flow", "is_trade_day", "fallback_to_demo", "valid_for_trading_observation"}:
+    if field_name in {
+        "estimated_capital_flow",
+        "is_trade_day",
+        "fallback_to_demo",
+        "valid_for_trading_observation",
+        "execution_ok",
+        "data_ready",
+    }:
         return VALUE_LABELS_ZH.get(str(value), str(value))
     if field_name in {
         "risk_flags",
@@ -1339,17 +1385,6 @@ def run_dashboard_action(
     now: datetime | None = None,
     timeout: int = 180,
 ) -> dict[str, Any]:
-    if action == "formal_live_scan":
-        session_state = get_session_state(now)
-        if session_state != TAIL_SESSION:
-            return {
-                "ok": False,
-                "command_ran": False,
-                "action": action,
-                "error": "FORMAL_LIVE_OUTSIDE_TAIL_SESSION",
-                "session_state": session_state,
-                "message": formal_live_block_message(language, session_state),
-            }
     result = run_approved_action(action, timeout=timeout)
     return action_feedback(action, result, language)
 
@@ -1394,7 +1429,7 @@ def _action_success_message(action: str, language: str) -> str:
             "news_live": "News briefing completed. The latest briefing is displayed below and in the News tab.",
             "intraday_live": "Intraday VWAP observation completed. Review the intraday signals below.",
             "live_dry_run": "Live Dry-run completed. Review Tail candidates, rejection audit, and live data quality below.",
-            "formal_live_scan": "Formal Live scan completed. If a manual ticket was generated, the buy review details are shown below.",
+            "formal_live_scan": "Shadow close-confirmation research completed. It did not generate a formal signal or ticket.",
             "after_close_live": "After-close analysis completed. Review the watchlist section below.",
             "morning_replay_live": "Morning replay completed. Review the replay watchlist below.",
             "sell_plan_live": "Sell plan completed. Review the sell-plan section below.",
@@ -1409,7 +1444,7 @@ def _action_success_message(action: str, language: str) -> str:
             "preflight": "盘前检查已完成，最新状态已在下方展示。",
             "news_live": "盘前消息面已生成，最新正文已显示在下方和“消息面”页签中。",
             "live_dry_run": "Live Dry-run 已完成。请查看下方尾盘候选、拒绝审计和数据质量。",
-            "formal_live_scan": "正式 Live 已执行。如生成了人工买入票据，买入核对信息已在下方展示。",
+            "formal_live_scan": "行业共振尾盘确认影子研究已完成，不生成正式信号或票据。",
             "after_close_live": "盘后观察池已生成，请查看下方观察池区域。",
             "morning_replay_live": "早盘 Replay 已完成，请查看下方 Replay 观察池。",
             "sell_plan_live": "卖出计划已生成，请查看下方卖出计划区域。",
@@ -1430,6 +1465,13 @@ def _action_failure_message(action: str, result: dict[str, Any], language: str) 
 
 def _action_success_warning_message(action: str, result: dict[str, Any], language: str) -> str:
     status = _command_output_field(result.get("stdout", ""), "Status")
+    data_ready = result.get("data_ready")
+    if data_ready is None:
+        data_ready = _command_output_bool(result.get("stdout", ""), "data_ready")
+    if action == "formal_live_scan" and data_ready is False:
+        if language == "en":
+            return "Close-confirmation execution completed, but point-in-time data is not ready. No shadow candidates or tickets were generated."
+        return "行业共振尾盘确认程序已完成，但时点数据未就绪；未生成影子候选或票据。"
     if action in {"news_live", "demo_news"} and status in {"NEWS_BRIEFING_DEGRADED", "NEWS_BRIEFING_PARTIAL"}:
         if language == "en":
             return "News briefing was generated, but some data sources were unavailable. Available content and source errors are displayed below."
@@ -1480,6 +1522,15 @@ def _command_output_field(stdout: str, label: str) -> str:
     return ""
 
 
+def _command_output_bool(stdout: str, label: str) -> bool | None:
+    value = _command_output_field(stdout, label).lower()
+    if value in {"true", "yes", "1"}:
+        return True
+    if value in {"false", "no", "0"}:
+        return False
+    return None
+
+
 def run_approved_action(action: str, timeout: int = 180) -> dict[str, Any]:
     if action not in APPROVED_ACTIONS:
         return {"ok": False, "error": "ACTION_NOT_APPROVED", "action": action}
@@ -1496,6 +1547,8 @@ def run_approved_action(action: str, timeout: int = 180) -> dict[str, Any]:
         return {"ok": False, "error": "ACTION_TIMEOUT", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
     return {
         "ok": completed.returncode == 0,
+        "execution_ok": _command_output_bool(completed.stdout, "execution_ok"),
+        "data_ready": _command_output_bool(completed.stdout, "data_ready"),
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
@@ -1652,6 +1705,7 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
 
     preflight_path = find_latest_file("preflight_*.md", reports)
     dry_run_path = find_latest_file("dry_run_scan_*.md", reports)
+    close_confirmation_path = find_latest_file("close_confirmation_shadow_*.md", reports)
     intraday_path = find_latest_file("intraday_observation_*.md", reports)
     auction_path = find_latest_file("auction_observation_*.md", reports)
     news_path = find_latest_file("news_briefing_*.md", reports)
@@ -1685,6 +1739,9 @@ def load_dashboard_state(mode: str = DEFAULT_MODE, root: Path | None = None) -> 
         "news_briefing": parse_news_briefing_report(news_path or reports / "news_briefing_missing.md"),
         "news_briefing_sections": parse_news_briefing_sections(news_path or reports / "news_briefing_missing.md"),
         "dry_run": parse_dry_run_report(dry_run_path or reports / "dry_run_missing.md"),
+        "close_confirmation": parse_key_value_md(
+            close_confirmation_path or reports / "close_confirmation_shadow_missing.md"
+        ),
         "quality": parse_live_quality_report(quality_path or reports / "quality_missing.md"),
         "after_close": parse_after_close_report(after_close_path or reports / "after_close_missing.md"),
         "morning_replay": parse_after_close_report(replay_path or reports / "morning_replay_missing.md"),
@@ -1917,25 +1974,26 @@ def main() -> None:
         _render_report_section(st, "盘中攻防" if language == "zh" else "Intraday Attack / Defence", state["intraday"], language, "intraday")
         render_table_or_empty(st, state["intraday_signals"], language, t(language, "empty_table"))
     with tabs[4]:
-        st.caption("原尾盘策略窗口：交易日 14:25-14:55。" if language == "zh" else "Existing tail strategy window: trading days 14:25-14:55.")
-        _render_report_section(st, "尾盘策略审计" if language == "zh" else "Tail Strategy Audit", state["dry_run"], language, "dry_run")
-        st.markdown("#### 正式 Live 买入核对信息" if language == "zh" else "#### Formal Live Buy Review")
-        plan_rows = formal_live_buy_plan_rows(state, language)
-        if plan_rows:
-            render_key_value_rows(st, plan_rows, language)
-        else:
-            st.caption("暂无正式 Live 人工买入票据。" if language == "zh" else "No formal Live manual ticket is available.")
-        _render_guidance(st, tail_usage_guidance(state, language))
-        observable, legacy_rejected = split_tail_signal_rows(state["signals"])
-        raw_rejected = state["signal_rejections"] if not state["signal_rejections"].empty else legacy_rejected
-        rejected, hard_excluded = split_tail_rejection_rows(raw_rejected)
-        st.markdown("#### 尾盘可观察候选" if language == "zh" else "#### Tail Observable Candidates")
-        render_table_or_empty(st, observable, language, t(language, "empty_table"))
-        st.markdown("#### 风险排除 / 不观察" if language == "zh" else "#### Risk Exclusions / Do Not Observe")
-        render_table_or_empty(st, rejected, language, t(language, "empty_table"))
-        if not hard_excluded.empty:
-            with st.expander("基础硬排除审计" if language == "zh" else "Base Hard-Exclusion Audit"):
-                render_table_or_empty(st, hard_excluded, language, t(language, "empty_table"))
+        st.warning(
+            "策略研发/影子模拟中：当前不生成正式信号或票据。"
+            if language == "zh"
+            else "Research / shadow simulation: no formal signal or ticket is generated."
+        )
+        _render_report_section(
+            st,
+            "行业共振尾盘确认" if language == "zh" else "Close Confirmation",
+            state["close_confirmation"],
+            language,
+            "close_confirmation",
+        )
+        with st.expander("旧策略冻结基线审计" if language == "zh" else "Frozen Legacy Baseline Audit"):
+            _render_report_section(
+                st,
+                "旧策略 Dry-run" if language == "zh" else "Legacy Dry-run",
+                state["dry_run"],
+                language,
+                "dry_run",
+            )
     with tabs[5]:
         st.caption("盘后观察池使用独立盘后分析策略，交易日 14:50 起可运行。" if language == "zh" else "The separate after-close analysis is available from 14:50 on trading days.")
         _render_report_section(st, "盘后观察池" if language == "zh" else "After-Close Watchlist", state["after_close"], language, "after_close")
@@ -1984,13 +2042,13 @@ def _render_top_status_bar(st, state: dict[str, Any], language: str) -> None:
     news = state.get("news_briefing", {})
     auction = state.get("auction", {})
     intraday = state.get("intraday", {})
-    tail = state.get("dry_run", {})
+    tail = state.get("close_confirmation", {})
     after_close = state.get("after_close", {})
     items = [
         ("mode", t(language, "mode"), hero_conclusion(state, language)["mode_label"]),
         ("status", "消息面" if language == "zh" else "News", news.get("status", "MISSING")),
         ("status", "集合竞价" if language == "zh" else "Auction", auction.get("market_auction_bias", auction.get("status", "MISSING"))),
-        ("status", "盘中/尾盘策略" if language == "zh" else "Intraday / Tail", f"{intraday.get('status', 'MISSING')} / {tail.get('status', 'MISSING')}"),
+        ("status", "盘中/尾盘确认" if language == "zh" else "Intraday / Close", f"{intraday.get('status', 'MISSING')} / {tail.get('status', 'MISSING')}"),
         ("status", "盘后观察池" if language == "zh" else "After Close", after_close.get("status", "MISSING")),
     ]
     cells = []
@@ -2057,9 +2115,9 @@ def _render_overview(st, state: dict[str, Any], language: str) -> None:
     )
     render_status_card(
         second_row[0],
-        "尾盘策略" if language == "zh" else "Tail Strategy",
-        state["dry_run"].get("status", "MISSING"),
-        status_badge(state["dry_run"].get("status", "MISSING"))["tone"],
+        "尾盘确认（影子）" if language == "zh" else "Close Confirmation",
+        localize_table_value("status", state["close_confirmation"].get("status", "MISSING"), language),
+        status_badge(state["close_confirmation"].get("status", "MISSING"))["tone"],
     )
     render_status_card(
         second_row[1],
@@ -2075,7 +2133,8 @@ def _render_overview(st, state: dict[str, Any], language: str) -> None:
 def _render_report_section(st, title: str, data: dict[str, Any], language: str, section_key: str) -> None:
     primary_value = data.get("status") or data.get("final_advice") or data.get("candidate_source") or "MISSING"
     badge = status_badge(primary_value)
-    render_status_card(st, title, badge["status"], badge["tone"], t(language, "result_summary"))
+    display_status = localize_table_value("status", badge["status"], language)
+    render_status_card(st, title, display_status, badge["tone"], t(language, "result_summary"))
     rows = inline_result_rows(section_key, data, language)
     if rows:
         render_key_value_rows(st, rows, language)

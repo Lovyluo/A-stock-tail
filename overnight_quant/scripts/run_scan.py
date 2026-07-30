@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import logging
 import sys
 from pathlib import Path
@@ -24,8 +25,45 @@ def run_scan(
     client=None,
 ) -> dict:
     runtime_config = config_for_mode(config or load_config(), mode)
+    if mode == "live" and not dry_run:
+        return _legacy_formal_entry_disabled(runtime_config, trade_date)
     runtime_client = client or AStockClient(mode, allow_outside_session=allow_outside_session)
     return YangYongxingOvernightStrategy(runtime_client, runtime_config).scan(trade_date, dry_run=dry_run)
+
+
+def _legacy_formal_entry_disabled(config: dict, trade_date: str | None) -> dict:
+    day = trade_date or date.today().isoformat()
+    return {
+        "status": "LEGACY_FORMAL_ENTRY_DISABLED",
+        "strategy_name": "legacy_frozen_baseline",
+        "strategy_phase": "frozen",
+        "market_gate": {
+            "pass": False,
+            "reasons": [],
+            "reject_reasons": ["legacy_formal_entry_disabled"],
+        },
+        "candidate_count": 0,
+        "candidate_source": "disabled",
+        "live_candidate_count": 0,
+        "demo_candidate_count": 0,
+        "valid_for_trading_observation": False,
+        "scored": [],
+        "rejected": [],
+        "selected": [],
+        "dry_run_selected": [],
+        "tickets": [],
+        "orders": [],
+        "fallback_messages": [],
+        "signals_csv": "",
+        "signal_rejections_csv": "",
+        "quality_report_path": "",
+        "dry_run_report_path": "",
+        "scan_summary_path": "",
+        "trade_date": day,
+        "demo_field_count": 0,
+        "formal_signal_enabled": False,
+        "ticket_enabled": False,
+    }
 
 
 def main() -> int:

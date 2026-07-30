@@ -149,6 +149,8 @@ def write_preflight_report(result: dict, reports_dir: str, trade_date: str) -> s
         "# 项目通路检测",
         "",
         f"status: {result.get('status', '')}",
+        f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}",
+        f"data_ready: {str(bool(result.get('data_ready'))).lower()}",
         f"trade_date: {trade_date}",
         f"run_time: {result.get('run_time', '')}",
         f"session_state: {result.get('session_state', '')}",
@@ -164,7 +166,11 @@ def write_preflight_report(result: dict, reports_dir: str, trade_date: str) -> s
         "",
     ]
     for item in result.get("workflow_checks", []):
-        lines.append(f"- {item.get('name', '')}: {'OK' if item.get('ok') else 'FAIL'}, returncode={item.get('returncode', '')}, error={item.get('error', '')}")
+        lines.append(
+            f"- {item.get('name', '')}: {'OK' if item.get('execution_ok') else 'FAIL'}, "
+            f"data_ready={str(bool(item.get('data_ready'))).lower()}, "
+            f"returncode={item.get('returncode', '')}, error={item.get('error', '')}"
+        )
     parser_check = result.get("dashboard_parser") or {}
     lines.extend(["", "## Dashboard Parser", "", f"- status: {'OK' if parser_check.get('ok') else 'FAIL'}, parsed_reports={parser_check.get('parsed_reports', 0)}, error={parser_check.get('error', '')}", "", "## Optional Data Sources", ""])
     for item in result.get("sources", []):

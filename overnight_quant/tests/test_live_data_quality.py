@@ -97,7 +97,7 @@ def test_live_partial_data_does_not_crash_and_records_missing_fields(tmp_path, m
     assert client.quality_report.field_coverage["limit_up"]["missing"] == 1
 
 
-def test_live_total_failure_falls_back_to_demo(monkeypatch):
+def test_live_total_failure_returns_no_candidates_without_demo_fallback(monkeypatch):
     client = AStockClient("live")
 
     def fail_source():
@@ -107,9 +107,13 @@ def test_live_total_failure_falls_back_to_demo(monkeypatch):
 
     rows = client.get_candidate_quotes()
 
-    assert rows == demo_quotes()
-    assert client.quality_report.fallback_to_demo is True
-    assert any("fallback to demo" in message for message in client.fallback_messages)
+    assert rows == []
+    assert client.quality_report.fallback_to_demo is False
+    assert client.fallback_messages == []
+    assert any(
+        item["source"] == "live_candidate_quotes" and item["ok"] is False
+        for item in client.quality_report.source_status
+    )
 
 
 def test_after_close_universe_filters_to_00_and_60_before_enrichment(tmp_path, monkeypatch):
@@ -847,7 +851,9 @@ def test_quality_report_file_is_generated(tmp_path, monkeypatch):
     report_path = Path(result["quality_report_path"])
     assert report_path.exists()
     assert report_path.name == "live_data_quality_2026-05-23.md"
-    assert "Fallback to demo: YES" in report_path.read_text(encoding="utf-8")
+    report_text = report_path.read_text(encoding="utf-8")
+    assert "Fallback to demo: NO" in report_text
+    assert "live_candidate_quotes: FAIL" in report_text
 
 
 def test_source_map_and_missing_fields_are_populated():

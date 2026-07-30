@@ -190,7 +190,15 @@ def _patched_live_client(monkeypatch, now, cache_dir):
     monkeypatch.setattr(client, "_eastmoney_fund_flow_minute", lambda code: [{"main_net": 1000, "large_net": 500}])
     monkeypatch.setattr(client, "_baidu_daily_kline", lambda code, lookback: [_daily_bar(now.date().isoformat())])
     monkeypatch.setattr(client, "_hsgt_realtime", lambda: [{"time": "14:30", "hgt_yi": 5, "sgt_yi": 4}])
+    monkeypatch.setattr(client, "get_market_snapshot", lambda: _live_market_snapshot(client))
     return client
+
+
+def _live_market_snapshot(client):
+    market = demo_market_snapshot()
+    market["source"] = "unit.live"
+    client._apply_session_context(market)
+    return market
 
 
 def _daily_bar(data_date):
