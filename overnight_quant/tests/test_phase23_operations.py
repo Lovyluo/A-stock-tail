@@ -80,7 +80,7 @@ def test_signal_csv_files_are_excel_friendly_utf8_sig(tmp_path, monkeypatch):
     assert Path(result["signal_rejections_csv"]).read_bytes().startswith(b"\xef\xbb\xbf")
 
 
-def test_dry_run_report_labels_demo_fallback_candidates_as_not_valid_for_observation(tmp_path, monkeypatch):
+def test_dry_run_report_does_not_inject_demo_candidates_when_live_sources_fail(tmp_path, monkeypatch):
     config = _tmp_config(tmp_path)
     client = _patched_client(monkeypatch, tmp_path, datetime(2026, 5, 22, 14, 30, tzinfo=CN))
     monkeypatch.setattr(client, "_fetch_live_candidate_seeds", lambda: [])
@@ -89,10 +89,10 @@ def test_dry_run_report_labels_demo_fallback_candidates_as_not_valid_for_observa
 
     text = Path(result["dry_run_report_path"]).read_text(encoding="utf-8")
     assert result["tickets"] == []
-    assert "candidate_source: demo_fallback" in text
+    assert "candidate_source: live" in text
     assert "live_candidate_count: 0" in text
-    assert "demo_candidate_count: 9" in text
-    assert "valid_for_trading_observation: NO" in text
+    assert "demo_candidate_count: 0" in text
+    assert "DATA_FALLBACK_DEMO" not in text
 
 
 def test_dry_run_report_labels_live_candidates_as_valid_for_observation(tmp_path, monkeypatch):
@@ -252,7 +252,17 @@ def _patched_client(monkeypatch, tmp_path, now):
     monkeypatch.setattr(client, "_eastmoney_fund_flow_daily", lambda code: [])
     monkeypatch.setattr(client, "_baidu_daily_kline", lambda code, lookback: [_daily_bar(now.date().isoformat())])
     monkeypatch.setattr(client, "_hsgt_realtime", lambda: [{"time": "14:30", "hgt_yi": 5, "sgt_yi": 4}])
+    monkeypatch.setattr(client, "get_market_snapshot", lambda: _live_market_snapshot(client))
     return client
+
+
+def _live_market_snapshot(client):
+    from overnight_quant.data.demo_data import demo_market_snapshot
+
+    market = demo_market_snapshot()
+    market["source"] = "unit.live"
+    client._apply_session_context(market)
+    return market
 
 
 def _live_good_quote(now):

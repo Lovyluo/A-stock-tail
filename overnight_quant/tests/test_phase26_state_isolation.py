@@ -21,14 +21,18 @@ def test_demo_scan_writes_examples_and_not_real(tmp_path):
     assert not (tmp_path / "real" / "reports").exists()
 
 
-def test_live_scan_writes_real_and_not_examples(tmp_path):
+def test_live_legacy_scan_is_frozen_without_writing_outputs(tmp_path):
     config = _tmp_config(tmp_path)
     client = AStockClient("demo")
 
     result = run_scan(mode="live", trade_date="2026-05-26", config=config, client=client)
 
-    assert Path(result["signals_csv"]).parent == tmp_path / "real" / "records"
-    assert Path(result["tickets"][0]).parent == tmp_path / "real" / "reports"
+    assert result["status"] == "LEGACY_FORMAL_ENTRY_DISABLED"
+    assert result["strategy_name"] == "legacy_frozen_baseline"
+    assert result["selected"] == []
+    assert result["tickets"] == []
+    assert result["demo_field_count"] == 0
+    assert not (tmp_path / "real").exists()
     assert not (tmp_path / "examples").exists()
 
 

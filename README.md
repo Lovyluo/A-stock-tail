@@ -9,7 +9,7 @@ A-stock-tail is a personal A-share research workspace built around two pieces:
 1. **Data Skill**: `SKILL.md` provides the A-share data-source capability.
 2. **Overnight Quant Dashboard**: `overnight_quant/` is an example application for after-close, pre-market, intraday, and sell-plan observation workflows.
 
-The project is designed for manual research, observation, and review. It does **not** place orders automatically, does **not** click brokerage software, and does **not** call any brokerage trading API.
+The project is designed for manual research, observation, and review. It has no real-market execution integration and does not operate brokerage software.
 
 Read the risk boundary before using the project: [DISCLAIMER.md](DISCLAIMER.md).
 
@@ -20,6 +20,7 @@ This repository packages a data Skill together with an overnight observation exa
 - `SKILL.md`: A-share data capability source, adapted from the upstream `a-stock-data` project.
 - `overnight_quant/`: Example app and scripts for watchlists, scans, backtests, dashboard views, position updates, and manual sell-plan reminders.
 - `overnight_quant/strategy/chip_volume.py`: Chip and volume confidence proxy indicators for observation reports. These are not real holder-cost data and are not trading advice.
+- `overnight_quant/strategy/close_confirmation_v1/`: v0.4 industry-resonance close-confirmation research strategy.
 - `docs/`, `DEPLOY.md`, and `overnight_quant_实盘使用手册.md`: Operational notes for local deployment and manual use.
 - `a-stock-data/`: Local upstream clone only. It is ignored by Git and is not part of the final `A-stock-tail` GitHub repository.
 
@@ -35,8 +36,8 @@ A-stock-tail only generates observation materials:
 
 It does not:
 
-- auto-submit orders
-- operate brokerage clients
+- submit real orders
+- operate brokerage clients or trading pages
 - scrape or control brokerage trading pages
 - call brokerage trading APIs
 - provide guaranteed investment returns
@@ -76,13 +77,32 @@ Run the full local test suite before changing or releasing the project:
 D:\A-stock\.venv\Scripts\python.exe -m pytest overnight_quant/tests -q
 ```
 
-Expected result after the chip/volume proxy module:
-
-```text
-337 passed
-```
-
 GitHub Actions runs the same test command on Windows with Python 3.12.
+
+## v0.4 Research Status
+
+The former `yang_yongxing_overnight_v1` entry is preserved as
+`legacy_frozen_baseline`. It is no longer a formal signal or ticket entry.
+
+`close_confirmation_v1` is currently **research / shadow simulation only**:
+
+- freezes point-in-time data at 14:50;
+- scores market, industry, relative strength, price/volume, sourced catalysts, and chip proxies;
+- starts event fills at 14:51 and cancels remaining quantity at 14:56;
+- applies partial fills, date-aware price limits, suspension, T+1, slippage, impact, and 100-share lots;
+- never substitutes daily close data for missing minute data;
+- never uses demo fallback fields in live, shadow, paper, or replay results.
+
+The historical and shadow acceptance thresholds have not yet been met because the required
+point-in-time dataset and observation period are not yet available. No production claim should
+be made until all gates in
+[the strategy design](overnight_quant/docs/phase7_0_close_confirmation_strategy_design.md)
+pass.
+
+See also:
+
+- [Point-in-time data dictionary](overnight_quant/docs/phase7_0_point_in_time_data_dictionary.md)
+- [v0.4 safety boundary](overnight_quant/docs/phase7_0_safety_boundary.md)
 
 ## Common Commands
 
@@ -92,6 +112,12 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_after_close_anal
 
 # Tail scan dry-run
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_scan.py --mode demo --dry-run
+
+# Freeze point-in-time records at 14:50
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --input snapshot_records.json --freeze --trade-date 2026-07-30
+
+# Run the new strategy in shadow mode
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_confirmation.py --mode shadow --date 2026-07-30
 
 # Sell plan
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_sell_plan.py --mode live

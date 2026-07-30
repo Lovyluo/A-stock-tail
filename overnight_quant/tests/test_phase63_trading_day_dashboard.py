@@ -15,7 +15,7 @@ def test_live_dry_run_and_health_check_are_not_primary_actions():
 
 def test_dashboard_tabs_match_trading_day_workflow():
     labels = premium_tab_labels("zh")
-    assert labels == ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘策略", "盘后观察池", "持仓/卖出计划", "审计与维护"]
+    assert labels == ["今日总览", "消息面", "集合竞价", "盘中攻防", "尾盘确认（影子）", "盘后观察池", "持仓/卖出计划", "审计与维护"]
 
 
 def test_workbench_does_not_contain_forbidden_execution_capabilities():

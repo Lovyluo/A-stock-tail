@@ -160,7 +160,7 @@ def test_action_labels_are_localized_and_demo_is_marked_as_demo():
     from overnight_quant.ui.dashboard import action_label
 
     assert action_label("zh", "live_dry_run") == "Live Dry-run"
-    assert action_label("zh", "formal_live_scan") == "尾盘策略"
+    assert action_label("zh", "formal_live_scan") == "行业共振尾盘确认（影子）"
     assert "演示" in action_label("zh", "demo_scan")
     assert "Demo" in action_label("en", "demo_scan")
 
@@ -340,7 +340,7 @@ def test_premium_dashboard_css_has_dark_financial_terminal_theme():
 def test_premium_tabs_include_tail_and_sell_plan():
     from overnight_quant.ui.dashboard import premium_tab_labels
 
-    assert premium_tab_labels("en") == ["Today", "News", "Auction", "Intraday", "Tail Strategy", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
+    assert premium_tab_labels("en") == ["Today", "News", "Auction", "Intraday", "Close Confirmation", "After-Close Watchlist", "Positions / Sell Plan", "Audit / Maintenance"]
 
 
 def test_legacy_after_close_status_is_normalized_without_losing_audit_value(tmp_path):
@@ -522,13 +522,16 @@ def test_position_update_feedback_summarizes_rejection_reason():
     assert "sell_qty_exceeds_open_position" in feedback["message"]
 
 
-def test_formal_live_scan_blocks_outside_tail_without_running_command(monkeypatch):
+def test_close_confirmation_shadow_can_report_missing_snapshot_outside_old_tail_window(monkeypatch):
     from overnight_quant.ui.dashboard import run_dashboard_action
 
-    def fail_run(*args, **kwargs):
-        raise AssertionError("formal live should not run outside tail session")
+    captured = {}
 
-    monkeypatch.setattr(subprocess, "run", fail_run)
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return subprocess.CompletedProcess(args, 0, "Status: POINT_IN_TIME_DATA_UNAVAILABLE\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     result = run_dashboard_action(
         "formal_live_scan",
@@ -536,10 +539,9 @@ def test_formal_live_scan_blocks_outside_tail_without_running_command(monkeypatc
         now=datetime(2026, 6, 3, 16, 30, tzinfo=timezone(timedelta(hours=8))),
     )
 
-    assert result["ok"] is False
-    assert result["command_ran"] is False
-    assert result["error"] == "FORMAL_LIVE_OUTSIDE_TAIL_SESSION"
-    assert "当前不是尾盘窗口" in result["message"]
+    assert result["ok"] is True
+    assert result["command_ran"] is True
+    assert any("run_close_confirmation.py" in item for item in captured["args"])
 
 
 def test_formal_live_scan_runs_during_tail_with_shell_false(monkeypatch):
@@ -606,8 +608,8 @@ def test_dashboard_exposes_formal_live_without_dry_run_flag():
     from overnight_quant.ui.dashboard import APPROVED_ACTIONS
 
     command = " ".join(APPROVED_ACTIONS["formal_live_scan"])
-    assert "run_scan.py" in command
-    assert "--mode live" in command
+    assert "run_close_confirmation.py" in command
+    assert "--mode shadow" in command
     assert "--dry-run" not in command
 
 

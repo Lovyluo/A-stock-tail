@@ -93,7 +93,15 @@ class AStockClient:
         if self.data_context == DATA_CONTEXT_PREVIOUS_CLOSE_REPLAY:
             return self._replay_market_snapshot()
         try:
-            snapshot = demo_market_snapshot()
+            snapshot = {
+                "indices": {},
+                "northbound_net_yi": 0.0,
+                "tail_30m_stable": False,
+                "hot_theme_count": 0,
+                "limit_down_count": 0,
+                "data_status": "LIVE_PARTIAL",
+                "source": "live_market_sources",
+            }
             self._apply_session_context(snapshot)
             indices = self._tencent_quotes(["sh000001", "sh000300", "sz399006"])
             if indices:
@@ -111,7 +119,16 @@ class AStockClient:
             return snapshot
         except Exception as exc:
             self.quality_report.record_source("live_market_snapshot", False, 0, str(exc))
-            snapshot = self._fallback(f"market snapshot live failed, fallback to demo market: {type(exc).__name__}: {exc}", demo_market_snapshot)
+            snapshot = {
+                "indices": {},
+                "northbound_net_yi": 0.0,
+                "tail_30m_stable": False,
+                "hot_theme_count": 0,
+                "limit_down_count": 0,
+                "data_status": "LIVE_DATA_UNAVAILABLE",
+                "source": "live_market_sources",
+                "source_error": f"{type(exc).__name__}: {exc}",
+            }
             self._apply_session_context(snapshot)
             return snapshot
 
@@ -127,9 +144,10 @@ class AStockClient:
                 raise RuntimeError("empty live quote response")
             return live
         except Exception as exc:
-            message = f"live data failed, fallback to demo: {type(exc).__name__}: {exc}"
-            self.quality_report.mark_fallback(message)
-            return self._fallback(message, demo_quotes)
+            message = f"live candidate data unavailable: {type(exc).__name__}: {exc}"
+            self.quality_report.record_source("live_candidate_quotes", False, 0, message)
+            self.logger.warning(message)
+            return []
 
     def get_after_close_universe_quotes(self) -> list[dict]:
         if self.mode == "demo":
@@ -150,9 +168,10 @@ class AStockClient:
                 except Exception as secondary_exc:
                     raise RuntimeError(f"{primary_exc}; secondary fallback failed: {secondary_exc}") from secondary_exc
         except Exception as exc:
-            message = f"after-close universe live data failed, fallback to demo: {type(exc).__name__}: {exc}"
-            self.quality_report.mark_fallback(message)
-            return self._fallback(message, lambda: [row for row in demo_quotes() if self._is_allowed_after_close_code(row.get("code", ""))])
+            message = f"after-close universe live data unavailable: {type(exc).__name__}: {exc}"
+            self.quality_report.record_source("after_close_universe", False, 0, message)
+            self.logger.warning(message)
+            return []
 
     def _build_after_close_universe_from_seeds(self, source: str, seeds: list[dict]) -> list[dict]:
         self.after_close_candidate_source = source
@@ -227,7 +246,8 @@ class AStockClient:
                 freshness=freshness,
             )
             self._kline_freshness_reasons[normalized_code] = self._freshness_rejection_reasons(freshness)
-            self._note(f"live kline failed, using demo kline: {'; '.join(errors[:3])}")
+            self.logger.warning("live kline unavailable for %s: %s", normalized_code, "; ".join(errors[:3]))
+            return []
         return demo_daily_kline(code, lookback)
 
     def get_kline_freshness_reasons(self, code: str) -> list[str]:
@@ -291,7 +311,15 @@ class AStockClient:
                 "is_limit_down": quote.get("price", 0.0) <= quote.get("limit_down", -1),
             }
         except Exception as exc:
-            return self._fallback(f"live current price failed, fallback to demo: {type(exc).__name__}: {exc}", lambda: demo_current_price(code))
+            self.quality_report.record_source("live_current_quote", False, 0, f"{code}: {exc}")
+            self.logger.warning("live current price unavailable for %s: %s", code, exc)
+            return {
+                "code": str(code).zfill(6),
+                "name": "",
+                "price": 0.0,
+                "data_status": "LIVE_DATA_UNAVAILABLE",
+                "source_error": f"{type(exc).__name__}: {exc}",
+            }
 
     def get_intraday_bars(self, code: str) -> list[dict]:
         if self.mode == "demo":
@@ -324,21 +352,6 @@ class AStockClient:
         }
         self._save_list_date_cache(cache)
         return True
-
-    def _live_quotes_for_demo_universe(self) -> list[dict]:
-        demo_rows = demo_quotes()
-        by_code = {row["code"]: row for row in demo_rows}
-        live_quotes = self._tencent_quotes(list(by_code))
-        rows = []
-        for code, quote in live_quotes.items():
-            base = dict(by_code.get(code, {}))
-            if not base:
-                continue
-            base.update(quote)
-            rows.append(base)
-        if len(rows) < len(demo_rows):
-            raise RuntimeError(f"incomplete live quotes for MVP universe: {len(rows)}/{len(demo_rows)}")
-        return rows
 
     def _fetch_live_candidate_seeds(self) -> list[dict]:
         hot_candidates: list[dict] = []
@@ -2434,10 +2447,6 @@ class AStockClient:
             "is_stale": False,
             "stale_reason": "" if raw_time else "timestamp_missing",
         }
-
-    def _fallback(self, message: str, fn):
-        self._note(message)
-        return fn()
 
     def _note(self, message: str) -> None:
         self.fallback_messages.append(message)
