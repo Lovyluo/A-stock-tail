@@ -45,24 +45,38 @@ class PointInTimeProvider:
         )
         result = deepcopy(snapshot)
         result["decision_time"] = decision.isoformat()
+        accepted_records, rejected_records = records_available_at(
+            result.get("records") or [],
+            decision,
+            require_published_at_for_news=True,
+        )
+        result["records"] = accepted_records
+        result["rejected_records"] = list(result.get("rejected_records") or []) + rejected_records
         if not result.get("stocks") and result.get("records"):
             result.update(_materialize_records(result.get("records") or []))
         result["stocks"] = [
             self._stock_at_decision(stock, decision, require_minute_data=require_minute_data)
-            for stock in snapshot.get("stocks", [])
+            for stock in result.get("stocks", [])
         ]
         result["stocks"] = [stock for stock in result["stocks"] if stock is not None]
-        market_records, market_rejected = records_available_at(snapshot.get("market_records", []), decision)
-        industry_records, industry_rejected = records_available_at(snapshot.get("industry_records", []), decision)
+        if require_minute_data and not result["stocks"]:
+            raise PointInTimeDataError("NO_STOCKS_WITH_MINUTE_DATA")
+        market_records, market_rejected = records_available_at(result.get("market_records", []), decision)
+        industry_records, industry_rejected = records_available_at(result.get("industry_records", []), decision)
         news, news_rejected = records_available_at(
-            snapshot.get("news", []),
+            result.get("news", []),
             decision,
             require_published_at_for_news=True,
         )
         result["market_records"] = market_records
         result["industry_records"] = industry_records
         result["news"] = news
-        result["pit_rejected_records"] = market_rejected + industry_rejected + news_rejected
+        result["pit_rejected_records"] = (
+            list(result.get("rejected_records") or [])
+            + market_rejected
+            + industry_rejected
+            + news_rejected
+        )
         return result
 
     @staticmethod

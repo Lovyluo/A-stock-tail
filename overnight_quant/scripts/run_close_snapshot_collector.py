@@ -15,6 +15,38 @@ from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.snapshot_store import CloseWindowCollector, ImmutableSnapshotStore
 
 
+def run_snapshot_collection(
+    *,
+    input_path: str | Path | None = None,
+    trade_date: str | None = None,
+    snapshot_root: str | Path = "overnight_quant/data/cache/close_confirmation_snapshots",
+    freeze: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    current = now or datetime.now(CN_TZ)
+    records = []
+    if input_path:
+        try:
+            records = json.loads(Path(input_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "status": "NO_VALID_RECORDS",
+                "execution_ok": False,
+                "data_ready": False,
+                "records": [],
+                "input_error": f"{type(exc).__name__}: {exc}",
+            }
+        if isinstance(records, dict):
+            records = records.get("records") or []
+        if not isinstance(records, list):
+            records = []
+    providers = {"input_file": lambda observed_at: list(records)} if records else {}
+    collector = CloseWindowCollector(ImmutableSnapshotStore(snapshot_root), providers)
+    if freeze:
+        return collector.freeze(trade_date or current.date().isoformat(), records)
+    return collector.collect(current)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect and freeze point-in-time close-confirmation snapshots.")
     parser.add_argument("--input", help="JSON file containing point-in-time records.")
@@ -23,20 +55,18 @@ def main() -> int:
     parser.add_argument("--freeze", action="store_true")
     args = parser.parse_args()
 
-    now = datetime.now(CN_TZ)
-    records = json.loads(Path(args.input).read_text(encoding="utf-8")) if args.input else []
-    if isinstance(records, dict):
-        records = records.get("records") or []
-    providers = {"input_file": lambda observed_at: list(records)} if records else {}
-    collector = CloseWindowCollector(ImmutableSnapshotStore(args.snapshot_root), providers)
-    if args.freeze:
-        result = collector.freeze(args.trade_date or now.date().isoformat(), records)
-    else:
-        result = collector.collect(now)
+    result = run_snapshot_collection(
+        input_path=args.input,
+        trade_date=args.trade_date,
+        snapshot_root=args.snapshot_root,
+        freeze=args.freeze,
+    )
     print(f"Status: {result['status']}")
+    print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")
+    print(f"data_ready: {str(bool(result.get('data_ready'))).lower()}")
     if result.get("path"):
         print(f"Snapshot: {result['path']}")
-    return 0 if result["status"] in {"COLLECTED", "FROZEN_1450"} else 2
+    return 0 if result.get("execution_ok") and result.get("data_ready") else 2
 
 
 if __name__ == "__main__":

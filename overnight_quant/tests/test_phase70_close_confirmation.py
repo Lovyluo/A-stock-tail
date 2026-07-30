@@ -172,9 +172,10 @@ def test_1440_to_1450_collector_persists_input_and_freeze_excludes_late_records(
     )
 
     collected = collector.collect(datetime.fromisoformat("2026-07-30T14:45:00+08:00"))
-    frozen = collector.freeze("2026-07-30", collected["records"])
+    frozen = collector.freeze("2026-07-30", [on_time, late])
 
-    assert len(collected["records"]) == 2
+    assert len(collected["records"]) == 1
+    assert len(collected["rejected_records"]) == 1
     assert frozen["record_count"] == 1
     assert frozen["rejected_count"] == 1
     assert frozen["rejected_records"][0]["pit_reject_reason"] == "event_after_decision"

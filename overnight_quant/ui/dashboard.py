@@ -106,6 +106,8 @@ TEXT = {
 
 FIELD_LABELS = {
     "zh": {
+        "execution_ok": "程序执行成功",
+        "data_ready": "数据就绪",
         "status": "状态",
         "trade_date": "交易日期",
         "run_time": "运行时间",
@@ -134,6 +136,8 @@ FIELD_LABELS = {
         "path": "文件路径",
     },
     "en": {
+        "execution_ok": "Execution OK",
+        "data_ready": "Data Ready",
         "status": "Status",
         "trade_date": "Trade Date",
         "run_time": "Run Time",
@@ -341,6 +345,12 @@ POSITION_STATUS_LABELS_ZH = {
     "FILLED": "已记录",
 }
 
+SYSTEM_STATUS_LABELS_ZH = {
+    "POINT_IN_TIME_DATA_UNAVAILABLE": "数据未就绪",
+    "NO_DATA_SOURCE": "数据源未配置",
+    "NO_VALID_RECORDS": "无有效时点数据",
+}
+
 REASON_LABELS_ZH = {
     "prev_day_high_volume": "前一交易日阶段高量",
     "today_volume_confirm": "当日放量确认",
@@ -526,6 +536,8 @@ INLINE_SECTION_FIELDS = {
     ],
     "close_confirmation": [
         "status",
+        "execution_ok",
+        "data_ready",
         "strategy_name",
         "strategy_phase",
         "decision_time",
@@ -1002,7 +1014,16 @@ def status_badge(status: str) -> dict[str, str]:
         or "OUTSIDE" in upper
         or "NO_TRADE" in upper
         or "NO_WATCHLIST" in upper
-        or upper in {"INTRADAY_WATCH_ONLY", "INTRADAY_NO_SIGNAL", "NO_INTRADAY_CANDIDATES", "MARKET_BLOCKED"}
+        or upper
+        in {
+            "INTRADAY_WATCH_ONLY",
+            "INTRADAY_NO_SIGNAL",
+            "NO_INTRADAY_CANDIDATES",
+            "MARKET_BLOCKED",
+            "POINT_IN_TIME_DATA_UNAVAILABLE",
+            "NO_DATA_SOURCE",
+            "NO_VALID_RECORDS",
+        }
     ):
         tone = "yellow"
     else:
@@ -1067,14 +1088,25 @@ def localize_table_value(field: str, value: Any, language: str) -> Any:
     if field_name == "side":
         return SIDE_LABELS_ZH.get(str(value).upper(), str(value))
     if field_name == "status":
-        return POSITION_STATUS_LABELS_ZH.get(str(value).upper(), str(value))
+        upper_value = str(value).upper()
+        return SYSTEM_STATUS_LABELS_ZH.get(
+            upper_value,
+            POSITION_STATUS_LABELS_ZH.get(upper_value, str(value)),
+        )
     if field_name in {"decision", "final_advice"}:
         return DECISION_LABELS_ZH.get(str(value), str(value))
     if field_name == "chip_peak_type":
         return CHIP_PEAK_LABELS_ZH.get(str(value), str(value))
     if field_name == "volume_signal":
         return VOLUME_SIGNAL_LABELS_ZH.get(str(value), str(value))
-    if field_name in {"estimated_capital_flow", "is_trade_day", "fallback_to_demo", "valid_for_trading_observation"}:
+    if field_name in {
+        "estimated_capital_flow",
+        "is_trade_day",
+        "fallback_to_demo",
+        "valid_for_trading_observation",
+        "execution_ok",
+        "data_ready",
+    }:
         return VALUE_LABELS_ZH.get(str(value), str(value))
     if field_name in {
         "risk_flags",
@@ -1431,6 +1463,13 @@ def _action_failure_message(action: str, result: dict[str, Any], language: str) 
 
 def _action_success_warning_message(action: str, result: dict[str, Any], language: str) -> str:
     status = _command_output_field(result.get("stdout", ""), "Status")
+    data_ready = result.get("data_ready")
+    if data_ready is None:
+        data_ready = _command_output_bool(result.get("stdout", ""), "data_ready")
+    if action == "formal_live_scan" and data_ready is False:
+        if language == "en":
+            return "Close-confirmation execution completed, but point-in-time data is not ready. No shadow candidates or tickets were generated."
+        return "行业共振尾盘确认程序已完成，但时点数据未就绪；未生成影子候选或票据。"
     if action in {"news_live", "demo_news"} and status in {"NEWS_BRIEFING_DEGRADED", "NEWS_BRIEFING_PARTIAL"}:
         if language == "en":
             return "News briefing was generated, but some data sources were unavailable. Available content and source errors are displayed below."
@@ -1481,6 +1520,15 @@ def _command_output_field(stdout: str, label: str) -> str:
     return ""
 
 
+def _command_output_bool(stdout: str, label: str) -> bool | None:
+    value = _command_output_field(stdout, label).lower()
+    if value in {"true", "yes", "1"}:
+        return True
+    if value in {"false", "no", "0"}:
+        return False
+    return None
+
+
 def run_approved_action(action: str, timeout: int = 180) -> dict[str, Any]:
     if action not in APPROVED_ACTIONS:
         return {"ok": False, "error": "ACTION_NOT_APPROVED", "action": action}
@@ -1497,6 +1545,8 @@ def run_approved_action(action: str, timeout: int = 180) -> dict[str, Any]:
         return {"ok": False, "error": "ACTION_TIMEOUT", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
     return {
         "ok": completed.returncode == 0,
+        "execution_ok": _command_output_bool(completed.stdout, "execution_ok"),
+        "data_ready": _command_output_bool(completed.stdout, "data_ready"),
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
@@ -2064,7 +2114,7 @@ def _render_overview(st, state: dict[str, Any], language: str) -> None:
     render_status_card(
         second_row[0],
         "尾盘确认（影子）" if language == "zh" else "Close Confirmation",
-        state["close_confirmation"].get("status", "MISSING"),
+        localize_table_value("status", state["close_confirmation"].get("status", "MISSING"), language),
         status_badge(state["close_confirmation"].get("status", "MISSING"))["tone"],
     )
     render_status_card(
@@ -2081,7 +2131,8 @@ def _render_overview(st, state: dict[str, Any], language: str) -> None:
 def _render_report_section(st, title: str, data: dict[str, Any], language: str, section_key: str) -> None:
     primary_value = data.get("status") or data.get("final_advice") or data.get("candidate_source") or "MISSING"
     badge = status_badge(primary_value)
-    render_status_card(st, title, badge["status"], badge["tone"], t(language, "result_summary"))
+    display_status = localize_table_value("status", badge["status"], language)
+    render_status_card(st, title, display_status, badge["tone"], t(language, "result_summary"))
     rows = inline_result_rows(section_key, data, language)
     if rows:
         render_key_value_rows(st, rows, language)

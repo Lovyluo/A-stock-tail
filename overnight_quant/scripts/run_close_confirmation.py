@@ -47,6 +47,8 @@ def run_close_confirmation(
             snapshot,
             mode=mode,
         )
+        result["execution_ok"] = True
+        result["data_ready"] = True
     except (FileNotFoundError, PointInTimeDataError, ValueError) as exc:
         result = enforce_formal_no_demo(
             {
@@ -62,6 +64,8 @@ def run_close_confirmation(
                 "orders": [],
                 "formal_signal_enabled": False,
                 "ticket_enabled": False,
+                "execution_ok": True,
+                "data_ready": False,
                 "data_error": f"{type(exc).__name__}: {exc}",
             },
             mode,
@@ -83,6 +87,8 @@ def main() -> int:
     )
     print("[Close Confirmation Shadow]")
     print(f"Status: {result['status']}")
+    print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")
+    print(f"data_ready: {str(bool(result.get('data_ready'))).lower()}")
     print(f"Strategy Phase: {result['strategy_phase']}")
     print(f"Decision Time: {result['decision_time']}")
     print(f"Demo Field Count: {result['demo_field_count']}")
@@ -90,7 +96,7 @@ def main() -> int:
     print(f"Formal Signal Enabled: {result['formal_signal_enabled']}")
     print(f"Ticket Enabled: {result['ticket_enabled']}")
     print(f"Report: {result['report_path']}")
-    return 0
+    return 0 if result.get("execution_ok") else 2
 
 
 if __name__ == "__main__":

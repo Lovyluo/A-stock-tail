@@ -62,8 +62,19 @@ class CloseWindowCollector:
         if not (COLLECTION_START <= current.time() <= FREEZE_TIME):
             return {
                 "status": "NOT_COLLECTION_WINDOW",
+                "execution_ok": True,
+                "data_ready": False,
                 "observed_at": current.isoformat(timespec="seconds"),
                 "records": [],
+            }
+        if not self.providers:
+            return {
+                "status": "NO_DATA_SOURCE",
+                "execution_ok": True,
+                "data_ready": False,
+                "observed_at": current.isoformat(timespec="seconds"),
+                "records": [],
+                "errors": [],
             }
         records: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
@@ -72,12 +83,26 @@ class CloseWindowCollector:
                 records.extend(dict(item) for item in provider(current))
             except Exception as exc:
                 errors.append({"source": source, "error": f"{type(exc).__name__}: {exc}"})
+        accepted, rejected = records_available_at(records, current)
+        if not accepted:
+            return {
+                "status": "NO_VALID_RECORDS",
+                "execution_ok": True,
+                "data_ready": False,
+                "observed_at": current.isoformat(timespec="seconds"),
+                "records": [],
+                "rejected_records": rejected,
+                "errors": errors,
+            }
         snapshot = {
             "status": "COLLECTED",
+            "execution_ok": True,
+            "data_ready": True,
             "observed_at": current.isoformat(timespec="seconds"),
-            "records": records,
+            "records": accepted,
+            "rejected_records": rejected,
             "errors": errors,
-            "raw_hash": stable_hash(records),
+            "raw_hash": stable_hash(accepted),
         }
         snapshot_id = current.strftime("%Y%m%d_%H%M%S")
         snapshot["path"] = str(self.store.write_once("collection", snapshot_id, snapshot))
@@ -87,8 +112,22 @@ class CloseWindowCollector:
         day = date.fromisoformat(str(trade_date)) if not isinstance(trade_date, date) else trade_date
         decision_time = datetime.combine(day, FREEZE_TIME, tzinfo=CN_TZ)
         accepted, rejected = records_available_at(records, decision_time)
+        if not accepted:
+            return {
+                "status": "NO_VALID_RECORDS",
+                "execution_ok": True,
+                "data_ready": False,
+                "trade_date": day.isoformat(),
+                "decision_time": decision_time.isoformat(timespec="seconds"),
+                "records": [],
+                "rejected_records": rejected,
+                "record_count": 0,
+                "rejected_count": len(rejected),
+            }
         frozen = {
             "status": "FROZEN_1450",
+            "execution_ok": True,
+            "data_ready": True,
             "trade_date": day.isoformat(),
             "decision_time": decision_time.isoformat(timespec="seconds"),
             "records": accepted,

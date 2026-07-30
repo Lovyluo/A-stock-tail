@@ -15,6 +15,8 @@ def write_close_confirmation_report(
         "# 行业共振尾盘确认策略影子报告",
         "",
         f"status: {result.get('status', 'UNKNOWN')}",
+        f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}",
+        f"data_ready: {str(bool(result.get('data_ready'))).lower()}",
         f"strategy_name: {result.get('strategy_name', 'close_confirmation_v1')}",
         f"strategy_phase: {result.get('strategy_phase', 'research_shadow')}",
         f"decision_time: {result.get('decision_time', '')}",
