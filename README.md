@@ -86,12 +86,15 @@ The former `yang_yongxing_overnight_v1` entry is preserved as
 
 `close_confirmation_v1` is currently **research / shadow simulation only**:
 
-- freezes point-in-time data at 14:50;
+- uses a four-stage point-in-time contract: feature cutoff, collection deadline,
+  decision time, and execution-not-before;
 - scores market, industry, relative strength, price/volume, sourced catalysts, and chip proxies;
-- starts event fills at 14:51 and cancels remaining quantity at 14:56;
+- starts event fills no earlier than the contract's execution time and cancels remaining
+  quantity at 14:56;
 - applies partial fills, date-aware price limits, suspension, T+1, slippage, impact, and 100-share lots;
 - never substitutes daily close data for missing minute data;
 - requires a versioned exchange-calendar or benchmark-index trading-date record for 60-day chip inputs;
+- treats Sina fund-flow data as an audit proxy that cannot satisfy the formal fund-flow gate;
 - never uses demo fallback fields in live, shadow, paper, or replay results.
 
 The historical and shadow acceptance thresholds have not yet been met because the required
@@ -105,9 +108,26 @@ It does not include a real automated market-data collector, and it is not ready 
 formal 60-trading-day shadow acceptance period. The production-grade point-in-time collector
 is deferred to a separate v0.4.1 phase.
 
+v0.4.1 now includes real-source provider interfaces and a validation matrix. Eastmoney
+`push2` stability, a verified industry-breadth backup, and the exact availability semantics of
+the 14:50 minute event remain blockers. These providers therefore do not yet authorize the
+formal 60-trading-day shadow acceptance period.
+
+The current conservative contract keeps `feature_event_cutoff=14:50:00`, waits until
+`collection_deadline=14:51:05`, decides at `14:51:10`, and permits simulated fills no earlier
+than `14:52:00`. This is not a claim that the supplier's 14:50 minute label has been verified.
+The 2026-07-31 four-point real-session probe was inconclusive because two required
+sampling points failed at the upstream connection. The two successful points covered all
+five tracked stocks and produced stable 14:50 OHLCV hashes, but that is not sufficient to
+distinguish minute-start from minute-end labeling. Minute-label readiness remains blocked.
+Any verified time contract must also carry the reviewed `probe_evidence_hash`; a VERIFIED
+label without that evidence, or a contract whose four times are out of order, is rejected.
+
 See also:
 
 - [Point-in-time data dictionary](overnight_quant/docs/phase7_0_point_in_time_data_dictionary.md)
+- [v0.4.1 real collector design](overnight_quant/docs/phase7_1_real_point_in_time_collectors_design.md)
+- [v0.4.1 source validation matrix](overnight_quant/docs/phase7_1_source_validation_matrix.md)
 - [v0.4 safety boundary](overnight_quant/docs/phase7_0_safety_boundary.md)
 
 ## Common Commands
@@ -121,6 +141,18 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_scan.py --mode d
 
 # Freeze point-in-time records at 14:50
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --input snapshot_records.json --freeze --trade-date 2026-07-30
+
+# Validate real providers without writing a snapshot
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_source_validation.py --codes 000001
+
+# Collect real provider records during the close window; no demo fallback
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --live --codes 000001
+
+# Probe the supplier's 14:50 minute-label semantics at four real-session times
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py
+
+# Benchmark real providers for 1/10/30/50 stocks without writing snapshots
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_collector_stress.py --sizes 1,10,30,50 --deadline-seconds 8
 
 # Run the new strategy in shadow mode
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_confirmation.py --mode shadow --date 2026-07-30

@@ -92,7 +92,11 @@ class CloseConfirmationStrategy:
             code = str(stock.get("code") or "").zfill(6)
             if code not in eligible_codes:
                 continue
-            scoring_stock = {**stock, "_news_source_ready": news_source_ready}
+            scoring_stock = {
+                **stock,
+                "_news_source_ready": news_source_ready,
+                "_time_contract": working_snapshot.get("time_contract"),
+            }
             features = build_close_confirmation_features(
                 scoring_stock,
                 decision_time=decision_time,
@@ -110,6 +114,9 @@ class CloseConfirmationStrategy:
                 "name": stock.get("name", ""),
                 "features": features,
                 "hard_gates": gates,
+                "execution_not_before": features.get(
+                    "execution_not_before"
+                ),
                 **score,
                 "decision": (
                     "SHADOW_CONFIRMATION"
@@ -160,6 +167,16 @@ def _base_result(
     mode: str,
     decision_time: Any,
 ) -> dict[str, Any]:
+    coverage = dict(readiness.get("coverage_by_type") or {})
+    proxy_coverage = dict(
+        readiness.get("proxy_coverage_by_type") or {}
+    )
+    normalized = readiness.get("normalized_snapshot") or {}
+    time_contract = dict(normalized.get("time_contract") or {})
+    proxy_only = bool(
+        proxy_coverage.get("fund_flow", 0)
+        and not coverage.get("fund_flow", 0)
+    )
     return {
         "strategy_name": STRATEGY_NAME,
         "strategy_phase": STRATEGY_PHASE,
@@ -167,7 +184,8 @@ def _base_result(
         "decision_time": str(decision_time),
         "execution_ok": True,
         "data_ready": bool(readiness["data_ready"]),
-        "coverage_by_type": dict(readiness.get("coverage_by_type") or {}),
+        "coverage_by_type": coverage,
+        "proxy_coverage_by_type": proxy_coverage,
         "readiness_errors": list(readiness.get("readiness_errors") or []),
         "critical_source_status": dict(
             readiness.get("critical_source_status") or {}
@@ -181,6 +199,25 @@ def _base_result(
         "orders": [],
         "formal_signal_enabled": False,
         "ticket_enabled": False,
+        "time_contract": time_contract,
+        "feature_event_cutoff": time_contract.get(
+            "feature_event_cutoff",
+            str(decision_time),
+        ),
+        "collection_deadline": time_contract.get(
+            "collection_deadline",
+            str(decision_time),
+        ),
+        "execution_not_before": time_contract.get(
+            "execution_not_before",
+            str(decision_time),
+        ),
+        "fund_flow_proxy_only": proxy_only,
+        "fund_flow_gate_notice": (
+            "资金流代理数据，不满足正式门禁"
+            if proxy_only
+            else ""
+        ),
         "notice": (
             "策略研发/影子模拟中；仅供研究观察，"
             "不生成正式交易信号、票据或外部执行动作。"

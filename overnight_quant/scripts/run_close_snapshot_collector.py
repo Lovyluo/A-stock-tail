@@ -12,7 +12,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.data.market_calendar import CN_TZ
-from overnight_quant.data.snapshot_store import CloseWindowCollector, ImmutableSnapshotStore
+from overnight_quant.data.close_time_contract import (
+    build_close_time_contract,
+)
+from overnight_quant.data.real_point_in_time_collectors import (
+    RealPointInTimeCollectors,
+)
+from overnight_quant.data.snapshot_store import (
+    CloseWindowCollector,
+    ImmutableSnapshotStore,
+)
 
 
 def run_snapshot_collection(
@@ -22,10 +31,17 @@ def run_snapshot_collection(
     snapshot_root: str | Path = "overnight_quant/data/cache/close_confirmation_snapshots",
     freeze: bool = False,
     now: datetime | None = None,
+    live: bool = False,
+    codes: list[str] | None = None,
+    collectors: RealPointInTimeCollectors | None = None,
+    minute_label_semantics: str = "unverified",
+    minute_label_verified: bool = False,
+    probe_evidence_hash: str = "",
 ) -> dict:
     current = now or datetime.now(CN_TZ)
     records = []
     source_status = []
+    time_contract = None
     if input_path:
         try:
             payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
@@ -40,17 +56,81 @@ def run_snapshot_collection(
         if isinstance(payload, dict):
             records = payload.get("records") or []
             source_status = list(payload.get("source_status") or [])
+            time_contract = payload.get("time_contract")
         else:
             records = payload
         if not isinstance(records, list):
             records = []
-    providers = {"input_file": lambda observed_at: list(records)} if records else {}
-    collector = CloseWindowCollector(ImmutableSnapshotStore(snapshot_root), providers)
+    if live and input_path:
+        return {
+            "status": "COLLECTOR_INPUT_CONFLICT",
+            "execution_ok": False,
+            "data_ready": False,
+            "records": [],
+        }
+    if live:
+        runtime_collectors = collectors or RealPointInTimeCollectors(
+            codes or [],
+            minute_label_semantics=minute_label_semantics,
+            minute_label_verified=minute_label_verified,
+            probe_evidence_hash=probe_evidence_hash,
+        )
+        providers = runtime_collectors.provider_map()
+        time_contract = (
+            getattr(runtime_collectors, "time_contract", None)
+            or build_close_time_contract(
+                current.date(),
+                minute_label_semantics=(
+                    getattr(
+                        runtime_collectors,
+                        "minute_label_semantics",
+                        minute_label_semantics,
+                    )
+                ),
+                verified=bool(
+                    getattr(
+                        runtime_collectors,
+                        "minute_label_verified",
+                        minute_label_verified,
+                    )
+                ),
+                probe_evidence_hash=str(
+                    getattr(
+                        runtime_collectors,
+                        "probe_evidence_hash",
+                        probe_evidence_hash,
+                    )
+                    or ""
+                ),
+            )
+        )
+    else:
+        providers = (
+            {"input_file": lambda observed_at: list(records)}
+            if records
+            else {}
+        )
+    collector = CloseWindowCollector(
+        ImmutableSnapshotStore(snapshot_root),
+        providers,
+        time_contract=time_contract,
+    )
     if freeze:
+        if live:
+            return {
+                "status": "LIVE_FREEZE_REQUIRES_COLLECTED_INPUT",
+                "execution_ok": False,
+                "data_ready": False,
+                "records": [],
+                "candidates": [],
+                "tickets": [],
+                "orders": [],
+            }
         return collector.freeze(
             trade_date or current.date().isoformat(),
             records,
             source_status=source_status,
+            time_contract=time_contract,
         )
     return collector.collect(current)
 
@@ -61,6 +141,37 @@ def main() -> int:
     parser.add_argument("--trade-date", default=None)
     parser.add_argument("--snapshot-root", default="overnight_quant/data/cache/close_confirmation_snapshots")
     parser.add_argument("--freeze", action="store_true")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Use real providers. No demo fallback is available.",
+    )
+    parser.add_argument(
+        "--minute-label-semantics",
+        choices=["unverified", "minute_start", "minute_end"],
+        default="unverified",
+    )
+    parser.add_argument(
+        "--minute-label-verified",
+        action="store_true",
+        help=(
+            "Mark a minute label result as verified only after the "
+            "four-point real-trading-day probe has been reviewed."
+        ),
+    )
+    parser.add_argument(
+        "--probe-evidence-hash",
+        default="",
+        help=(
+            "Reviewed SHA-256 evidence hash required with "
+            "--minute-label-verified."
+        ),
+    )
+    parser.add_argument(
+        "--codes",
+        default="",
+        help="Comma-separated stock codes for real provider collection.",
+    )
     args = parser.parse_args()
 
     result = run_snapshot_collection(
@@ -68,6 +179,15 @@ def main() -> int:
         trade_date=args.trade_date,
         snapshot_root=args.snapshot_root,
         freeze=args.freeze,
+        live=args.live,
+        codes=[
+            item.strip()
+            for item in str(args.codes).split(",")
+            if item.strip()
+        ],
+        minute_label_semantics=args.minute_label_semantics,
+        minute_label_verified=args.minute_label_verified,
+        probe_evidence_hash=args.probe_evidence_hash,
     )
     print(f"Status: {result['status']}")
     print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")

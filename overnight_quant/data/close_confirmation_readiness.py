@@ -5,6 +5,11 @@ from datetime import date, datetime
 import math
 from typing import Any, Iterable
 
+from overnight_quant.data.close_time_contract import (
+    CloseTimeContract,
+    contract_datetimes,
+    normalize_close_time_contract,
+)
 from overnight_quant.data.point_in_time import (
     parse_cn_datetime,
     records_available_at,
@@ -12,7 +17,7 @@ from overnight_quant.data.point_in_time import (
 )
 
 
-SNAPSHOT_CONTRACT_VERSION = "close_confirmation_pit_v3"
+SNAPSHOT_CONTRACT_VERSION = "close_confirmation_pit_v4"
 MIN_MINUTE_BARS = 12
 MIN_DAILY_BARS = 60
 REQUIRED_NESTED_TEMPORAL_FIELDS = (
@@ -56,7 +61,13 @@ SUCCESS_SOURCE_STATES = {
     "AVAILABLE",
     "AVAILABLE_EMPTY",
 }
-FAILED_SOURCE_STATES = {"FAILED", "ERROR", "UNAVAILABLE", "TIMEOUT"}
+FAILED_SOURCE_STATES = {
+    "FAILED",
+    "ERROR",
+    "UNAVAILABLE",
+    "TIMEOUT",
+    "DEADLINE_EXCEEDED",
+}
 
 
 def validate_close_confirmation_readiness(
@@ -77,6 +88,17 @@ def validate_close_confirmation_readiness(
     coverage = _coverage_by_type(normalized, decision)
     source_status = _critical_source_status(normalized, coverage)
     readiness_errors: list[str] = []
+    time_contract = normalize_close_time_contract(
+        normalized.get("time_contract"),
+        fallback_decision_time=decision,
+    )
+    if (
+        time_contract is not None
+        and time_contract.contract_version
+        != "legacy_single_cutoff_v1"
+        and not time_contract.minute_label_verified
+    ):
+        readiness_errors.append("minute_label_semantics_unverified")
     calendar_contract = dict(
         normalized.get("trading_calendar_contract") or {}
     )
@@ -108,6 +130,7 @@ def validate_close_confirmation_readiness(
             decision,
             min_minute_bars=max(1, int(min_minute_bars)),
             min_daily_bars=max(1, int(min_daily_bars)),
+            time_contract=time_contract,
         )
         stock_readiness[code] = {
             "ready": not errors,
@@ -133,6 +156,9 @@ def validate_close_confirmation_readiness(
     return {
         "data_ready": not readiness_errors,
         "coverage_by_type": coverage,
+        "proxy_coverage_by_type": _proxy_coverage_by_type(
+            normalized
+        ),
         "readiness_errors": readiness_errors,
         "critical_source_status": source_status,
         "eligible_stock_codes": eligible_codes,
@@ -156,11 +182,14 @@ def validate_close_confirmation_readiness(
 def normalize_point_in_time_records(
     records: Iterable[dict[str, Any]],
     decision_time: str | datetime,
+    *,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     temporal_valid, rejected = records_available_at(
         records,
         decision_time,
         require_published_at_for_news=True,
+        time_contract=time_contract,
     )
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in temporal_valid:
@@ -226,6 +255,17 @@ def normalize_close_confirmation_snapshot(
     )
     result = deepcopy(snapshot)
     result["snapshot_contract_version"] = SNAPSHOT_CONTRACT_VERSION
+    time_contract = normalize_close_time_contract(
+        result.get("time_contract"),
+        fallback_decision_time=decision,
+    )
+    if time_contract is not None:
+        result["time_contract"] = time_contract.as_dict()
+        if (
+            time_contract.contract_version
+            != "legacy_single_cutoff_v1"
+        ):
+            decision = parse_cn_datetime(time_contract.decision_time)
     if decision is None:
         result["decision_time"] = str(
             decision_time or snapshot.get("decision_time") or ""
@@ -237,6 +277,7 @@ def normalize_close_confirmation_snapshot(
         normalize_point_in_time_records(
             result.get("records") or [],
             decision,
+            time_contract=time_contract,
         )
     )
     record_audit = _merge_record_normalization_audit(
@@ -255,6 +296,7 @@ def normalize_close_confirmation_snapshot(
     accepted_sources, rejected_sources = filter_source_status_at(
         result.get("source_status") or [],
         decision,
+        time_contract=time_contract,
     )
     result["source_status"] = accepted_sources
     result["rejected_source_status"] = [
@@ -272,6 +314,7 @@ def normalize_close_confirmation_snapshot(
         calendar_input,
         decision,
         data_type="trading_calendar",
+        time_contract=time_contract,
     )
     calendar_contract = build_trading_calendar_contract(
         calendar_records,
@@ -284,17 +327,20 @@ def normalize_close_confirmation_snapshot(
         result.get("market_records") or [],
         decision,
         data_type="market",
+        time_contract=time_contract,
     )
     industry_records, industry_rejected = normalize_nested_temporal_rows(
         result.get("industry_records") or [],
         decision,
         data_type="industry",
+        time_contract=time_contract,
     )
     global_news, global_news_rejected = normalize_nested_temporal_rows(
         result.get("news") or [],
         decision,
         data_type="news",
         require_published_at=True,
+        time_contract=time_contract,
     )
     result["market_records"] = market_records
     result["industry_records"] = industry_records
@@ -314,6 +360,7 @@ def normalize_close_confirmation_snapshot(
                 stock,
                 decision,
                 calendar_contract=calendar_contract,
+                time_contract=time_contract,
             )
         )
     result["stocks"] = sorted(
@@ -354,6 +401,8 @@ def _merge_record_normalization_audit(
 def filter_source_status_at(
     rows: Iterable[dict[str, Any]],
     decision_time: str | datetime,
+    *,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     decision = parse_cn_datetime(decision_time)
     if decision is None:
@@ -365,6 +414,7 @@ def filter_source_status_at(
         rows,
         decision,
         data_type="source_status",
+        time_contract=time_contract,
     )
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in accepted:
@@ -422,12 +472,14 @@ def normalize_nested_temporal_rows(
     *,
     data_type: str,
     require_published_at: bool = False,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     accepted, rejected = filter_nested_temporal_rows(
         rows,
         decision_time,
         data_type=data_type,
         require_published_at=require_published_at,
+        time_contract=time_contract,
     )
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in accepted:
@@ -457,12 +509,15 @@ def normalize_nested_temporal_rows(
 def normalize_minute_bars(
     rows: Iterable[dict[str, Any]],
     decision_time: str | datetime,
+    *,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     source_rows = list(rows)
     accepted, rejected = filter_nested_temporal_rows(
         source_rows,
         decision_time,
         data_type="minute_bar",
+        time_contract=time_contract,
     )
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in accepted:
@@ -519,6 +574,7 @@ def filter_nested_temporal_rows(
     *,
     data_type: str,
     require_published_at: bool = False,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     decision = parse_cn_datetime(decision_time)
     accepted: list[dict[str, Any]] = []
@@ -531,7 +587,9 @@ def filter_nested_temporal_rows(
             else _nested_temporal_reject_reason(
                 row,
                 decision,
+                data_type=data_type,
                 require_published_at=require_published_at,
+                time_contract=time_contract,
             )
         )
         if reason:
@@ -652,12 +710,14 @@ def normalize_daily_bars(
     decision_time: str | datetime,
     *,
     calendar_contract: dict[str, Any] | None = None,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     decision = parse_cn_datetime(decision_time)
     temporal_valid, rejected = filter_nested_temporal_rows(
         rows,
         decision_time,
         data_type="daily_bar",
+        time_contract=time_contract,
     )
     errors: list[str] = []
     warnings: list[str] = []
@@ -860,12 +920,14 @@ def _normalize_stock(
     decision: datetime,
     *,
     calendar_contract: dict[str, Any],
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> dict[str, Any]:
     result = deepcopy(stock)
     quote_valid, quote_rejected = filter_nested_temporal_rows(
         [stock],
         decision,
         data_type="quote",
+        time_contract=time_contract,
     )
     result["quote_temporal_valid"] = bool(quote_valid)
     result["quote_temporal_rejections"] = quote_rejected
@@ -874,15 +936,18 @@ def _normalize_stock(
         [stock.get("market") or {}],
         decision,
         data_type="market",
+        time_contract=time_contract,
     )
     industry_valid, industry_rejected = normalize_nested_temporal_rows(
         [stock.get("industry") or {}],
         decision,
         data_type="industry",
+        time_contract=time_contract,
     )
     minute_valid, minute_audit = normalize_minute_bars(
         stock.get("intraday_bars") or stock.get("minute_bars") or [],
         decision,
+        time_contract=time_contract,
     )
     minute_audit = _merge_minute_audit(
         stock.get("minute_bar_audit") or {},
@@ -892,6 +957,7 @@ def _normalize_stock(
         stock.get("daily_bars") or [],
         decision,
         calendar_contract=calendar_contract,
+        time_contract=time_contract,
     )
     daily_audit = _merge_daily_audit(
         stock.get("daily_bar_audit") or {},
@@ -901,12 +967,14 @@ def _normalize_stock(
         stock.get("fund_flow") or [],
         decision,
         data_type="fund_flow",
+        time_contract=time_contract,
     )
     news_valid, news_rejected = normalize_nested_temporal_rows(
         stock.get("news") or [],
         decision,
         data_type="news",
         require_published_at=True,
+        time_contract=time_contract,
     )
 
     result["market"] = market_valid[-1] if market_valid else {}
@@ -1052,6 +1120,7 @@ def _stock_readiness_errors(
     *,
     min_minute_bars: int,
     min_daily_bars: int,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> list[str]:
     errors: list[str] = []
     if not stock.get("quote_temporal_valid"):
@@ -1076,7 +1145,16 @@ def _stock_readiness_errors(
     )
     if unique_event_minutes < min_minute_bars:
         errors.append("minute_bar_count_below_minimum")
-    decision_minute = decision.replace(second=0, microsecond=0)
+    contract = normalize_close_time_contract(
+        time_contract,
+        fallback_decision_time=decision,
+    )
+    contract_times = contract_datetimes(contract) if contract else {}
+    feature_cutoff = contract_times.get(
+        "feature_event_cutoff",
+        decision,
+    )
+    decision_minute = feature_cutoff.replace(second=0, microsecond=0)
     event_minutes = {
         parse_cn_datetime(row.get("event_time")).replace(
             second=0,
@@ -1162,7 +1240,12 @@ def _coverage_by_type(
             len(stock.get("daily_bars") or []) for stock in stocks
         ),
         "fund_flow": sum(
-            len(stock.get("fund_flow") or []) for stock in stocks
+            sum(
+                1
+                for row in stock.get("fund_flow") or []
+                if _eligible_fund_flow_row(row)
+            )
+            for stock in stocks
         ),
         "news": len(snapshot.get("news") or [])
         + sum(len(stock.get("news") or []) for stock in stocks),
@@ -1173,6 +1256,22 @@ def _coverage_by_type(
             )
             else 0
         ),
+    }
+
+
+def _proxy_coverage_by_type(
+    snapshot: dict[str, Any],
+) -> dict[str, int]:
+    stocks = snapshot.get("stocks") or []
+    return {
+        "fund_flow": sum(
+            sum(
+                1
+                for row in stock.get("fund_flow") or []
+                if not _eligible_fund_flow_row(row)
+            )
+            for stock in stocks
+        )
     }
 
 
@@ -1225,7 +1324,9 @@ def _nested_temporal_reject_reason(
     row: dict[str, Any],
     decision: datetime,
     *,
+    data_type: str,
     require_published_at: bool,
+    time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> str:
     missing = [
         field
@@ -1240,12 +1341,50 @@ def _nested_temporal_reject_reason(
     cutoff = parse_cn_datetime(row.get("decision_cutoff"))
     if None in {event, observed, available, cutoff}:
         return "temporal_contract_invalid"
-    if event > decision:
-        return "event_after_decision"
-    if observed > decision:
-        return "observed_after_decision"
-    if available > decision:
-        return "available_after_decision"
+    contract = normalize_close_time_contract(
+        time_contract,
+        fallback_decision_time=decision,
+    )
+    contract_times = contract_datetimes(contract) if contract else {}
+    split_contract = bool(
+        contract
+        and contract.contract_version != "legacy_single_cutoff_v1"
+    )
+    feature_cutoff = contract_times.get(
+        "feature_event_cutoff",
+        decision,
+    )
+    collection_deadline = contract_times.get(
+        "collection_deadline",
+        decision,
+    )
+    event_deadline = (
+        collection_deadline
+        if data_type == "source_status"
+        else feature_cutoff
+    )
+    if event > event_deadline:
+        return (
+            "event_after_collection_deadline"
+            if split_contract and data_type == "source_status"
+            else (
+                "event_after_feature_cutoff"
+                if split_contract
+                else "event_after_decision"
+            )
+        )
+    if observed > collection_deadline:
+        return (
+            "observed_after_collection_deadline"
+            if split_contract
+            else "observed_after_decision"
+        )
+    if available > collection_deadline:
+        return (
+            "available_after_collection_deadline"
+            if split_contract
+            else "available_after_decision"
+        )
     if available < observed:
         return "available_before_observed"
     if decision > cutoff:
@@ -1254,8 +1393,12 @@ def _nested_temporal_reject_reason(
         published = parse_cn_datetime(row.get("published_at"))
         if published is None:
             return "news_published_at_missing"
-        if published > decision:
-            return "news_published_after_decision"
+        if published > feature_cutoff:
+            return (
+                "news_published_after_feature_cutoff"
+                if split_contract
+                else "news_published_after_decision"
+            )
     return ""
 
 
@@ -1558,12 +1701,20 @@ def _valid_ohlcv(row: dict[str, Any]) -> bool:
 
 def _valid_fund_flow(rows: list[dict[str, Any]]) -> bool:
     return any(
-        any(
+        _eligible_fund_flow_row(row)
+        and any(
             _valid_number(row.get(field))
             for field in ("main_net", "large_net", "super_net")
         )
         for row in rows
     )
+
+
+def _eligible_fund_flow_row(row: dict[str, Any]) -> bool:
+    source = str(row.get("source") or "").lower()
+    if bool(row.get("is_proxy")) or "sina_money_flow" in source:
+        return False
+    return row.get("eligible_for_hard_gate") is not False
 
 
 def _looks_like_quote(stock: dict[str, Any]) -> bool:
@@ -1609,6 +1760,13 @@ def _temporal_fields(row: dict[str, Any]) -> dict[str, Any]:
             "observed_at",
             "available_at",
             "decision_cutoff",
+            "feature_event_cutoff",
+            "collection_deadline",
+            "decision_time",
+            "execution_not_before",
+            "time_contract_version",
+            "minute_label_semantics",
+            "minute_label_validation_status",
             "source",
             "source_version",
             "request_hash",

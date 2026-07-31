@@ -11,6 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.backtest.point_in_time_provider import PointInTimeDataError, PointInTimeProvider
+from overnight_quant.data.close_time_contract import (
+    build_close_time_contract,
+)
 from overnight_quant.data.point_in_time import enforce_formal_no_demo
 from overnight_quant.reports.close_confirmation_report import write_close_confirmation_report
 from overnight_quant.strategy.registry import (
@@ -50,13 +53,24 @@ def run_close_confirmation(
         result.setdefault("execution_ok", True)
         result.setdefault("data_ready", False)
     except (FileNotFoundError, PointInTimeDataError, ValueError) as exc:
+        time_contract = build_close_time_contract(day)
         result = enforce_formal_no_demo(
             {
                 "strategy_name": "close_confirmation_v1",
                 "strategy_phase": "research_shadow",
                 "status": "POINT_IN_TIME_DATA_UNAVAILABLE",
                 "mode": mode,
-                "decision_time": f"{day}T14:50:00+08:00",
+                "decision_time": time_contract.decision_time,
+                "feature_event_cutoff": (
+                    time_contract.feature_event_cutoff
+                ),
+                "collection_deadline": (
+                    time_contract.collection_deadline
+                ),
+                "execution_not_before": (
+                    time_contract.execution_not_before
+                ),
+                "time_contract": time_contract.as_dict(),
                 "scored": [],
                 "shadow_candidates": [],
                 "selected": [],

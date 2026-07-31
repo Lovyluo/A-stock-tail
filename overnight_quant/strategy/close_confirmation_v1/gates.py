@@ -28,13 +28,16 @@ def evaluate_hard_gates(
 ) -> dict[str, Any]:
     settings = {**DEFAULT_GATE_CONFIG, **(config or {})}
     decision = parse_cn_datetime(decision_time)
+    feature_cutoff = parse_cn_datetime(
+        features.get("feature_event_cutoff")
+    ) or decision
     last_bar = parse_cn_datetime(features.get("last_bar_time"))
     minute_complete = bool(
-        decision
+        feature_cutoff
         and last_bar
-        and last_bar.date() == decision.date()
+        and last_bar.date() == feature_cutoff.date()
         and last_bar.time().replace(second=0, microsecond=0)
-        >= decision.time().replace(second=0, microsecond=0)
+        >= feature_cutoff.time().replace(second=0, microsecond=0)
     )
     demo_paths = demo_field_paths(stock) if str(mode).lower() in {"live", "shadow", "paper", "replay"} else []
     availability = features.get("feature_availability") or {}
