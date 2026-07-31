@@ -145,6 +145,7 @@ class RequestsTransport:
         self._last_host_request: dict[str, float] = {}
         self._state_lock = threading.Lock()
         self._global_deadline: float | None = None
+        self._collection_cancelled = False
         self._metrics = {
             "request_count": 0,
             "retry_count": 0,
@@ -156,6 +157,11 @@ class RequestsTransport:
     def set_global_deadline(self, deadline: float | None) -> None:
         with self._state_lock:
             self._global_deadline = deadline
+            self._collection_cancelled = False
+
+    def cancel_current_collection(self) -> None:
+        with self._state_lock:
+            self._collection_cancelled = True
 
     def reset_metrics(self) -> None:
         with self._state_lock:
@@ -182,12 +188,7 @@ class RequestsTransport:
     ) -> RawHttpResponse:
         last_error: Exception | None = None
         for attempt in range(self.max_attempts):
-            remaining = self._deadline_remaining()
-            if remaining is not None and remaining <= 0:
-                self._increment_metric("deadline_trigger_count")
-                raise GlobalDeadlineExceeded(
-                    "global_collection_deadline_exceeded"
-                )
+            self.raise_if_cancelled()
             self._respect_host_interval(url)
             started = self.monotonic()
             remaining = self._deadline_remaining()
@@ -215,6 +216,7 @@ class RequestsTransport:
                     timeout=(connect_timeout, read_timeout),
                 )
                 response.raise_for_status()
+                self.raise_if_cancelled()
                 return RawHttpResponse(
                     content=bytes(response.content),
                     status_code=int(response.status_code),
@@ -227,6 +229,7 @@ class RequestsTransport:
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt + 1 < self.max_attempts:
+                    self.raise_if_cancelled()
                     self._increment_metric("retry_count")
                     self.sleep(
                         self.backoff_seconds * (2**attempt)
@@ -261,6 +264,7 @@ class RequestsTransport:
                     "global_collection_deadline_exceeded"
                 )
             self.sleep(wait_seconds)
+            self.raise_if_cancelled()
 
     def _deadline_remaining(self) -> float | None:
         with self._state_lock:
@@ -270,6 +274,19 @@ class RequestsTransport:
             if deadline is None
             else deadline - self.monotonic()
         )
+
+    def raise_if_cancelled(self) -> None:
+        with self._state_lock:
+            cancelled = self._collection_cancelled
+            deadline = self._global_deadline
+        if cancelled or (
+            deadline is not None
+            and deadline - self.monotonic() <= 0
+        ):
+            self._increment_metric("deadline_trigger_count")
+            raise GlobalDeadlineExceeded(
+                "global_collection_deadline_exceeded"
+            )
 
     def _increment_metric(self, name: str) -> None:
         with self._state_lock:
@@ -286,6 +303,7 @@ class RealPointInTimeCollectors:
         time_contract: dict[str, Any] | CloseTimeContract | None = None,
         minute_label_semantics: str = "unverified",
         minute_label_verified: bool = False,
+        probe_evidence_hash: str = "",
     ):
         self.codes = _normalize_codes(codes)
         self.transport = transport or RequestsTransport()
@@ -295,6 +313,7 @@ class RealPointInTimeCollectors:
         self.time_contract = normalize_close_time_contract(time_contract)
         self.minute_label_semantics = minute_label_semantics
         self.minute_label_verified = bool(minute_label_verified)
+        self.probe_evidence_hash = str(probe_evidence_hash or "")
 
     def provider_map(
         self,
@@ -304,57 +323,101 @@ class RealPointInTimeCollectors:
                 self.collect_industry,
                 ["industry"],
                 SOURCE_VERSIONS["eastmoney_industry"],
+                priority=1,
+                stage="tail",
             ),
             "tencent_quote": ProviderSpec(
                 self.collect_quotes,
                 ["quote"],
                 SOURCE_VERSIONS["tencent_quote"],
+                priority=1,
+                stage="tail",
             ),
             "eastmoney_market": ProviderSpec(
                 self.collect_market,
                 ["market"],
                 SOURCE_VERSIONS["eastmoney_market"],
+                priority=1,
+                stage="tail",
             ),
             "tencent_trading_calendar": ProviderSpec(
                 self.collect_trading_calendar,
                 ["trading_calendar"],
                 SOURCE_VERSIONS["tencent_calendar"],
+                priority=2,
+                stage="prewarm",
             ),
             "tencent_qfq_daily": ProviderSpec(
                 self.collect_qfq_daily_bars,
                 ["daily_bar"],
                 SOURCE_VERSIONS["tencent_qfq_daily"],
+                priority=2,
+                stage="prewarm",
             ),
             "eastmoney_minute_bar": ProviderSpec(
                 self.collect_minute_bars,
                 ["minute_bar"],
                 SOURCE_VERSIONS["eastmoney_minute"],
+                priority=1,
+                stage="tail",
             ),
             "selected_fund_flow": ProviderSpec(
                 self.collect_selected_fund_flow,
                 ["fund_flow"],
                 SOURCE_VERSIONS["selected_fund"],
+                priority=1,
+                stage="tail",
             ),
             "eastmoney_global_news": ProviderSpec(
                 self.collect_global_news,
                 ["news"],
                 SOURCE_VERSIONS["eastmoney_global_news"],
+                priority=3,
+                stage="news",
             ),
             "eastmoney_stock_news": ProviderSpec(
                 self.collect_stock_news,
                 ["news"],
                 SOURCE_VERSIONS["eastmoney_stock_news"],
+                priority=3,
+                stage="news",
             ),
             "cninfo_announcements": ProviderSpec(
                 self.collect_announcements,
                 ["news"],
                 SOURCE_VERSIONS["cninfo_announcements"],
+                priority=3,
+                stage="news",
             ),
             "newsnow_cls_audit": ProviderSpec(
                 self.collect_newsnow_cls,
                 ["news"],
                 SOURCE_VERSIONS["newsnow_cls"],
+                priority=4,
+                stage="audit",
             ),
+        }
+
+    def tail_provider_map(self) -> dict[str, ProviderSpec]:
+        return {
+            source: provider
+            for source, provider in self.provider_map().items()
+            if provider.stage == "tail"
+        }
+
+    def prewarm_provider_map(self) -> dict[str, ProviderSpec]:
+        providers = self.provider_map()
+        providers["eastmoney_industry_mapping"] = ProviderSpec(
+            self.collect_industry_mappings,
+            ["industry_mapping"],
+            SOURCE_VERSIONS["eastmoney_industry"],
+            priority=2,
+            stage="prewarm",
+        )
+        return {
+            source: provider
+            for source, provider in providers.items()
+            if provider.stage in {"prewarm", "news"}
         }
 
     def validation_provider_map(self) -> dict[str, ProviderSpec]:
@@ -364,16 +427,21 @@ class RealPointInTimeCollectors:
             self.collect_eastmoney_fund_flow,
             ["fund_flow"],
             SOURCE_VERSIONS["eastmoney_fund"],
+            priority=1,
+            stage="tail",
         )
         providers["sina_fund_flow_backup"] = ProviderSpec(
             self.collect_sina_fund_flow,
             ["fund_flow"],
             SOURCE_VERSIONS["sina_fund"],
+            priority=4,
+            stage="audit",
         )
         return providers
 
     def collect_quotes(self, observed_at: datetime) -> ProviderBatch:
         self._require_codes()
+        self._check_cancelled()
         symbols = [_tencent_symbol(code) for code in self.codes]
         response = self.transport.request(
             "GET",
@@ -654,6 +722,7 @@ class RealPointInTimeCollectors:
         records = []
         raw_hashes = []
         for code in self.codes:
+            self._check_cancelled()
             symbol = _tencent_symbol(code)
             response, payload = self._tencent_daily_response(
                 symbol,
@@ -733,6 +802,7 @@ class RealPointInTimeCollectors:
         records = []
         raw_hashes = []
         for code in self.codes:
+            self._check_cancelled()
             response = self.transport.request(
                 "GET",
                 EASTMONEY_MINUTE_URL,
@@ -820,6 +890,7 @@ class RealPointInTimeCollectors:
         )
         raw_hashes.append(market_raw_hash)
         for code in self.codes:
+            self._check_cancelled()
             mapping = self._get_industry_mapping(
                 code,
                 observed_at=observed_at,
@@ -897,6 +968,52 @@ class RealPointInTimeCollectors:
             raw_hashes=raw_hashes,
         )
 
+    def collect_industry_mappings(
+        self,
+        observed_at: datetime,
+    ) -> ProviderBatch:
+        self._require_codes()
+        records = []
+        raw_hashes = []
+        for code in self.codes:
+            self._check_cancelled()
+            mapping = self._get_industry_mapping(
+                code,
+                observed_at=observed_at,
+            )
+            raw_hashes.append(mapping["raw_hash"])
+            completed = (
+                parse_cn_datetime(mapping.get("available_at"))
+                or self._now()
+            )
+            records.append(
+                self._record(
+                    {
+                        "code": code,
+                        "name": mapping["name"],
+                        "board_code": mapping["board_code"],
+                        "prewarm_only": True,
+                        "eligible_for_hard_gate": False,
+                    },
+                    data_type="industry_mapping",
+                    event_time=completed,
+                    observed_at=observed_at,
+                    available_at=completed,
+                    source="eastmoney_industry_mapping",
+                    source_version=SOURCE_VERSIONS[
+                        "eastmoney_industry"
+                    ],
+                    request={"stock_code": code},
+                    raw_hash=mapping["raw_hash"],
+                )
+            )
+        return _batch(
+            records,
+            ["industry_mapping"],
+            SOURCE_VERSIONS["eastmoney_industry"],
+            raw_hashes=raw_hashes,
+        )
+
     def collect_eastmoney_fund_flow(
         self,
         observed_at: datetime,
@@ -905,6 +1022,7 @@ class RealPointInTimeCollectors:
         records = []
         raw_hashes = []
         for code in self.codes:
+            self._check_cancelled()
             response = self.transport.request(
                 "GET",
                 EASTMONEY_FUND_URL,
@@ -1011,6 +1129,7 @@ class RealPointInTimeCollectors:
         }
         records = []
         for code in self.codes:
+            self._check_cancelled()
             item = by_code.get(code)
             if not item:
                 continue
@@ -1142,6 +1261,7 @@ class RealPointInTimeCollectors:
         records = []
         raw_hashes = []
         for code in self.codes:
+            self._check_cancelled()
             callback = "jQuery_pit_news"
             inner = {
                 "uid": "",
@@ -1220,6 +1340,7 @@ class RealPointInTimeCollectors:
         records = []
         raw_hashes = []
         for code in self.codes:
+            self._check_cancelled()
             response = self.transport.request(
                 "POST",
                 CNINFO_ANNOUNCEMENT_URL,
@@ -1423,6 +1544,7 @@ class RealPointInTimeCollectors:
                 ),
             },
         )
+        completed = self._now()
         rows = response.json().get("ssbk") or []
         ranked = sorted(
             (
@@ -1446,6 +1568,9 @@ class RealPointInTimeCollectors:
             ),
             "raw_hash": response.raw_hash,
             "observed_at": observed_at.isoformat(
+                timespec="seconds"
+            ),
+            "available_at": completed.isoformat(
                 timespec="seconds"
             ),
         }
@@ -1738,6 +1863,11 @@ class RealPointInTimeCollectors:
     def _require_codes(self) -> None:
         if not self.codes:
             raise SourceContractError("target_codes_missing")
+
+    def _check_cancelled(self) -> None:
+        checker = getattr(self.transport, "raise_if_cancelled", None)
+        if callable(checker):
+            checker()
 
     def _now(self) -> datetime:
         return _as_cn(self.clock())

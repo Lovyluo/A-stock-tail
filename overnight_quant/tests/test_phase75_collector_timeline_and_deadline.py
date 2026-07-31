@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 import json
+import threading
 import time
 
 import pytest
@@ -20,6 +21,7 @@ from overnight_quant.data.collector_stress import run_provider_stress
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_label_probe import (
     classify_minute_label_samples,
+    run_scheduled_minute_label_probe,
 )
 from overnight_quant.data.point_in_time import (
     build_point_in_time_record,
@@ -34,6 +36,7 @@ from overnight_quant.data.real_point_in_time_collectors import (
     RawHttpResponse,
     RealPointInTimeCollectors,
     RealSourceError,
+    RequestsTransport,
 )
 from overnight_quant.data.snapshot_store import (
     CloseWindowCollector,
@@ -51,6 +54,7 @@ from overnight_quant.strategy.close_confirmation_v1.strategy import (
 
 
 TRADE_DATE = "2026-07-30"
+PROBE_HASH = "e" * 64
 
 
 def test_four_stage_timeline_is_conservative_until_probe_verifies():
@@ -59,11 +63,13 @@ def test_four_stage_timeline_is_conservative_until_probe_verifies():
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     minute_end = build_close_time_contract(
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_END,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
 
     assert unverified.minute_label_verified is False
@@ -82,7 +88,7 @@ def test_minute_label_change_detector_distinguishes_start_and_end():
         hashes=["missing", "a", "b", "b"]
     )
     end_samples = _probe_samples(
-        hashes=["missing", "a", "a", "a"]
+        hashes=["a", "a", "a", "a"]
     )
 
     start = classify_minute_label_samples(start_samples)
@@ -92,6 +98,116 @@ def test_minute_label_change_detector_distinguishes_start_and_end():
     assert start["minute_label_validation_status"] == "VERIFIED"
     assert end["minute_label_semantics"] == MINUTE_LABEL_END
     assert end["minute_label_validation_status"] == "VERIFIED"
+    assert len(start["probe_evidence_hash"]) == 64
+    assert (
+        start["recommended_time_contract"]["probe_evidence_hash"]
+        == start["probe_evidence_hash"]
+    )
+
+
+def test_absent_then_unchanged_minute_label_is_inconclusive():
+    result = classify_minute_label_samples(
+        _probe_samples(["missing", "a", "a", "a"])
+    )
+
+    assert result["minute_label_validation_status"] == (
+        "INCONCLUSIVE"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["late", "failed", "coverage"],
+)
+def test_probe_timing_failure_or_coverage_gap_is_inconclusive(
+    mutation,
+):
+    samples = _probe_samples(["missing", "a", "b", "b"])
+    if mutation == "late":
+        samples[1]["request_started_at"] = (
+            "2026-07-30T14:50:08+08:00"
+        )
+        samples[1]["request_completed_at"] = (
+            "2026-07-30T14:50:09+08:00"
+        )
+    elif mutation == "failed":
+        samples[1]["error"] = "timeout"
+    else:
+        samples[1]["covered_codes"] = []
+
+    result = classify_minute_label_samples(samples)
+
+    assert result["minute_label_validation_status"] == (
+        "INCONCLUSIVE"
+    )
+
+
+def test_verified_time_contract_requires_evidence_and_valid_order():
+    with pytest.raises(
+        ValueError,
+        match="requires_probe_evidence_hash",
+    ):
+        build_close_time_contract(
+            TRADE_DATE,
+            minute_label_semantics=MINUTE_LABEL_START,
+            verified=True,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="close_time_contract_order_invalid",
+    ):
+        CloseTimeContract(
+            feature_event_cutoff=(
+                "2026-07-30T14:50:00+08:00"
+            ),
+            collection_deadline=(
+                "2026-07-30T14:49:59+08:00"
+            ),
+            decision_time="2026-07-30T14:51:10+08:00",
+            execution_not_before=(
+                "2026-07-30T14:52:00+08:00"
+            ),
+        )
+
+
+def test_scheduled_probe_records_request_evidence():
+    clock = _AdvancingClock(
+        datetime.fromisoformat(
+            "2026-07-30T14:49:50+08:00"
+        )
+    )
+    collectors = _ProbeCollectors(
+        ["000001", "600000"],
+        clock,
+    )
+
+    result = run_scheduled_minute_label_probe(
+        collectors.codes,
+        trade_date=TRADE_DATE,
+        collectors=collectors,
+        clock=clock,
+        sleep=clock.advance,
+        monotonic=lambda: clock.now.timestamp(),
+    )
+
+    assert result["status"] == "MINUTE_LABEL_VERIFIED"
+    assert result["minute_label_semantics"] == MINUTE_LABEL_START
+    assert result["requires_manual_review"] is True
+    assert len(result["probe_evidence_hash"]) == 64
+    assert len(result["samples"]) == 4
+    assert all(
+        sample["request_started_at"]
+        and sample["request_completed_at"]
+        and sample["request_elapsed_ms"] == pytest.approx(200)
+        and sample["source_versions"] == ["unit_minute_v1"]
+        and sample["sample_trade_date"] == TRADE_DATE
+        for sample in result["samples"]
+    )
+    assert result["samples"][0]["presence_by_code"] == {
+        "000001": False,
+        "600000": False,
+    }
 
 
 def test_unverified_timeline_cannot_be_data_ready():
@@ -114,10 +230,13 @@ def test_global_deadline_marks_unfinished_provider_and_returns(tmp_path):
         execution_not_before="2026-07-30T14:51:00+08:00",
         minute_label_semantics=MINUTE_LABEL_END,
         minute_label_validation_status="VERIFIED",
+        probe_evidence_hash=PROBE_HASH,
     )
 
+    cancelled = threading.Event()
+
     def slow_provider(_):
-        time.sleep(1.5)
+        cancelled.wait(2)
         return []
 
     collector = CloseWindowCollector(
@@ -127,6 +246,7 @@ def test_global_deadline_marks_unfinished_provider_and_returns(tmp_path):
                 slow_provider,
                 ["quote"],
                 "unit_slow_v1",
+                cancel_setter=cancelled.set,
             )
         },
         time_contract=contract,
@@ -137,7 +257,7 @@ def test_global_deadline_marks_unfinished_provider_and_returns(tmp_path):
     )
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 1.4
+    assert elapsed < 1.2
     assert result["data_ready"] is False
     assert result["provider_metrics"]["slow"]["status"] == (
         "DEADLINE_EXCEEDED"
@@ -149,6 +269,155 @@ def test_global_deadline_marks_unfinished_provider_and_returns(tmp_path):
     _assert_no_outputs(result)
 
 
+def test_collection_has_no_background_metrics_and_next_run_is_clean(
+    tmp_path,
+):
+    session = _SlowSession([0.15, 0.0, 0.0])
+    transport = RequestsTransport(
+        session=session,
+        timeout_seconds=1,
+        max_attempts=2,
+        min_host_interval_seconds=0,
+    )
+    requester = _RequestingProvider(transport)
+    short_contract = CloseTimeContract(
+        feature_event_cutoff=(
+            "2026-07-30T14:50:00+08:00"
+        ),
+        collection_deadline=(
+            "2026-07-30T14:50:00.050000+08:00"
+        ),
+        decision_time="2026-07-30T14:50:01+08:00",
+        execution_not_before=(
+            "2026-07-30T14:51:00+08:00"
+        ),
+        minute_label_semantics=MINUTE_LABEL_END,
+        minute_label_validation_status="VERIFIED",
+        probe_evidence_hash=PROBE_HASH,
+    )
+    observed = datetime.fromisoformat(
+        "2026-07-30T14:50:00+08:00"
+    )
+    first = CloseWindowCollector(
+        ImmutableSnapshotStore(tmp_path / "first"),
+        {
+            "requester": ProviderSpec(
+                requester.collect,
+                ["quote"],
+                "unit_requester_v1",
+                priority=1,
+                stage="tail",
+            )
+        },
+        clock=lambda: observed,
+        time_contract=short_contract,
+    ).collect(observed)
+    metrics_after_return = transport.metrics_snapshot()
+    calls_after_return = session.calls
+    time.sleep(0.1)
+
+    assert transport.metrics_snapshot() == metrics_after_return
+    assert session.calls == calls_after_return == 1
+    assert first["collection_metrics"]["late_provider_count"] == 1
+
+    long_contract = CloseTimeContract(
+        feature_event_cutoff=(
+            "2026-07-30T14:50:00+08:00"
+        ),
+        collection_deadline=(
+            "2026-07-30T14:50:01+08:00"
+        ),
+        decision_time="2026-07-30T14:50:02+08:00",
+        execution_not_before=(
+            "2026-07-30T14:51:00+08:00"
+        ),
+        minute_label_semantics=MINUTE_LABEL_END,
+        minute_label_validation_status="VERIFIED",
+        probe_evidence_hash=PROBE_HASH,
+    )
+    second = CloseWindowCollector(
+        ImmutableSnapshotStore(tmp_path / "second"),
+        {
+            "requester": ProviderSpec(
+                requester.collect,
+                ["quote"],
+                "unit_requester_v1",
+                priority=1,
+                stage="tail",
+            )
+        },
+        clock=lambda: observed,
+        time_contract=long_contract,
+    ).collect(observed)
+    second_metrics = transport.metrics_snapshot()
+    second_calls = session.calls
+    time.sleep(0.1)
+
+    assert second["collection_metrics"]["late_provider_count"] == 0
+    assert session.calls == second_calls == 3
+    assert transport.metrics_snapshot() == second_metrics
+
+
+def test_provider_priority_and_prewarm_groups_are_explicit(tmp_path):
+    order = []
+    contract = build_close_time_contract(
+        TRADE_DATE,
+        minute_label_semantics=MINUTE_LABEL_START,
+        verified=True,
+        probe_evidence_hash=PROBE_HASH,
+    )
+
+    def provider(name):
+        def collect(_):
+            order.append(name)
+            return ProviderBatch()
+
+        return collect
+
+    providers = {
+        "audit": ProviderSpec(
+            provider("audit"),
+            priority=4,
+            stage="audit",
+        ),
+        "news": ProviderSpec(
+            provider("news"),
+            priority=3,
+            stage="news",
+        ),
+        "static": ProviderSpec(
+            provider("static"),
+            priority=2,
+            stage="prewarm",
+        ),
+        "tail": ProviderSpec(
+            provider("tail"),
+            priority=1,
+            stage="tail",
+        ),
+    }
+    observed = datetime.fromisoformat(
+        "2026-07-30T14:50:00+08:00"
+    )
+    CloseWindowCollector(
+        ImmutableSnapshotStore(tmp_path),
+        providers,
+        clock=lambda: observed,
+        time_contract=contract,
+        max_workers=1,
+    ).collect(observed)
+
+    assert order == ["tail", "static", "news", "audit"]
+    collectors = RealPointInTimeCollectors(["000001"])
+    assert all(
+        item.priority == 1 and item.stage == "tail"
+        for item in collectors.tail_provider_map().values()
+    )
+    assert "eastmoney_industry_mapping" in (
+        collectors.prewarm_provider_map()
+    )
+
+
 def test_concurrent_completion_order_does_not_change_hash_or_decision(
     tmp_path,
 ):
@@ -156,6 +425,7 @@ def test_concurrent_completion_order_does_not_change_hash_or_decision(
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     records = _complete_records(contract)
     midpoint = len(records) // 2
@@ -302,6 +572,7 @@ def test_proxy_does_not_change_formal_score_or_decision_hash():
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     snapshot = _complete_snapshot(contract)
     strategy = CloseConfirmationStrategy()
@@ -341,6 +612,7 @@ def test_proxy_only_fails_gate_and_dashboard_report_is_explicit(
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     snapshot = _complete_snapshot(contract)
     for row in snapshot["records"]:
@@ -380,6 +652,7 @@ def test_late_fund_flow_cannot_change_score_or_snapshot_hash():
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     records = _complete_records(contract)
     snapshot = _complete_snapshot(contract)
@@ -432,6 +705,7 @@ def test_premarket_run_cannot_claim_close_sla(tmp_path):
         TRADE_DATE,
         minute_label_semantics=MINUTE_LABEL_START,
         verified=True,
+        probe_evidence_hash=PROBE_HASH,
     )
     collector = CloseWindowCollector(
         ImmutableSnapshotStore(tmp_path),
@@ -474,15 +748,60 @@ def test_stress_runner_reports_each_candidate_scale(stock_count):
     )
     result = run_provider_stress(
         {"quote": provider},
+        expected_codes=[
+            f"{index:06d}"
+            for index in range(stock_count)
+        ],
         deadline_seconds=1,
     )
 
     assert result["request_count"] == stock_count
-    assert result["coverage_stock_count_by_type"]["quote"] == (
+    assert result["formal_coverage_by_type"]["quote"] == (
         stock_count
     )
-    assert result["completed_before_deadline_ratio"] == 1.0
+    assert result["proxy_coverage_by_type"] == {}
+    assert result["provider_success_ratio"] == 1.0
+    assert result["formal_complete_stock_count"] == 0
+    assert result["formal_complete_stock_ratio"] == 0
+    assert result["not_started_provider_count"] == 0
+    assert result["late_provider_count"] == 0
     assert result["provider_latency_ms"]["p50"] is not None
+    _assert_no_outputs(result)
+
+
+def test_stress_metrics_separate_formal_and_proxy_coverage():
+    rows = [
+        {
+            "data_type": "quote",
+            "payload": {"code": "000001"},
+        },
+        {
+            "data_type": "fund_flow",
+            "payload": {
+                "code": "000001",
+                "is_proxy": True,
+                "eligible_for_hard_gate": False,
+            },
+        },
+    ]
+    result = run_provider_stress(
+        {
+            "mixed": ProviderSpec(
+                lambda _: ProviderBatch(records=rows),
+                priority=1,
+                stage="tail",
+            )
+        },
+        expected_codes=["000001"],
+        deadline_seconds=1,
+    )
+
+    assert result["formal_coverage_by_type"] == {"quote": 1}
+    assert result["proxy_coverage_by_type"] == {
+        "fund_flow": 1
+    }
+    assert result["formal_complete_stock_count"] == 0
+    assert result["formal_complete_stock_ratio"] == 0
     _assert_no_outputs(result)
 
 
@@ -688,7 +1007,16 @@ def _probe_samples(hashes):
     )
     return [
         {
+            "target_at": sampled_at,
             "sampled_at": sampled_at,
+            "request_started_at": sampled_at,
+            "request_completed_at": sampled_at,
+            "request_elapsed_ms": 0,
+            "requested_codes": ["000001"],
+            "covered_codes": ["000001"],
+            "presence_by_code": {
+                "000001": value != "missing"
+            },
             "signatures": (
                 {}
                 if value == "missing"
@@ -698,10 +1026,116 @@ def _probe_samples(hashes):
                     }
                 }
             ),
+            "raw_response_hashes": ["a" * 64],
+            "provider_raw_hash": "b" * 64,
+            "source_versions": ["unit_minute_v1"],
+            "sample_trade_date": TRADE_DATE,
             "error": "",
         }
         for sampled_at, value in zip(times, hashes)
     ]
+
+
+class _AdvancingClock:
+    def __init__(self, value):
+        self.now = value
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=float(seconds))
+
+
+class _ProbeCollectors:
+    def __init__(self, codes, clock):
+        self.codes = list(codes)
+        self.clock = clock
+        self.calls = 0
+
+    def collect_minute_bars(self, observed_at):
+        self.calls += 1
+        values = [None, 1.0, 2.0, 2.0]
+        value = values[self.calls - 1]
+        rows = []
+        for code in self.codes:
+            minute = "14:49" if value is None else "14:50"
+            close = 10.0 if value is None else value
+            rows.append(
+                {
+                    "data_type": "minute_bar",
+                    "event_time": (
+                        f"{TRADE_DATE}T{minute}:00+08:00"
+                    ),
+                    "source": "unit_minute",
+                    "source_version": "unit_minute_v1",
+                    "raw_hash": (
+                        f"{self.calls:x}" * 64
+                    )[:64],
+                    "payload": {
+                        "code": code,
+                        "open": close,
+                        "high": close,
+                        "low": close,
+                        "close": close,
+                        "volume": int(close),
+                        "amount": int(close * 10),
+                    },
+                }
+            )
+        self.clock.advance(0.2)
+        return ProviderBatch(
+            records=rows,
+            data_types=["minute_bar"],
+            source_version="unit_minute_v1",
+            raw_hash=(f"{self.calls:x}" * 64)[:64],
+        )
+
+
+class _UnitHttpResponse:
+    def __init__(self, url):
+        self.content = b"{}"
+        self.status_code = 200
+        self.url = url
+
+    def raise_for_status(self):
+        return None
+
+
+class _SlowSession:
+    def __init__(self, delays):
+        self.delays = list(delays)
+        self.calls = 0
+
+    def request(self, method, url, **kwargs):
+        index = self.calls
+        self.calls += 1
+        delay = (
+            self.delays[index]
+            if index < len(self.delays)
+            else 0
+        )
+        if delay:
+            time.sleep(delay)
+        return _UnitHttpResponse(url)
+
+
+class _RequestingProvider:
+    def __init__(self, transport):
+        self.transport = transport
+
+    def collect(self, _):
+        for index in range(2):
+            self.transport.raise_if_cancelled()
+            self.transport.request(
+                "GET",
+                f"https://unit.test/{index}",
+            )
+        return ProviderBatch(
+            records=[],
+            data_types=["quote"],
+            source_version="unit_requester_v1",
+        )
 
 
 class _FundTransport:

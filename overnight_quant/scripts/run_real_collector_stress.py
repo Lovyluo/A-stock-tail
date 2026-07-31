@@ -54,6 +54,7 @@ def run_real_collector_stress(
         )
         result = run_provider_stress(
             collectors.provider_map(),
+            expected_codes=codes,
             observed_at=datetime.now(CN_TZ),
             deadline_seconds=deadline_seconds,
             max_workers=4,

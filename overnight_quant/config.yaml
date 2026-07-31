@@ -18,6 +18,7 @@ close_confirmation:
   execution_not_before: "14:52:00"
   minute_label_semantics: "unverified"
   minute_label_validation_status: "PENDING_REAL_OBSERVATION"
+  probe_evidence_hash: ""
   entry_start: "14:51"
   cancel_at: "14:56"
   gates:

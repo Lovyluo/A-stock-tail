@@ -54,6 +54,9 @@ class ProviderSpec:
     source_version: str = ""
     deadline_setter: Callable[[float | None], None] | None = None
     metrics_getter: Callable[[], dict[str, Any]] | None = None
+    cancel_setter: Callable[[], None] | None = None
+    priority: int = 3
+    stage: str = "news"
 
     def __post_init__(self) -> None:
         owner = getattr(self.callback, "__self__", None)
@@ -73,6 +76,14 @@ class ProviderSpec:
                 self,
                 "metrics_getter",
                 transport.metrics_snapshot,
+            )
+        if self.cancel_setter is None and callable(
+            getattr(transport, "cancel_current_collection", None)
+        ):
+            object.__setattr__(
+                self,
+                "cancel_setter",
+                transport.cancel_current_collection,
             )
 
     def __call__(
@@ -390,7 +401,7 @@ class CloseWindowCollector:
         )
         futures: dict[Future, str] = {}
         skipped_sources: list[str] = []
-        for source in sorted(self.providers):
+        for source in _provider_submission_order(self.providers):
             if self.monotonic() >= deadline_monotonic:
                 skipped_sources.append(source)
                 continue
@@ -413,15 +424,37 @@ class CloseWindowCollector:
             futures[future]: future.result()
             for future in completed_futures
         }
-        deadline_sources = sorted(
-            [
-                *skipped_sources,
-                *(futures[future] for future in pending_futures),
-            ]
-        )
+        running_at_deadline = {
+            future for future in pending_futures if future.running()
+        }
+        cancelled_before_start = set()
         for future in pending_futures:
-            future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+            if future.cancel():
+                cancelled_before_start.add(future)
+            else:
+                running_at_deadline.add(future)
+        if pending_futures or skipped_sources:
+            self._cancel_providers()
+        executor.shutdown(wait=True, cancel_futures=True)
+        late_sources = sorted(
+            futures[future]
+            for future in running_at_deadline
+        )
+        not_started_sources = sorted(
+            {
+                *skipped_sources,
+                *(
+                    futures[future]
+                    for future in cancelled_before_start
+                ),
+            }
+        )
+        deadline_sources = sorted(
+            {
+                *not_started_sources,
+                *late_sources,
+            }
+        )
         self._set_provider_deadlines(None)
 
         records: list[dict[str, Any]] = []
@@ -597,11 +630,15 @@ class CloseWindowCollector:
         )
         collection_metrics = {
             "provider_count": len(self.providers),
-            "completed_before_deadline": completed_count,
-            "completed_before_deadline_ratio": round(
+            "provider_success_count": completed_count,
+            "provider_success_ratio": round(
                 completed_count / max(1, len(self.providers)),
                 6,
             ),
+            "not_started_provider_count": len(
+                not_started_sources
+            ),
+            "late_provider_count": len(late_sources),
             "deadline_exceeded_count": sum(
                 1
                 for item in provider_metrics.values()
@@ -684,13 +721,32 @@ class CloseWindowCollector:
         self,
         deadline: float | None,
     ) -> None:
-        seen: set[int] = set()
+        seen: set[tuple[int, int]] = set()
         for provider in self.providers.values():
             setter = getattr(provider, "deadline_setter", None)
-            if setter is None or id(setter) in seen:
+            if setter is None:
                 continue
-            seen.add(id(setter))
+            owner = getattr(setter, "__self__", None)
+            function = getattr(setter, "__func__", setter)
+            identity = (id(owner), id(function))
+            if identity in seen:
+                continue
+            seen.add(identity)
             setter(deadline)
+
+    def _cancel_providers(self) -> None:
+        seen: set[tuple[int, int]] = set()
+        for provider in self.providers.values():
+            cancel = getattr(provider, "cancel_setter", None)
+            if cancel is None:
+                continue
+            owner = getattr(cancel, "__self__", None)
+            function = getattr(cancel, "__func__", cancel)
+            identity = (id(owner), id(function))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            cancel()
 
     def _provider_transport_metrics(self) -> dict[str, Any]:
         for provider in self.providers.values():
@@ -1013,6 +1069,19 @@ def _provider_data_types(provider: Any) -> list[str]:
             for item in getattr(provider, "data_types", [])
             if str(item).strip()
         }
+    )
+
+
+def _provider_submission_order(
+    providers: dict[str, Any],
+) -> list[str]:
+    return sorted(
+        providers,
+        key=lambda source: (
+            int(getattr(providers[source], "priority", 3)),
+            str(getattr(providers[source], "stage", "news")),
+            source,
+        ),
     )
 
 

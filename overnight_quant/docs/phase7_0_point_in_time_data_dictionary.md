@@ -163,14 +163,36 @@ source status。冻结后到达的来源状态不能改变已冻结快照及其�
 真实交易日必须在 `14:49:55`、`14:50:05`、`14:50:30`、`14:51:05`
 采样同一供应商接口并比较标记为 14:50 的 OHLCV：
 
-- 14:50 记录在 14:50 分钟内变化、14:51 后稳定：按分钟开始标签处理，
+- 14:49:55 尚不存在 14:50 行，14:50 后出现、在该分钟内变化且 14:51 后稳定：
+  支持分钟开始标签，
   采集截止为 14:51:05，决策为 14:51:10，模拟成交不早于 14:52；
-- 14:50 记录从 14:50 初始采样起稳定：可作为分钟结束标签候选，但仍需使用多只
-  高流动性股票复核；
-- 样本缺失或变化模式不明确：`minute_label_semantics=unverified`，
+- 只有 14:49:55 已存在有效 14:50 行，且后续三个时点均稳定，才支持分钟结束标签；
+- 14:49:55 不存在、后续始终不变，只能得到 `INCONCLUSIVE`；
+- 任一请求迟到、失败、缺少目标股票覆盖或变化模式不明确：
+  `minute_label_semantics=unverified`，
   `data_ready=false`。
 
-当前四时点实盘采样尚未完成，因此不得宣称 14:50 SLA 已通过。
+每个采样点记录 `target_at`、`request_started_at`、`request_completed_at`、
+`request_elapsed_ms`、逐股 `presence_by_code`、`raw_response_hashes`、
+`source_versions` 和 `sample_trade_date`。规范化后的四点证据计算
+`probe_evidence_hash`；标记为 VERIFIED 的时间合同必须绑定合法的 64 位 evidence
+hash，并满足：
+
+```text
+feature_event_cutoff <= collection_deadline
+                     <= decision_time
+                     <= execution_not_before
+```
+
+2026-07-31 已执行一次真实交易日四时点采样。14:50:05 和 14:51:05 两次请求覆盖
+全部 5 只股票，且对应的 14:50 OHLCV 哈希稳定；14:49:55 和 14:50:30 因上游
+连接失败未取得覆盖。由于任一必需时点失败都只能得到 `INCONCLUSIVE`，本次证据
+不能区分分钟开始或分钟结束标签，仍不得宣称 14:50 SLA 已通过，也不得启用
+`minute-label-verified`。
+
+本次脱敏证据哈希为
+`1d9d051a02820da2a06d3bd6eb4d387a8586276687d57a3dbe1f3436f009b14b`。
+原始采样文件仅保存在被忽略的 cache 目录，不进入仓库。
 
 ## 8. 60 日筹码代理日线合同
 

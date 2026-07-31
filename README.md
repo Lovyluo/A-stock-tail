@@ -116,7 +116,12 @@ formal 60-trading-day shadow acceptance period.
 The current conservative contract keeps `feature_event_cutoff=14:50:00`, waits until
 `collection_deadline=14:51:05`, decides at `14:51:10`, and permits simulated fills no earlier
 than `14:52:00`. This is not a claim that the supplier's 14:50 minute label has been verified.
-Until the four-point real-session probe succeeds, minute-label readiness remains blocked.
+The 2026-07-31 four-point real-session probe was inconclusive because two required
+sampling points failed at the upstream connection. The two successful points covered all
+five tracked stocks and produced stable 14:50 OHLCV hashes, but that is not sufficient to
+distinguish minute-start from minute-end labeling. Minute-label readiness remains blocked.
+Any verified time contract must also carry the reviewed `probe_evidence_hash`; a VERIFIED
+label without that evidence, or a contract whose four times are out of order, is rejected.
 
 See also:
 

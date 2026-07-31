@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+import time as time_module
 from typing import Any, Callable
 
 from overnight_quant.data.close_time_contract import (
@@ -22,6 +23,7 @@ PROBE_CLOCKS = (
     time(14, 50, 30),
     time(14, 51, 5),
 )
+MAX_PROBE_START_LAG_SECONDS = 2.0
 
 
 def minute_1450_signature(
@@ -58,8 +60,17 @@ def minute_1450_signature(
 
 def classify_minute_label_samples(
     samples: list[dict[str, Any]],
+    *,
+    required_codes: list[str] | None = None,
 ) -> dict[str, Any]:
-    ordered = sorted(samples, key=lambda item: item["sampled_at"])
+    ordered = sorted(
+        samples,
+        key=lambda item: (
+            item.get("target_at")
+            or item.get("sampled_at")
+            or ""
+        ),
+    )
     expected = [
         "14:49:55",
         "14:50:05",
@@ -67,7 +78,11 @@ def classify_minute_label_samples(
         "14:51:05",
     ]
     by_clock = {
-        str(item.get("sampled_at") or "")[11:19]: item
+        str(
+            item.get("target_at")
+            or item.get("sampled_at")
+            or ""
+        )[11:19]: item
         for item in ordered
     }
     missing_points = [
@@ -85,63 +100,145 @@ def classify_minute_label_samples(
         )
 
     tracked_codes = sorted(
-        set.intersection(
-            *(
-                set((by_clock[clock].get("signatures") or {}).keys())
-                for clock in expected[1:]
+        {
+            str(code).zfill(6)
+            for code in (
+                required_codes
+                or ordered[0].get("requested_codes")
+                or []
+            )
+            if str(code).strip()
+        }
+    )
+    if not tracked_codes:
+        tracked_codes = sorted(
+            set().union(
+                *(
+                    set(
+                        (
+                            by_clock[clock].get("signatures")
+                            or {}
+                        ).keys()
+                    )
+                    for clock in expected
+                )
             )
         )
+    evidence_hash = _probe_evidence_hash(
+        ordered,
+        tracked_codes,
     )
+    timing_errors = _probe_timing_errors(by_clock, expected)
+    if timing_errors:
+        return _probe_result(
+            MINUTE_LABEL_UNVERIFIED,
+            "INCONCLUSIVE",
+            samples=ordered,
+            reasons=timing_errors,
+            tracked_codes=tracked_codes,
+            probe_evidence_hash=evidence_hash,
+        )
+    coverage_errors = []
+    for clock in expected:
+        covered = {
+            str(code).zfill(6)
+            for code in (
+                by_clock[clock].get("covered_codes") or []
+            )
+        }
+        missing = sorted(set(tracked_codes) - covered)
+        if missing:
+            coverage_errors.append(
+                f"probe_stock_coverage_missing:{clock}:"
+                + ",".join(missing)
+            )
+    if coverage_errors:
+        return _probe_result(
+            MINUTE_LABEL_UNVERIFIED,
+            "INCONCLUSIVE",
+            samples=ordered,
+            reasons=coverage_errors,
+            tracked_codes=tracked_codes,
+            probe_evidence_hash=evidence_hash,
+        )
     if not tracked_codes:
         return _probe_result(
             MINUTE_LABEL_UNVERIFIED,
             "INCONCLUSIVE",
             samples=ordered,
-            reasons=["minute_1450_not_present_at_required_points"],
+            reasons=["probe_required_codes_missing"],
+            probe_evidence_hash=evidence_hash,
         )
 
-    changed_during_1450 = False
-    stable_after_1450 = True
-    stable_from_1450_start = True
+    first_present = []
+    later_present = []
+    changed_during_1450 = []
+    stable_after_1450 = []
+    stable_from_first = []
     for code in tracked_codes:
-        hashes = [
-            (
-                by_clock[clock].get("signatures") or {}
-            )[code]["ohlcv_hash"]
-            for clock in expected[1:]
+        signatures = [
+            (by_clock[clock].get("signatures") or {}).get(code)
+            for clock in expected
         ]
-        changed_during_1450 = changed_during_1450 or (
-            hashes[0] != hashes[1]
+        first_present.append(signatures[0] is not None)
+        later_present.append(
+            all(item is not None for item in signatures[1:])
         )
-        stable_after_1450 = stable_after_1450 and (
-            hashes[1] == hashes[2]
-        )
-        stable_from_1450_start = stable_from_1450_start and (
-            hashes[0] == hashes[1] == hashes[2]
-        )
+        if all(item is not None for item in signatures[1:]):
+            hashes = [
+                str(item["ohlcv_hash"])
+                for item in signatures[1:]
+                if item is not None
+            ]
+            changed_during_1450.append(hashes[0] != hashes[1])
+            stable_after_1450.append(hashes[1] == hashes[2])
+        else:
+            changed_during_1450.append(False)
+            stable_after_1450.append(False)
+        if all(item is not None for item in signatures):
+            all_hashes = [
+                str(item["ohlcv_hash"])
+                for item in signatures
+                if item is not None
+            ]
+            stable_from_first.append(len(set(all_hashes)) == 1)
+        else:
+            stable_from_first.append(False)
 
-    if changed_during_1450 and stable_after_1450:
+    if (
+        all(not value for value in first_present)
+        and all(later_present)
+        and all(changed_during_1450)
+        and all(stable_after_1450)
+    ):
         semantics = MINUTE_LABEL_START
         conclusion = "VERIFIED"
         reasons = [
-            "minute_1450_changed_inside_1450_and_stabilized_after_1451"
+            "minute_1450_absent_before_1450_changed_inside_minute_and_stabilized_after_1451"
         ]
-    elif stable_from_1450_start:
+    elif (
+        all(first_present)
+        and all(later_present)
+        and all(stable_from_first)
+    ):
         semantics = MINUTE_LABEL_END
         conclusion = "VERIFIED"
         reasons = [
-            "minute_1450_was_stable_from_1450_start_through_1451"
+            "minute_1450_present_before_1450_and_stable_through_1451"
         ]
     else:
         semantics = MINUTE_LABEL_UNVERIFIED
         conclusion = "INCONCLUSIVE"
-        reasons = ["minute_1450_change_pattern_inconclusive"]
+        reasons = [
+            "minute_1450_presence_or_change_pattern_inconclusive"
+        ]
     return _probe_result(
         semantics,
         conclusion,
         samples=ordered,
         reasons=reasons,
         tracked_codes=tracked_codes,
+        probe_evidence_hash=evidence_hash,
     )
 
 
@@ -152,11 +249,11 @@ def run_scheduled_minute_label_probe(
     collectors: RealPointInTimeCollectors | None = None,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
-    import time as time_module
-
     runtime_clock = clock or (lambda: datetime.now(CN_TZ))
     runtime_sleep = sleep or time_module.sleep
+    runtime_monotonic = monotonic or time_module.monotonic
     current = runtime_clock()
     day = (
         current.date()
@@ -199,27 +296,94 @@ def run_scheduled_minute_label_probe(
         )
         if wait_seconds:
             runtime_sleep(wait_seconds)
-        observed = runtime_clock()
+        request_started = runtime_clock()
+        started_monotonic = runtime_monotonic()
+        signatures = {}
+        covered_codes = []
+        raw_response_hashes = []
+        source_versions = []
+        provider_raw_hash = ""
         try:
-            batch = runtime_collectors.collect_minute_bars(observed)
+            batch = runtime_collectors.collect_minute_bars(
+                request_started
+            )
+            request_completed = runtime_clock()
             signatures = minute_1450_signature(batch.records)
+            covered_codes = sorted(
+                {
+                    str(
+                        (row.get("payload") or {}).get("code")
+                        or ""
+                    ).zfill(6)
+                    for row in batch.records
+                    if str(row.get("data_type") or "")
+                    == "minute_bar"
+                    and (row.get("payload") or {}).get("code")
+                }
+            )
+            raw_response_hashes = sorted(
+                {
+                    str(row.get("raw_hash") or "")
+                    for row in batch.records
+                    if row.get("raw_hash")
+                }
+            )
+            source_versions = sorted(
+                {
+                    str(row.get("source_version") or "")
+                    for row in batch.records
+                    if row.get("source_version")
+                }
+            )
+            provider_raw_hash = str(batch.raw_hash or "")
             error = ""
         except Exception as exc:
+            request_completed = runtime_clock()
             signatures = {}
             error = f"{type(exc).__name__}: {exc}"
+        elapsed_ms = round(
+            (runtime_monotonic() - started_monotonic) * 1000,
+            3,
+        )
         samples.append(
             {
-                "sampled_at": observed.isoformat(timespec="seconds"),
+                "target_at": target.isoformat(
+                    timespec="seconds"
+                ),
+                "sampled_at": request_started.isoformat(
+                    timespec="seconds"
+                ),
+                "request_started_at": request_started.isoformat(
+                    timespec="milliseconds"
+                ),
+                "request_completed_at": request_completed.isoformat(
+                    timespec="milliseconds"
+                ),
+                "request_elapsed_ms": elapsed_ms,
+                "requested_codes": list(runtime_collectors.codes),
+                "covered_codes": covered_codes,
+                "presence_by_code": {
+                    code: code in signatures
+                    for code in runtime_collectors.codes
+                },
                 "signatures": signatures,
+                "raw_response_hashes": raw_response_hashes,
+                "provider_raw_hash": provider_raw_hash,
+                "source_versions": source_versions,
+                "sample_trade_date": day.isoformat(),
                 "error": error,
             }
         )
-    result = classify_minute_label_samples(samples)
+    result = classify_minute_label_samples(
+        samples,
+        required_codes=list(runtime_collectors.codes),
+    )
     result.update(
         {
             "execution_ok": True,
             "data_ready": False,
             "trade_date": day.isoformat(),
+            "requires_manual_review": True,
             "candidates": [],
             "tickets": [],
             "orders": [],
@@ -235,6 +399,7 @@ def _probe_result(
     samples: list[dict[str, Any]],
     reasons: list[str],
     tracked_codes: list[str] | None = None,
+    probe_evidence_hash: str = "",
 ) -> dict[str, Any]:
     verified = conclusion == "VERIFIED"
     contract = build_close_time_contract(
@@ -243,6 +408,9 @@ def _probe_result(
         else date.today(),
         minute_label_semantics=semantics,
         verified=verified,
+        probe_evidence_hash=(
+            probe_evidence_hash if verified else ""
+        ),
     )
     return {
         "status": (
@@ -253,7 +421,111 @@ def _probe_result(
         "minute_label_semantics": semantics,
         "minute_label_validation_status": conclusion,
         "tracked_codes": tracked_codes or [],
+        "probe_evidence_hash": probe_evidence_hash,
         "reasons": reasons,
         "samples": samples,
         "recommended_time_contract": contract.as_dict(),
     }
+
+
+def _probe_timing_errors(
+    by_clock: dict[str, dict[str, Any]],
+    expected: list[str],
+) -> list[str]:
+    errors = []
+    for clock in expected:
+        sample = by_clock[clock]
+        if sample.get("error"):
+            errors.append(f"probe_request_failed:{clock}")
+            continue
+        target = _sample_datetime(
+            sample.get("target_at") or sample.get("sampled_at")
+        )
+        started = _sample_datetime(
+            sample.get("request_started_at")
+            or sample.get("sampled_at")
+        )
+        completed = _sample_datetime(
+            sample.get("request_completed_at")
+            or sample.get("sampled_at")
+        )
+        if target is None or started is None or completed is None:
+            errors.append(f"probe_timing_missing:{clock}")
+            continue
+        if completed < started:
+            errors.append(f"probe_completion_before_start:{clock}")
+        if (
+            started - target
+        ).total_seconds() > MAX_PROBE_START_LAG_SECONDS:
+            errors.append(f"probe_started_late:{clock}")
+    return errors
+
+
+def _probe_evidence_hash(
+    samples: list[dict[str, Any]],
+    tracked_codes: list[str],
+) -> str:
+    evidence = {
+        "tracked_codes": list(tracked_codes),
+        "samples": [
+            {
+                "target_at": item.get("target_at")
+                or item.get("sampled_at"),
+                "request_started_at": item.get(
+                    "request_started_at"
+                )
+                or item.get("sampled_at"),
+                "request_completed_at": item.get(
+                    "request_completed_at"
+                )
+                or item.get("sampled_at"),
+                "request_elapsed_ms": item.get(
+                    "request_elapsed_ms"
+                ),
+                "covered_codes": sorted(
+                    item.get("covered_codes") or []
+                ),
+                "presence_by_code": item.get(
+                    "presence_by_code"
+                )
+                or {
+                    code: code
+                    in (item.get("signatures") or {})
+                    for code in tracked_codes
+                },
+                "signatures": item.get("signatures") or {},
+                "raw_response_hashes": sorted(
+                    item.get("raw_response_hashes") or []
+                ),
+                "provider_raw_hash": item.get(
+                    "provider_raw_hash"
+                )
+                or "",
+                "source_versions": sorted(
+                    item.get("source_versions") or []
+                ),
+                "sample_trade_date": item.get(
+                    "sample_trade_date"
+                )
+                or str(
+                    item.get("sampled_at") or ""
+                )[:10],
+                "error": item.get("error") or "",
+            }
+            for item in samples
+        ],
+    }
+    return stable_hash(evidence)
+
+
+def _sample_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=CN_TZ)
+    return parsed.astimezone(CN_TZ)

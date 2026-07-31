@@ -36,6 +36,7 @@ def run_snapshot_collection(
     collectors: RealPointInTimeCollectors | None = None,
     minute_label_semantics: str = "unverified",
     minute_label_verified: bool = False,
+    probe_evidence_hash: str = "",
 ) -> dict:
     current = now or datetime.now(CN_TZ)
     records = []
@@ -72,6 +73,7 @@ def run_snapshot_collection(
             codes or [],
             minute_label_semantics=minute_label_semantics,
             minute_label_verified=minute_label_verified,
+            probe_evidence_hash=probe_evidence_hash,
         )
         providers = runtime_collectors.provider_map()
         time_contract = (
@@ -91,6 +93,14 @@ def run_snapshot_collection(
                         "minute_label_verified",
                         minute_label_verified,
                     )
+                ),
+                probe_evidence_hash=str(
+                    getattr(
+                        runtime_collectors,
+                        "probe_evidence_hash",
+                        probe_evidence_hash,
+                    )
+                    or ""
                 ),
             )
         )
@@ -150,6 +160,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--probe-evidence-hash",
+        default="",
+        help=(
+            "Reviewed SHA-256 evidence hash required with "
+            "--minute-label-verified."
+        ),
+    )
+    parser.add_argument(
         "--codes",
         default="",
         help="Comma-separated stock codes for real provider collection.",
@@ -169,6 +187,7 @@ def main() -> int:
         ],
         minute_label_semantics=args.minute_label_semantics,
         minute_label_verified=args.minute_label_verified,
+        probe_evidence_hash=args.probe_evidence_hash,
     )
     print(f"Status: {result['status']}")
     print(f"execution_ok: {str(bool(result.get('execution_ok'))).lower()}")
