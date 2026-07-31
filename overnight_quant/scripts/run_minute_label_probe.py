@@ -12,6 +12,10 @@ if str(ROOT) not in sys.path:
 
 from overnight_quant.data.minute_label_probe import (
     run_scheduled_minute_label_probe,
+    write_probe_json_atomic,
+)
+from overnight_quant.data.minute_probe_sources import (
+    SUPPORTED_MINUTE_PROBE_SOURCES,
 )
 
 
@@ -28,6 +32,23 @@ def main() -> int:
         help="Comma-separated liquid A-share codes.",
     )
     parser.add_argument("--date", default=None)
+    parser.add_argument(
+        "--source",
+        choices=SUPPORTED_MINUTE_PROBE_SOURCES,
+        default="eastmoney",
+        help=(
+            "Run one source-specific probe. Evidence from different "
+            "sources is never combined."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Optional JSON path. Python writes UTF-8 atomically; "
+            "do not pipe through Tee-Object."
+        ),
+    )
     args = parser.parse_args()
     result = run_scheduled_minute_label_probe(
         [
@@ -36,7 +57,10 @@ def main() -> int:
             if item.strip()
         ],
         trade_date=args.date,
+        source=args.source,
     )
+    if args.output:
+        write_probe_json_atomic(result, args.output)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return (
         0

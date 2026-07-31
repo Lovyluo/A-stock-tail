@@ -128,6 +128,7 @@ See also:
 - [Point-in-time data dictionary](overnight_quant/docs/phase7_0_point_in_time_data_dictionary.md)
 - [v0.4.1 real collector design](overnight_quant/docs/phase7_1_real_point_in_time_collectors_design.md)
 - [v0.4.1 source validation matrix](overnight_quant/docs/phase7_1_source_validation_matrix.md)
+- [v0.4.1 source qualification design](overnight_quant/docs/phase7_2_source_qualification_design.md)
 - [v0.4 safety boundary](overnight_quant/docs/phase7_0_safety_boundary.md)
 
 ## Common Commands
@@ -148,8 +149,10 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_source_vali
 # Collect real provider records during the close window; no demo fallback
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_collector.py --live --codes 000001
 
-# Probe the supplier's 14:50 minute-label semantics at four real-session times
-D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py
+# Probe each supplier independently and atomically write UTF-8 JSON
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source eastmoney --codes 000001,000333,600000,600519,601318 --date 2026-08-03 --output overnight_quant/data/cache/minute_label_probe_eastmoney_2026-08-03.json
+
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source mootdx --codes 000001,000333,600000,600519,601318 --date 2026-08-03 --output overnight_quant/data/cache/minute_label_probe_mootdx_2026-08-03.json
 
 # Benchmark real providers for 1/10/30/50 stocks without writing snapshots
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_collector_stress.py --sizes 1,10,30,50 --deadline-seconds 8

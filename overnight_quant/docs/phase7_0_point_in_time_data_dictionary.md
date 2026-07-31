@@ -184,6 +184,11 @@ feature_event_cutoff <= collection_deadline
                      <= execution_not_before
 ```
 
+来源资格阶段还要求每个样本包含 `probe_source`。同一 evidence hash 只能覆盖一个来源；
+样本中出现多个来源，或命令指定来源与样本来源不一致时，必须返回
+`MINUTE_LABEL_INCONCLUSIVE`。东财和 mootdx 的不同成功时点不得拼接。原始结果由
+Python 使用临时文件和 `os.replace` 原子写入无 BOM UTF-8 JSON。
+
 2026-07-31 已执行一次真实交易日四时点采样。14:50:05 和 14:51:05 两次请求覆盖
 全部 5 只股票，且对应的 14:50 OHLCV 哈希稳定；14:49:55 和 14:50:30 因上游
 连接失败未取得覆盖。由于任一必需时点失败都只能得到 `INCONCLUSIVE`，本次证据
