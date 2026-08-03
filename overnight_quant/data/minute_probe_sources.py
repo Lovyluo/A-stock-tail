@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Callable, Iterable
 
@@ -29,11 +29,15 @@ SUPPORTED_MINUTE_PROBE_SOURCES = (
 )
 
 
-def _mootdx_source_version() -> str:
+def _mootdx_package_version() -> str:
     try:
-        package_version = version("mootdx")
+        return version("mootdx")
     except PackageNotFoundError:
-        package_version = "unavailable"
+        return "unavailable"
+
+
+def _mootdx_source_version() -> str:
+    package_version = _mootdx_package_version()
     return (
         f"mootdx_{package_version}_tdx_std_bars_1m_"
         "v2026-07-31"
@@ -41,6 +45,10 @@ def _mootdx_source_version() -> str:
 
 
 MOOTDX_MINUTE_SOURCE_VERSION = _mootdx_source_version()
+MOOTDX_TRANSACTION_SOURCE_VERSION = (
+    f"mootdx_{_mootdx_package_version()}_"
+    "tdx_std_transaction_v2026-08-03"
+)
 
 
 def build_minute_probe_collector(
@@ -139,6 +147,108 @@ class MootdxMinuteProbeCollectors:
             raw_hash=stable_hash(sorted(raw_hashes)),
         )
 
+    def collect_transaction_evidence(
+        self,
+        observed_at: datetime,
+        *,
+        page_size: int = 800,
+        max_pages: int = 20,
+    ) -> dict[str, Any]:
+        if not self.codes:
+            raise SourceContractError("target_codes_missing")
+        client = self._get_client()
+        started_at = _as_cn(self.clock())
+        by_code: dict[str, dict[str, Any]] = {}
+        for code in self.codes:
+            rows = []
+            raw_hashes = []
+            page_count = 0
+            error = ""
+            seen_rows = set()
+            for page_index in range(max_pages):
+                start = page_index * page_size
+                try:
+                    frame = client.transaction(
+                        symbol=code,
+                        start=start,
+                        offset=page_size,
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    break
+                page_count += 1
+                if frame is None or getattr(frame, "empty", True):
+                    break
+                page_rows = _normalize_mootdx_transactions(
+                    frame,
+                    code=code,
+                    trade_date=observed_at.date(),
+                    source_offset=start,
+                )
+                if not page_rows:
+                    break
+                page_hash = stable_hash(page_rows)
+                raw_hashes.append(page_hash)
+                new_rows = []
+                for row in page_rows:
+                    identity = stable_hash(row)
+                    if identity in seen_rows:
+                        continue
+                    seen_rows.add(identity)
+                    rows.append(row)
+                    new_rows.append(row)
+                if not new_rows or _covers_attribution_window(rows):
+                    break
+            rows.sort(
+                key=lambda row: (
+                    row["event_time"],
+                    int(row["source_position"]),
+                )
+            )
+            completed_at = _as_cn(self.clock())
+            by_code[code] = {
+                "source": self.probe_source,
+                "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+                "observed_at": _as_cn(observed_at).isoformat(
+                    timespec="milliseconds"
+                ),
+                "available_at": completed_at.isoformat(
+                    timespec="milliseconds"
+                ),
+                "timestamp_precision": _timestamp_precision(rows),
+                "volume_unit": "mootdx_native_volume",
+                "coverage_complete": _covers_attribution_window(rows),
+                "page_count": page_count,
+                "raw_response_hashes": sorted(raw_hashes),
+                "records": rows,
+                "error": error,
+            }
+        completed_at = _as_cn(self.clock())
+        evidence = {
+            "source": self.probe_source,
+            "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+            "trade_date": observed_at.date().isoformat(),
+            "requested_codes": list(self.codes),
+            "request_started_at": started_at.isoformat(
+                timespec="milliseconds"
+            ),
+            "request_completed_at": completed_at.isoformat(
+                timespec="milliseconds"
+            ),
+            "by_code": dict(sorted(by_code.items())),
+        }
+        from overnight_quant.data.transaction_attribution import (
+            compute_transaction_evidence_hash,
+        )
+
+        evidence["transaction_evidence_hash"] = (
+            compute_transaction_evidence_hash(
+                evidence,
+                source=self.probe_source,
+            )
+        )
+        return evidence
+
     def close(self) -> None:
         if self._client is None:
             return
@@ -176,11 +286,12 @@ class MootdxMinuteProbeCollectors:
             "amount": row["amount"],
             "field_units": {
                 "price": "CNY_per_share",
-                "volume": "share",
+                "volume": "mootdx_native_volume",
                 "amount": "CNY",
             },
             "minute_label_semantics": "unverified",
             "minute_label_verified": False,
+            "is_final": False,
         }
         request = {
             "symbol": row["code"],
@@ -211,6 +322,7 @@ class MootdxMinuteProbeCollectors:
             "request_hash": stable_hash(request),
             "raw_hash": raw_hash,
             "data_type": "minute_bar",
+            "is_final": False,
             "payload": payload,
         }
 
@@ -247,6 +359,86 @@ def _normalize_mootdx_rows(
             }
         )
     return sorted(rows, key=lambda row: row["event_time"])
+
+
+def _normalize_mootdx_transactions(
+    frame: Any,
+    *,
+    code: str,
+    trade_date: date,
+    source_offset: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    for row_index, item in enumerate(
+        frame.to_dict(orient="records")
+    ):
+        event, precision = _transaction_event_time(
+            item.get("datetime") or item.get("time"),
+            trade_date=trade_date,
+        )
+        if event is None:
+            continue
+        rows.append(
+            {
+                "code": code,
+                "event_time": event.isoformat(timespec="seconds"),
+                "timestamp_precision": precision,
+                "price": _finite_number(item.get("price")),
+                "volume": _finite_number(
+                    item.get("vol", item.get("volume"))
+                ),
+                "trade_count": int(
+                    _finite_number(item.get("num", 1))
+                ),
+                "buy_or_sell": item.get("buyorsell"),
+                "source_position": source_offset + row_index,
+            }
+        )
+    return rows
+
+
+def _transaction_event_time(
+    value: Any,
+    *,
+    trade_date: date,
+) -> tuple[datetime | None, str]:
+    text = str(value or "").strip()
+    if not text:
+        return None, "missing"
+    precision = "second" if text.count(":") >= 2 else "minute"
+    if "T" not in text and "-" not in text[:10]:
+        text = f"{trade_date.isoformat()}T{text}"
+    event = parse_cn_datetime(text)
+    if event is None or event.date() != trade_date:
+        return None, precision
+    return event, precision
+
+
+def _timestamp_precision(rows: list[dict[str, Any]]) -> str:
+    precisions = {
+        str(row.get("timestamp_precision") or "missing")
+        for row in rows
+    }
+    return "second" if precisions == {"second"} else "insufficient"
+
+
+def _covers_attribution_window(
+    rows: list[dict[str, Any]],
+) -> bool:
+    events = [
+        parse_cn_datetime(row.get("event_time")) for row in rows
+    ]
+    events = [item for item in events if item is not None]
+    if not events:
+        return False
+    day = events[0].date()
+    start = datetime.combine(day, time(14, 49), tzinfo=CN_TZ)
+    end = datetime.combine(
+        day,
+        time(14, 50, 59),
+        tzinfo=CN_TZ,
+    )
+    return min(events) <= start and max(events) >= end
 
 
 def _finite_number(value: Any) -> float:

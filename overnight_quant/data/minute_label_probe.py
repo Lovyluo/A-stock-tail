@@ -17,10 +17,16 @@ from overnight_quant.data.close_time_contract import (
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_probe_sources import (
     PROBE_SOURCE_EASTMONEY,
+    PROBE_SOURCE_MOOTDX,
     build_minute_probe_collector,
     normalize_probe_source,
 )
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.transaction_attribution import (
+    ATTRIBUTION_INCONCLUSIVE,
+    attribute_mootdx_minute_intervals,
+    compute_transaction_evidence_hash,
+)
 
 
 PROBE_CLOCKS = (
@@ -52,11 +58,16 @@ def minute_1450_signature(
                 "close",
                 "volume",
                 "amount",
+                "trade_count",
             )
         }
         signatures[code] = {
             "ohlcv": values,
             "ohlcv_hash": stable_hash(values),
+            "volume_unit": str(
+                (payload.get("field_units") or {}).get("volume")
+                or ""
+            ),
             "source": row.get("source"),
             "source_version": row.get("source_version"),
             "raw_hash": row.get("raw_hash"),
@@ -341,6 +352,7 @@ def run_scheduled_minute_label_probe(
             f"{collector_source}:{normalized_source}"
         )
     samples = []
+    transaction_evidence: dict[str, Any] = {}
     try:
         for target in targets:
             wait_seconds = max(
@@ -432,6 +444,51 @@ def run_scheduled_minute_label_probe(
                     "error": error,
                 }
             )
+        if normalized_source == PROBE_SOURCE_MOOTDX:
+            collect_transactions = getattr(
+                runtime_collectors,
+                "collect_transaction_evidence",
+                None,
+            )
+            if callable(collect_transactions):
+                transaction_started = runtime_clock()
+                try:
+                    transaction_evidence = collect_transactions(
+                        transaction_started
+                    )
+                except Exception as exc:
+                    transaction_evidence = {
+                        "source": normalized_source,
+                        "source_version": str(
+                            getattr(
+                                runtime_collectors,
+                                "source_version",
+                                "",
+                            )
+                        ),
+                        "trade_date": day.isoformat(),
+                        "requested_codes": list(
+                            runtime_collectors.codes
+                        ),
+                        "request_started_at": (
+                            transaction_started.isoformat(
+                                timespec="milliseconds"
+                            )
+                        ),
+                        "request_completed_at": (
+                            runtime_clock().isoformat(
+                                timespec="milliseconds"
+                            )
+                        ),
+                        "by_code": {},
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    transaction_evidence[
+                        "transaction_evidence_hash"
+                    ] = compute_transaction_evidence_hash(
+                        transaction_evidence,
+                        source=normalized_source,
+                    )
     finally:
         close = getattr(runtime_collectors, "close", None)
         if callable(close):
@@ -441,6 +498,45 @@ def run_scheduled_minute_label_probe(
         required_codes=list(runtime_collectors.codes),
         source=normalized_source,
     )
+    result["source_role"] = (
+        "qualification_candidate"
+        if normalized_source == PROBE_SOURCE_MOOTDX
+        else "audit_only"
+    )
+    if normalized_source == PROBE_SOURCE_MOOTDX:
+        if transaction_evidence:
+            attribution = attribute_mootdx_minute_intervals(
+                result,
+                transaction_evidence,
+            )
+        else:
+            attribution = {
+                "status": ATTRIBUTION_INCONCLUSIVE,
+                "source": normalized_source,
+                "reasons": ["transaction_evidence_missing"],
+                "per_stock": {},
+                "all_stocks_final": False,
+                "provisional_time_contract": {},
+                "combined_evidence_hash": "",
+            }
+        result["transaction_evidence"] = transaction_evidence
+        result["transaction_attribution"] = attribution
+        result["transaction_evidence_hash"] = str(
+            transaction_evidence.get("transaction_evidence_hash")
+            or ""
+        )
+        result["combined_evidence_hash"] = str(
+            attribution.get("combined_evidence_hash") or ""
+        )
+        if attribution.get("status") != ATTRIBUTION_INCONCLUSIVE:
+            result["status"] = "MINUTE_LABEL_PROVISIONAL"
+            result["minute_label_semantics"] = attribution["status"]
+            result["minute_label_validation_status"] = (
+                "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+            )
+            result["recommended_time_contract"] = attribution[
+                "provisional_time_contract"
+            ]
     all_source_versions = sorted(
         {
             version
@@ -604,12 +700,15 @@ def compute_probe_evidence_hash(
     samples: list[dict[str, Any]],
     tracked_codes: list[str],
     *,
-    source: str = "",
+    source: str,
 ) -> str:
+    normalized_source = str(source or "").strip().lower()
+    if not normalized_source:
+        raise ValueError("evidence_source_required")
     return _probe_evidence_hash(
         samples,
         tracked_codes,
-        source=source,
+        source=normalized_source,
     )
 
 

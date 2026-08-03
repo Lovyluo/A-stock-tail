@@ -19,6 +19,10 @@ from overnight_quant.data.minute_probe_sources import (
 from overnight_quant.data.source_qualification import (
     evaluate_minute_source_qualification,
 )
+from overnight_quant.data.transaction_attribution import (
+    attribute_mootdx_minute_intervals,
+    compute_transaction_evidence_hash,
+)
 from overnight_quant.scripts import run_minute_label_probe as probe_script
 
 
@@ -154,7 +158,7 @@ def test_mootdx_collector_emits_independent_minute_records():
 
 def test_three_consecutive_source_specific_days_qualify_for_review():
     results = [
-        _verified_result(day, "mootdx")
+        _provisional_result(day)
         for day in CALENDAR
     ]
 
@@ -178,9 +182,9 @@ def test_three_consecutive_source_specific_days_qualify_for_review():
     assert qualification["orders"] == []
 
 
-def test_one_verified_day_does_not_qualify_source():
+def test_eastmoney_is_audit_only_and_never_counts_as_qualified_day():
     qualification = evaluate_minute_source_qualification(
-        [_verified_result(CALENDAR[0], "eastmoney")],
+            [_verified_result(CALENDAR[0], "eastmoney")],
         source="eastmoney",
         trading_calendar=CALENDAR_CONTRACT,
         expected_codes=CODES,
@@ -188,14 +192,15 @@ def test_one_verified_day_does_not_qualify_source():
 
     assert qualification["qualified_for_configuration_review"] is False
     assert (
-        "consecutive_qualified_days_below_minimum:1"
+        "audit_only_source_not_eligible"
         in qualification["qualification_errors"]
     )
+    assert qualification["maximum_consecutive_qualified_days"] == 0
 
 
 def test_unversioned_trading_calendar_cannot_qualify_source():
     results = [
-        _verified_result(day, "mootdx")
+        _provisional_result(day)
         for day in CALENDAR
     ]
 
@@ -226,7 +231,7 @@ def test_nonconsecutive_days_do_not_satisfy_qualification():
         "2026-08-06",
     ]
     results = [
-        _verified_result(day, "mootdx")
+        _provisional_result(day)
         for day in (calendar[0], calendar[2], calendar[3])
     ]
 
@@ -246,7 +251,7 @@ def test_nonconsecutive_days_do_not_satisfy_qualification():
 
 def test_request_p95_above_two_seconds_blocks_qualification():
     results = [
-        _verified_result(day, "eastmoney")
+        _provisional_result(day)
         for day in CALENDAR
     ]
     results[1]["samples"][2]["request_elapsed_ms"] = 2501
@@ -254,7 +259,7 @@ def test_request_p95_above_two_seconds_blocks_qualification():
 
     qualification = evaluate_minute_source_qualification(
         results,
-        source="eastmoney",
+        source="mootdx",
         trading_calendar=CALENDAR_CONTRACT,
         expected_codes=CODES,
     )
@@ -269,7 +274,7 @@ def test_request_p95_above_two_seconds_blocks_qualification():
 
 def test_evidence_hash_drift_blocks_qualification():
     results = [
-        _verified_result(day, "mootdx")
+        _provisional_result(day)
         for day in CALENDAR
     ]
     results[0]["samples"][0]["request_completed_at"] = (
@@ -291,7 +296,7 @@ def test_evidence_hash_drift_blocks_qualification():
 
 def test_inconclusive_day_cannot_be_used_for_source_qualification():
     results = [
-        _verified_result(day, "eastmoney")
+        _provisional_result(day)
         for day in CALENDAR
     ]
     results[1]["status"] = "MINUTE_LABEL_INCONCLUSIVE"
@@ -299,13 +304,13 @@ def test_inconclusive_day_cannot_be_used_for_source_qualification():
 
     qualification = evaluate_minute_source_qualification(
         results,
-        source="eastmoney",
+        source="mootdx",
         trading_calendar=CALENDAR_CONTRACT,
         expected_codes=CODES,
     )
 
     assert qualification["qualified_for_configuration_review"] is False
-    assert "probe_day_not_verified" in qualification[
+    assert "probe_day_not_provisional" in qualification[
         "qualification_errors"
     ]
 
@@ -333,6 +338,82 @@ def _verified_result(day, source):
     return result
 
 
+def _provisional_result(day):
+    result = _verified_result(day, "mootdx")
+    transaction = {
+        "source": "mootdx",
+        "source_version": "mootdx_transaction_v1",
+        "trade_date": day,
+        "requested_codes": list(CODES),
+        "request_started_at": f"{day}T14:51:06+08:00",
+        "request_completed_at": f"{day}T14:51:07+08:00",
+        "by_code": {
+            code: _transaction_rows(day, code) for code in CODES
+        },
+    }
+    transaction["transaction_evidence_hash"] = (
+        compute_transaction_evidence_hash(
+            transaction,
+            source="mootdx",
+        )
+    )
+    attribution = attribute_mootdx_minute_intervals(
+        result,
+        transaction,
+    )
+    result.update(
+        {
+            "status": "MINUTE_LABEL_PROVISIONAL",
+            "minute_label_semantics": attribution["status"],
+            "minute_label_validation_status": (
+                "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+            ),
+            "source_role": "qualification_candidate",
+            "transaction_evidence": transaction,
+            "transaction_attribution": attribution,
+            "transaction_evidence_hash": transaction[
+                "transaction_evidence_hash"
+            ],
+            "combined_evidence_hash": attribution[
+                "combined_evidence_hash"
+            ],
+            "recommended_time_contract": attribution[
+                "provisional_time_contract"
+            ],
+        }
+    )
+    return result
+
+
+def _transaction_rows(day, code):
+    return {
+        "source": "mootdx",
+        "source_version": "mootdx_transaction_v1",
+        "timestamp_precision": "second",
+        "volume_unit": "mootdx_native_volume",
+        "coverage_complete": True,
+        "records": [
+            _transaction(day, code, "14:49:00", 10.0, 40, 0),
+            _transaction(day, code, "14:49:59", 10.0, 60, 1),
+            _transaction(day, code, "14:50:00", 9.9, 10, 2),
+            _transaction(day, code, "14:50:59", 9.8, 20, 3),
+        ],
+        "error": "",
+    }
+
+
+def _transaction(day, code, clock, price, volume, position):
+    return {
+        "code": code,
+        "event_time": f"{day}T{clock}+08:00",
+        "timestamp_precision": "second",
+        "price": price,
+        "volume": volume,
+        "trade_count": 1,
+        "source_position": position,
+    }
+
+
 def _reclassify_result(result):
     source = result["source"]
     rebuilt = classify_minute_label_samples(
@@ -354,6 +435,33 @@ def _reclassify_result(result):
             "orders": [],
         }
     )
+    if source == "mootdx" and result.get("transaction_evidence"):
+        transaction = result["transaction_evidence"]
+        attribution = attribute_mootdx_minute_intervals(
+            rebuilt,
+            transaction,
+        )
+        rebuilt.update(
+            {
+                "status": "MINUTE_LABEL_PROVISIONAL",
+                "minute_label_semantics": attribution["status"],
+                "minute_label_validation_status": (
+                    "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+                ),
+                "source_role": "qualification_candidate",
+                "transaction_evidence": transaction,
+                "transaction_attribution": attribution,
+                "transaction_evidence_hash": transaction[
+                    "transaction_evidence_hash"
+                ],
+                "combined_evidence_hash": attribution[
+                    "combined_evidence_hash"
+                ],
+                "recommended_time_contract": attribution[
+                    "provisional_time_contract"
+                ],
+            }
+        )
     return rebuilt
 
 
@@ -365,6 +473,15 @@ def _verified_samples(day, source):
         signatures = {
             code: {
                 "ohlcv_hash": "a" * 64,
+                "ohlcv": {
+                    "open": 10.0,
+                    "high": 10.0,
+                    "low": 10.0,
+                    "close": 10.0,
+                    "volume": 100.0,
+                    "amount": 1000.0,
+                },
+                "volume_unit": "mootdx_native_volume",
                 "source": source,
                 "source_version": f"{source}_minute_v1",
                 "raw_hash": f"{index + 1:x}" * 64,

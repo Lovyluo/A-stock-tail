@@ -64,7 +64,8 @@ def main() -> int:
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return (
         0
-        if result.get("status") == "MINUTE_LABEL_VERIFIED"
+        if result.get("status")
+        in {"MINUTE_LABEL_VERIFIED", "MINUTE_LABEL_PROVISIONAL"}
         else 2
     )
 

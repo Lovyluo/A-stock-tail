@@ -10,8 +10,14 @@ from overnight_quant.data.market_calendar import CN_TZ
 TIME_CONTRACT_VERSION = "close_confirmation_timeline_v2"
 MINUTE_LABEL_END = "minute_end"
 MINUTE_LABEL_START = "minute_start"
+MINUTE_LABEL_END_PROVISIONAL = "minute_end_provisional"
+MINUTE_LABEL_START_PROVISIONAL = "minute_start_provisional"
 MINUTE_LABEL_UNVERIFIED = "unverified"
 VALIDATED_MINUTE_LABELS = {MINUTE_LABEL_END, MINUTE_LABEL_START}
+PROVISIONAL_MINUTE_LABELS = {
+    MINUTE_LABEL_END_PROVISIONAL,
+    MINUTE_LABEL_START_PROVISIONAL,
+}
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,15 @@ class CloseTimeContract:
     minute_label_validation_status: str = "PENDING_REAL_OBSERVATION"
     probe_evidence_hash: str = ""
     contract_version: str = TIME_CONTRACT_VERSION
+    bar_label_time: str = ""
+    interval_start: str = ""
+    interval_end: str = ""
+    first_observed_at: str = ""
+    finalized_at: str = ""
+    is_final: bool = True
+    finalization_delay_ms: float = 0.0
+    transaction_evidence_hash: str = ""
+    combined_evidence_hash: str = ""
 
     def __post_init__(self) -> None:
         values = [
@@ -51,6 +66,47 @@ class CloseTimeContract:
             raise ValueError(
                 "verified_minute_label_requires_probe_evidence_hash"
             )
+        if self.minute_label_semantics in PROVISIONAL_MINUTE_LABELS:
+            if (
+                self.minute_label_validation_status
+                != "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+            ):
+                raise ValueError(
+                    "provisional_minute_label_status_invalid"
+                )
+            if not self.is_final:
+                raise ValueError(
+                    "provisional_minute_label_requires_final_bar"
+                )
+            if not all(
+                _valid_evidence_hash(value)
+                for value in (
+                    self.probe_evidence_hash,
+                    self.transaction_evidence_hash,
+                    self.combined_evidence_hash,
+                )
+            ):
+                raise ValueError(
+                    "provisional_minute_label_evidence_invalid"
+                )
+            attribution_times = [
+                _parse_datetime(value)
+                for value in (
+                    self.bar_label_time,
+                    self.interval_start,
+                    self.interval_end,
+                    self.first_observed_at,
+                    self.finalized_at,
+                )
+            ]
+            if any(value is None for value in attribution_times):
+                raise ValueError(
+                    "provisional_minute_label_times_invalid"
+                )
+            if float(self.finalization_delay_ms) < 0:
+                raise ValueError(
+                    "provisional_finalization_delay_invalid"
+                )
 
     @property
     def minute_label_verified(self) -> bool:
@@ -58,6 +114,19 @@ class CloseTimeContract:
             self.minute_label_semantics in VALIDATED_MINUTE_LABELS
             and self.minute_label_validation_status == "VERIFIED"
         )
+
+    @property
+    def minute_label_provisional(self) -> bool:
+        return (
+            self.minute_label_semantics in PROVISIONAL_MINUTE_LABELS
+            and self.minute_label_validation_status
+            == "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+            and self.is_final
+        )
+
+    @property
+    def decision_eligible(self) -> bool:
+        return self.minute_label_verified and self.is_final
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,6 +138,15 @@ def build_close_time_contract(
     minute_label_semantics: str = MINUTE_LABEL_UNVERIFIED,
     verified: bool = False,
     probe_evidence_hash: str = "",
+    bar_label_time: str = "",
+    interval_start: str = "",
+    interval_end: str = "",
+    first_observed_at: str = "",
+    finalized_at: str = "",
+    is_final: bool = True,
+    finalization_delay_ms: float = 0.0,
+    transaction_evidence_hash: str = "",
+    combined_evidence_hash: str = "",
 ) -> CloseTimeContract:
     day = (
         trade_date
@@ -79,11 +157,16 @@ def build_close_time_contract(
     if semantics not in {
         MINUTE_LABEL_END,
         MINUTE_LABEL_START,
+        MINUTE_LABEL_END_PROVISIONAL,
+        MINUTE_LABEL_START_PROVISIONAL,
         MINUTE_LABEL_UNVERIFIED,
     }:
         raise ValueError(f"minute_label_semantics_invalid:{semantics}")
 
-    if semantics == MINUTE_LABEL_END:
+    if semantics in {
+        MINUTE_LABEL_END,
+        MINUTE_LABEL_END_PROVISIONAL,
+    }:
         collection_deadline = time(14, 50, 30)
         decision_time = time(14, 50, 35)
         execution_not_before = time(14, 51)
@@ -93,11 +176,14 @@ def build_close_time_contract(
         decision_time = time(14, 51, 10)
         execution_not_before = time(14, 52)
 
-    validation_status = (
-        "VERIFIED"
-        if verified and semantics in VALIDATED_MINUTE_LABELS
-        else "PENDING_REAL_OBSERVATION"
-    )
+    if semantics in PROVISIONAL_MINUTE_LABELS:
+        validation_status = "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+    else:
+        validation_status = (
+            "VERIFIED"
+            if verified and semantics in VALIDATED_MINUTE_LABELS
+            else "PENDING_REAL_OBSERVATION"
+        )
     if validation_status == "VERIFIED" and not _valid_evidence_hash(
         probe_evidence_hash
     ):
@@ -112,6 +198,17 @@ def build_close_time_contract(
         minute_label_semantics=semantics,
         minute_label_validation_status=validation_status,
         probe_evidence_hash=str(probe_evidence_hash),
+        bar_label_time=str(bar_label_time or ""),
+        interval_start=str(interval_start or ""),
+        interval_end=str(interval_end or ""),
+        first_observed_at=str(first_observed_at or ""),
+        finalized_at=str(finalized_at or ""),
+        is_final=bool(is_final),
+        finalization_delay_ms=float(finalization_delay_ms or 0.0),
+        transaction_evidence_hash=str(
+            transaction_evidence_hash or ""
+        ),
+        combined_evidence_hash=str(combined_evidence_hash or ""),
     )
 
 
@@ -155,6 +252,23 @@ def normalize_close_time_contract(
             ),
             contract_version=str(
                 value.get("contract_version") or TIME_CONTRACT_VERSION
+            ),
+            bar_label_time=str(value.get("bar_label_time") or ""),
+            interval_start=str(value.get("interval_start") or ""),
+            interval_end=str(value.get("interval_end") or ""),
+            first_observed_at=str(
+                value.get("first_observed_at") or ""
+            ),
+            finalized_at=str(value.get("finalized_at") or ""),
+            is_final=bool(value.get("is_final", True)),
+            finalization_delay_ms=float(
+                value.get("finalization_delay_ms") or 0.0
+            ),
+            transaction_evidence_hash=str(
+                value.get("transaction_evidence_hash") or ""
+            ),
+            combined_evidence_hash=str(
+                value.get("combined_evidence_hash") or ""
             ),
         )
     if fallback_decision_time in (None, ""):

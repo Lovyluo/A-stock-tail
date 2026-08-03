@@ -189,6 +189,37 @@ feature_event_cutoff <= collection_deadline
 `MINUTE_LABEL_INCONCLUSIVE`。东财和 mootdx 的不同成功时点不得拼接。原始结果由
 Python 使用临时文件和 `os.replace` 原子写入无 BOM UTF-8 JSON。
 
+### 7.1.1 同源逐笔归因与 provisional 合同
+
+mootdx 资格采样在最后一个分钟采样点之后，使用同一来源的逐笔接口分别聚合
+`14:49:00-14:49:59` 和 `14:50:00-14:50:59`。只有其中一个区间与最终稳定的
+14:50 分钟行在 open、high、low、close、volume 上精确匹配，且成交记录完整、秒级
+时间与原生数量单位一致时，才允许记录 `minute_end_provisional` 或
+`minute_start_provisional`。两边都匹配、两边都不匹配、覆盖不足或单位不一致时保持
+`INCONCLUSIVE`。不能从时间标签文本直接推断语义。
+
+mootdx 分钟 K 线当前不提供成交笔数字段。逐笔聚合的 `trade_count` 必须保留在证据中，
+并标记 `minute_bar_field_unavailable_audit_only`；不得把它描述成已经完成字段等价性
+证明。这也是结论保持 provisional、不能成为正式决策合同的原因之一。
+
+provisional 时间合同新增字段：
+
+| 字段 | 含义 |
+|---|---|
+| `bar_label_time` | 被归因的稳定分钟行标签时间 |
+| `interval_start` / `interval_end` | 匹配的实际成交事件区间 |
+| `first_observed_at` | 首次观察到该分钟行的时间 |
+| `finalized_at` | 至少三次稳定观察后确认不再变化的时间 |
+| `is_final` | 该证据中的分钟行是否已稳定；false 时禁止进入决策 |
+| `finalization_delay_ms` | 区间结束到最终确认的延迟 |
+| `transaction_evidence_hash` | 单一来源逐笔证据哈希 |
+| `combined_evidence_hash` | 分钟证据与逐笔归因的组合哈希 |
+
+`is_final=false` 的分钟记录在规范化时以 `minute_bar_not_final` 拒绝，不得进入
+readiness、评分、`snapshot_hash` 或 `decision_hash`。即使 `is_final=true`，provisional
+合同仍不是正式决策可用合同；只有完成连续多日验证并经 PM 人工复核后才能讨论配置
+变更。
+
 2026-07-31 已执行一次真实交易日四时点采样。14:50:05 和 14:51:05 两次请求覆盖
 全部 5 只股票，且对应的 14:50 OHLCV 哈希稳定；14:49:55 和 14:50:30 因上游
 连接失败未取得覆盖。由于任一必需时点失败都只能得到 `INCONCLUSIVE`，本次证据

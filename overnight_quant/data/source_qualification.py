@@ -8,8 +8,18 @@ from overnight_quant.data.minute_label_probe import (
     compute_probe_evidence_hash,
 )
 from overnight_quant.data.minute_probe_sources import (
+    PROBE_SOURCE_EASTMONEY,
+    PROBE_SOURCE_MOOTDX,
     normalize_probe_source,
 )
+from overnight_quant.data.close_time_contract import (
+    PROVISIONAL_MINUTE_LABELS,
+)
+from overnight_quant.data.transaction_attribution import (
+    attribute_mootdx_minute_intervals,
+    compute_transaction_evidence_hash,
+)
+from overnight_quant.data.point_in_time import stable_hash
 
 
 REQUIRED_PROBE_CLOCKS = (
@@ -58,6 +68,10 @@ def evaluate_minute_source_qualification(
     qualified_dates = []
 
     errors.extend(_calendar_contract_errors(calendar_contract))
+    if normalized_source == PROBE_SOURCE_EASTMONEY:
+        errors.append("audit_only_source_not_eligible")
+    elif normalized_source != PROBE_SOURCE_MOOTDX:
+        errors.append("source_not_qualification_candidate")
     if not results:
         errors.append("probe_results_missing")
 
@@ -186,10 +200,17 @@ def _validate_probe_day(
         errors.append(
             f"probe_source_mismatch:{result_source or '<empty>'}"
         )
-    if result.get("status") != "MINUTE_LABEL_VERIFIED":
-        errors.append("probe_day_not_verified")
-    if result.get("minute_label_validation_status") != "VERIFIED":
-        errors.append("probe_validation_status_not_verified")
+    if result.get("status") != "MINUTE_LABEL_PROVISIONAL":
+        errors.append("probe_day_not_provisional")
+    if result.get("minute_label_validation_status") != (
+        "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+    ):
+        errors.append("probe_transaction_attribution_missing")
+    semantics = str(result.get("minute_label_semantics") or "")
+    if semantics not in PROVISIONAL_MINUTE_LABELS:
+        errors.append("probe_provisional_semantics_invalid")
+    if result.get("source_role") != "qualification_candidate":
+        errors.append("probe_source_role_not_eligible")
     if int(result.get("late_record_count") or 0) != 0:
         errors.append("probe_late_records_present")
     if any(result.get(key) for key in ("candidates", "tickets", "orders")):
@@ -240,6 +261,57 @@ def _validate_probe_day(
     actual_hash = str(result.get("probe_evidence_hash") or "")
     if not _is_hash(actual_hash) or actual_hash != expected_hash:
         errors.append("probe_evidence_hash_drift")
+
+    transaction = dict(result.get("transaction_evidence") or {})
+    attribution = dict(result.get("transaction_attribution") or {})
+    try:
+        expected_transaction_hash = compute_transaction_evidence_hash(
+            transaction,
+            source=source,
+        )
+    except ValueError:
+        expected_transaction_hash = ""
+    actual_transaction_hash = str(
+        result.get("transaction_evidence_hash") or ""
+    )
+    if (
+        not _is_hash(actual_transaction_hash)
+        or actual_transaction_hash != expected_transaction_hash
+    ):
+        errors.append("transaction_evidence_hash_drift")
+    try:
+        expected_attribution = attribute_mootdx_minute_intervals(
+            result,
+            transaction,
+        )
+        expected_combined_hash = str(
+            expected_attribution.get("combined_evidence_hash") or ""
+        )
+        if stable_hash(attribution) != stable_hash(
+            expected_attribution
+        ):
+            errors.append("transaction_attribution_derivation_drift")
+    except (KeyError, ValueError):
+        expected_combined_hash = ""
+    actual_combined_hash = str(
+        result.get("combined_evidence_hash") or ""
+    )
+    if (
+        not _is_hash(actual_combined_hash)
+        or actual_combined_hash != expected_combined_hash
+    ):
+        errors.append("combined_evidence_hash_drift")
+    if attribution.get("status") != semantics:
+        errors.append("transaction_attribution_semantics_mismatch")
+    per_stock = attribution.get("per_stock") or {}
+    if sorted(per_stock) != codes:
+        errors.append("transaction_attribution_coverage_incomplete")
+    elif any(
+        row.get("status") != semantics
+        or row.get("is_final") is not True
+        for row in per_stock.values()
+    ):
+        errors.append("transaction_attribution_not_final_or_consistent")
     return sorted(set(errors))
 
 
