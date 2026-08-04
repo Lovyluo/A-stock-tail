@@ -6,13 +6,19 @@ param(
 
     [string]$Codes = '000001,000333,600000,600519,601318',
 
-    [string]$ProjectRoot = 'D:\A-stock',
+    [string]$ProjectRoot = '',
 
     [switch]$ValidateOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $ProjectRoot = [IO.Path]::GetFullPath(
+        (Join-Path $PSScriptRoot '..\..')
+    )
+}
 
 $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $probeScript = Join-Path $ProjectRoot 'overnight_quant\scripts\run_minute_label_probe.py'
