@@ -20,7 +20,14 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     )
 }
 
-$python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+$venvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+$python = if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+    $venvPython
+}
+else {
+    $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($null -eq $pythonCommand) { '' } else { $pythonCommand.Source }
+}
 $probeScript = Join-Path $ProjectRoot 'overnight_quant\scripts\run_minute_label_probe.py'
 $cacheDir = Join-Path $ProjectRoot 'overnight_quant\data\cache'
 $day = [datetime]::ParseExact(
@@ -201,7 +208,8 @@ $script:watchdogStartedAt = [datetime]::Now.ToString(
     'yyyy-MM-ddTHH:mm:ss.fffK'
 )
 
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+if ([string]::IsNullOrWhiteSpace($python) -or
+    -not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "python_missing:$python"
 }
 if (-not (Test-Path -LiteralPath $probeScript -PathType Leaf)) {
