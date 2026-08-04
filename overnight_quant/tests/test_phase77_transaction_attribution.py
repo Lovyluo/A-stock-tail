@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import json
+from pathlib import Path
+import subprocess
 import sys
 
 import pandas as pd
@@ -264,6 +266,41 @@ def test_scheduled_mootdx_probe_stays_research_only_with_provisional_result():
     assert result["tickets"] == []
     assert result["orders"] == []
     assert collector.closed is True
+
+
+def test_watchdog_validate_only_exposes_safe_start_window():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_minute_probe_watchdog.ps1"
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-Date",
+            "2026-08-05",
+            "-ValidateOnly",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["status"] == "WATCHDOG_VALIDATED"
+    assert result["start_at"].endswith("T14:40:00")
+    assert result["last_safe_start"].endswith("T14:49:50")
+    assert result["sources"] == ["mootdx", "eastmoney"]
+    assert result["candidates"] == []
+    assert result["tickets"] == []
+    assert result["orders"] == []
 
 
 def _complete_payload():
