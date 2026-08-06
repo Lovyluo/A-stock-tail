@@ -13,7 +13,10 @@ if str(ROOT) not in sys.path:
 from overnight_quant.data.minute_label_probe import (
     write_probe_json_atomic,
 )
+from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.probe_evidence import verify_probe_evidence
 from overnight_quant.data.transaction_attribution import (
+    REANALYSIS_INPUT_INVALID,
     build_mootdx_probe_reanalysis,
 )
 
@@ -39,28 +42,60 @@ def main() -> int:
     payload = json.loads(raw.decode("utf-8"))
     result = build_mootdx_probe_reanalysis(payload)
     write_probe_json_atomic(result, target)
+    written = json.loads(target.read_text(encoding="utf-8"))
+    verification = verify_probe_evidence(written, source="mootdx")
+    successful = (
+        result.get("status") == "PM_REVIEW_REQUIRED"
+        and verification.get("status") == "PROBE_EVIDENCE_VERIFIED"
+    )
+    if not successful and result.get("status") == "PM_REVIEW_REQUIRED":
+        result["status"] = "REANALYSIS_OUTPUT_INVALID"
+        result["execution_ok"] = False
+        result["minute_label_validation_status"] = "INVALID"
+        result["reanalysis_errors"] = sorted(
+            {
+                "independent_evidence_verification_failed",
+                *(
+                    str(error)
+                    for error in (verification.get("errors") or [])
+                ),
+            }
+        )
+    result["independent_evidence_verification"] = verification
+    result.pop("reanalysis_evidence_hash", None)
+    result["reanalysis_evidence_hash"] = stable_hash(result)
+    write_probe_json_atomic(result, target)
     print(
         json.dumps(
             {
-                "status": result["status"],
-                "data_ready": result["data_ready"],
-                "source": result["source"],
-                "trade_date": result["trade_date"],
-                "minute_label_semantics": result[
-                    "minute_label_semantics"
-                ],
-                "probe_evidence_hash": result[
-                    "probe_evidence_hash"
-                ],
-                "transaction_evidence_hash": result[
-                    "transaction_evidence_hash"
-                ],
-                "combined_evidence_hash": result[
-                    "combined_evidence_hash"
-                ],
-                "reanalysis_evidence_hash": result[
-                    "reanalysis_evidence_hash"
-                ],
+                "status": result.get("status", REANALYSIS_INPUT_INVALID),
+                "data_ready": bool(result.get("data_ready")),
+                "source": result.get("source", "mootdx"),
+                "trade_date": result.get("trade_date", ""),
+                "minute_label_semantics": result.get(
+                    "minute_label_semantics",
+                    "INCONCLUSIVE",
+                ),
+                "probe_evidence_hash": result.get(
+                    "probe_evidence_hash",
+                    "",
+                ),
+                "transaction_evidence_hash": result.get(
+                    "transaction_evidence_hash",
+                    "",
+                ),
+                "combined_evidence_hash": result.get(
+                    "combined_evidence_hash",
+                    "",
+                ),
+                "reanalysis_evidence_hash": result.get(
+                    "reanalysis_evidence_hash",
+                    "",
+                ),
+                "independent_verification_status": verification.get(
+                    "status",
+                    "PROBE_EVIDENCE_INVALID",
+                ),
                 "output": str(target),
                 "candidates": [],
                 "tickets": [],
@@ -71,7 +106,7 @@ def main() -> int:
             sort_keys=True,
         )
     )
-    return 0 if result["status"] == "PM_REVIEW_REQUIRED" else 2
+    return 0 if successful else 2
 
 
 if __name__ == "__main__":

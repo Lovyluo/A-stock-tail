@@ -33,7 +33,11 @@ from overnight_quant.data.snapshot_store import ProviderBatch
 from overnight_quant.data.transaction_attribution import (
     ATTRIBUTION_INCONCLUSIVE,
     MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
+    MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION,
+    MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION,
+    MOOTDX_LEGACY_TRANSACTION_VOLUME_UNIT,
     MOOTDX_LOT_TO_SHARE_BASIS,
+    REANALYSIS_INPUT_INVALID,
     aggregate_transaction_interval,
     attribute_mootdx_minute_intervals,
     build_mootdx_probe_reanalysis,
@@ -41,6 +45,7 @@ from overnight_quant.data.transaction_attribution import (
     normalize_mootdx_transaction_evidence,
 )
 from overnight_quant.scripts import run_probe_evidence_verify
+from overnight_quant.scripts import run_mootdx_probe_reanalysis
 
 
 DAY = "2026-08-04"
@@ -316,6 +321,200 @@ def test_reanalysis_is_deterministic_and_never_updates_qualification():
     assert first["orders"] == []
 
 
+def test_reanalysis_rejects_probe_timing_drift_before_normalization():
+    payload = _complete_payload()
+    payload["samples"][0]["request_elapsed_ms"] += 1
+
+    result = build_mootdx_probe_reanalysis(payload)
+
+    _assert_invalid_reanalysis(result)
+    assert "minute_probe_evidence_hash_drift" in result[
+        "reanalysis_errors"
+    ]
+
+
+@pytest.mark.parametrize("hash_layer", ["transaction", "combined"])
+def test_reanalysis_rejects_original_hash_drift(hash_layer):
+    payload = _complete_payload()
+    if hash_layer == "transaction":
+        payload["transaction_evidence"]["by_code"][CODES[0]][
+            "records"
+        ][0]["volume"] += 1
+        expected = "transaction_evidence_hash_drift"
+    else:
+        payload["combined_evidence_hash"] = "0" * 64
+        expected = "combined_evidence_hash_drift"
+
+    result = build_mootdx_probe_reanalysis(payload)
+
+    _assert_invalid_reanalysis(result)
+    assert expected in result["reanalysis_errors"]
+
+
+@pytest.mark.parametrize("output_name", ["candidates", "tickets", "orders"])
+def test_reanalysis_rejects_input_with_execution_outputs(output_name):
+    payload = _complete_payload()
+    payload[output_name] = [{"code": CODES[0]}]
+
+    result = build_mootdx_probe_reanalysis(payload)
+
+    _assert_invalid_reanalysis(result)
+    assert f"reanalysis_input_{output_name}_not_empty" in result[
+        "reanalysis_errors"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("unknown_version", "transaction_source_version_not_approved"),
+        ("unknown_unit", "transaction_top_level_volume_unit_mismatch"),
+        ("mixed_source", "transaction_record_source_mismatch"),
+    ],
+)
+def test_reanalysis_rejects_unapproved_transaction_contract(
+    mutation,
+    expected,
+):
+    payload = _complete_payload()
+    transaction = payload["transaction_evidence"]
+    if mutation == "unknown_version":
+        transaction["source_version"] = (
+            "mootdx_0.11.8_tdx_std_transaction_v2026-08-07"
+        )
+        for stock in transaction["by_code"].values():
+            stock["source_version"] = transaction["source_version"]
+            for row in stock["records"]:
+                row["source_version"] = transaction["source_version"]
+    elif mutation == "unknown_unit":
+        transaction["source_volume_unit"] = "unknown"
+        transaction["volume_unit"] = "unknown"
+        for stock in transaction["by_code"].values():
+            stock["source_volume_unit"] = "unknown"
+            stock["volume_unit"] = "unknown"
+            for row in stock["records"]:
+                row["source_volume_unit"] = "unknown"
+                row["raw_volume_unit"] = "unknown"
+    else:
+        transaction["by_code"][CODES[0]]["records"][0][
+            "source"
+        ] = "eastmoney"
+    _rebuild_original_evidence(payload)
+
+    result = build_mootdx_probe_reanalysis(payload)
+
+    _assert_invalid_reanalysis(result)
+    assert expected in result["reanalysis_errors"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["trade_date", "code_set"],
+)
+def test_reanalysis_rejects_identity_mismatch(mutation):
+    payload = _complete_payload()
+    if mutation == "trade_date":
+        payload["trade_date"] = "2026-08-05"
+        expected = "reanalysis_transaction_trade_date_mismatch"
+    else:
+        payload["tracked_codes"] = [*CODES, "600001"]
+        expected = "reanalysis_transaction_code_set_mismatch"
+
+    result = build_mootdx_probe_reanalysis(payload)
+
+    _assert_invalid_reanalysis(result)
+    assert expected in result["reanalysis_errors"]
+
+
+def test_approved_legacy_transaction_evidence_replays_safely():
+    result = build_mootdx_probe_reanalysis(_legacy_complete_payload())
+
+    assert result["status"] == "PM_REVIEW_REQUIRED"
+    assert result["input_evidence_verification"]["status"] == (
+        "PROBE_EVIDENCE_VERIFIED"
+    )
+    assert result["transaction_evidence"]["source_version"] == (
+        MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION
+    )
+    assert result["transaction_evidence"]["source_volume_unit"] == (
+        MOOTDX_LEGACY_TRANSACTION_VOLUME_UNIT
+    )
+    assert result["data_ready"] is False
+    assert result["candidates"] == []
+    assert result["tickets"] == []
+    assert result["orders"] == []
+
+
+def test_current_transaction_version_replays_with_lot_contract():
+    result = build_mootdx_probe_reanalysis(_complete_payload())
+
+    assert result["status"] == "PM_REVIEW_REQUIRED"
+    transaction = result["transaction_evidence"]
+    assert transaction["source_version"] == (
+        MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION
+    )
+    assert transaction["source_volume_unit"] == "lot"
+    assert all(
+        row["source"] == "mootdx"
+        and row["source_version"]
+        == MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION
+        and row["source_volume_unit"] == "lot"
+        for stock in transaction["by_code"].values()
+        for row in stock["records"]
+    )
+
+
+def test_reanalysis_cli_fails_closed_when_independent_verification_fails(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    source = tmp_path / "source.json"
+    output = tmp_path / "derived.json"
+    source.write_text(
+        json.dumps(_complete_payload()),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        run_mootdx_probe_reanalysis,
+        "verify_probe_evidence",
+        lambda payload, source: {
+            "status": "PROBE_EVIDENCE_INVALID",
+            "execution_ok": True,
+            "data_ready": False,
+            "source": source,
+            "errors": ["forced_verification_failure"],
+            "candidates": [],
+            "tickets": [],
+            "orders": [],
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_mootdx_probe_reanalysis.py",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+        ],
+    )
+
+    exit_code = run_mootdx_probe_reanalysis.main()
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(output.read_text(encoding="utf-8"))
+
+    assert exit_code != 0
+    assert printed["status"] == "REANALYSIS_OUTPUT_INVALID"
+    assert written["status"] == "REANALYSIS_OUTPUT_INVALID"
+    assert written["status"] != "PM_REVIEW_REQUIRED"
+    assert written["data_ready"] is False
+    assert written["candidates"] == []
+    assert written["tickets"] == []
+    assert written["orders"] == []
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_reason"),
     [
@@ -564,6 +763,7 @@ def _complete_payload():
         **probe,
         "source": "mootdx",
         "source_role": "qualification_candidate",
+        "trade_date": DAY,
         "transaction_evidence": transaction,
         "transaction_attribution": attribution,
         "transaction_evidence_hash": transaction[
@@ -576,6 +776,87 @@ def _complete_payload():
         "tickets": [],
         "orders": [],
     }
+
+
+def _legacy_complete_payload():
+    payload = _complete_payload()
+    transaction = deepcopy(payload["transaction_evidence"])
+    transaction["source_version"] = (
+        MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION
+    )
+    for field in (
+        "source_volume_unit",
+        "volume_unit",
+        "raw_volume_unit",
+        "normalized_volume_unit",
+        "volume_conversion_factor",
+        "volume_conversion_basis",
+        "volume_normalization_version",
+        "attribution_algorithm_version",
+    ):
+        transaction.pop(field, None)
+    for stock in transaction["by_code"].values():
+        stock["source_version"] = (
+            MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION
+        )
+        stock["timestamp_precision"] = "insufficient"
+        stock["volume_unit"] = MOOTDX_LEGACY_TRANSACTION_VOLUME_UNIT
+        for field in (
+            "source_volume_unit",
+            "raw_volume_unit",
+            "normalized_volume_unit",
+            "volume_conversion_factor",
+            "volume_conversion_basis",
+            "volume_normalization_version",
+            "source_timestamp_precision",
+        ):
+            stock.pop(field, None)
+        for row in stock["records"]:
+            for field in (
+                "source",
+                "source_version",
+                "source_volume_unit",
+                "source_time_text",
+                "source_time_origin",
+                "raw_volume",
+                "raw_volume_unit",
+                "normalized_volume",
+                "normalized_volume_unit",
+                "volume_conversion_factor",
+                "volume_conversion_basis",
+            ):
+                row.pop(field, None)
+    payload["transaction_evidence"] = transaction
+    _rebuild_original_evidence(payload)
+    return payload
+
+
+def _rebuild_original_evidence(payload):
+    transaction = payload["transaction_evidence"]
+    transaction["transaction_evidence_hash"] = (
+        compute_transaction_evidence_hash(transaction, source="mootdx")
+    )
+    attribution = attribute_mootdx_minute_intervals(
+        payload,
+        transaction,
+    )
+    payload["transaction_attribution"] = attribution
+    payload["transaction_evidence_hash"] = transaction[
+        "transaction_evidence_hash"
+    ]
+    payload["combined_evidence_hash"] = attribution[
+        "combined_evidence_hash"
+    ]
+
+
+def _assert_invalid_reanalysis(result):
+    assert result["status"] == REANALYSIS_INPUT_INVALID
+    assert result["execution_ok"] is False
+    assert result["data_ready"] is False
+    assert result["automatic_qualification_update"] is False
+    assert result["candidates"] == []
+    assert result["tickets"] == []
+    assert result["orders"] == []
 
 
 def _probe_result(*, first_present, ohlcv=None):
@@ -665,7 +946,8 @@ def _transaction_evidence(
         )
         by_code[code] = {
             "source": "mootdx",
-            "source_version": "mootdx_transaction_v1",
+            "source_version": MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION,
+            "source_volume_unit": "lot",
             "timestamp_precision": "minute",
             "volume_unit": "lot",
             "coverage_complete": True,
@@ -674,7 +956,9 @@ def _transaction_evidence(
         }
     evidence = {
         "source": "mootdx",
-        "source_version": "mootdx_transaction_v1",
+        "source_version": MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION,
+        "source_volume_unit": "lot",
+        "volume_unit": "lot",
         "trade_date": DAY,
         "requested_codes": list(CODES),
         "request_started_at": f"{DAY}T14:51:06+08:00",
@@ -706,12 +990,16 @@ def _interval_records(
     return [
         {
             "code": code,
+            "source": "mootdx",
+            "source_version": MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION,
+            "source_volume_unit": "lot",
             "event_time": f"{DAY}T{minute}:00+08:00",
             "source_time_text": minute,
             "source_time_origin": "source",
             "timestamp_precision": "minute",
             "price": price,
             "volume": volume,
+            "raw_volume_unit": "lot",
             "trade_count": 1,
             "source_position": start_position + index,
         }

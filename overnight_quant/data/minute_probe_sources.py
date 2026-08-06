@@ -209,6 +209,7 @@ class MootdxMinuteProbeCollectors:
             by_code[code] = {
                 "source": self.probe_source,
                 "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+                "source_volume_unit": "lot",
                 "observed_at": _as_cn(observed_at).isoformat(
                     timespec="milliseconds"
                 ),
@@ -227,6 +228,8 @@ class MootdxMinuteProbeCollectors:
         evidence = {
             "source": self.probe_source,
             "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+            "source_volume_unit": "lot",
+            "volume_unit": "lot",
             "trade_date": observed_at.date().isoformat(),
             "requested_codes": list(self.codes),
             "request_started_at": started_at.isoformat(
@@ -386,6 +389,9 @@ def _normalize_mootdx_transactions(
         rows.append(
             {
                 "code": code,
+                "source": PROBE_SOURCE_MOOTDX,
+                "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+                "source_volume_unit": "lot",
                 "event_time": event.isoformat(timespec="seconds"),
                 "source_time_text": source_time_text,
                 "source_time_origin": "source",

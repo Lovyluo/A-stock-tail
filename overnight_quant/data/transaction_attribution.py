@@ -28,6 +28,25 @@ MOOTDX_TRANSACTION_RAW_VOLUME_UNIT = "lot"
 MOOTDX_MINUTE_BAR_VOLUME_UNIT = "share"
 MOOTDX_LOT_TO_SHARE_FACTOR = 100.0
 MOOTDX_LOT_TO_SHARE_BASIS = "A_share_round_lot_100_shares"
+MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION = (
+    "mootdx_0.11.7_tdx_std_transaction_v2026-08-03"
+)
+MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION = (
+    "mootdx_0.11.7_tdx_std_transaction_v2026-08-06"
+)
+MOOTDX_LEGACY_TRANSACTION_VOLUME_UNIT = "mootdx_native_volume"
+REANALYSIS_INPUT_INVALID = "REANALYSIS_INPUT_INVALID"
+
+_MOOTDX_TRANSACTION_SOURCE_CONTRACTS = {
+    MOOTDX_LEGACY_TRANSACTION_SOURCE_VERSION: {
+        "source_volume_unit": MOOTDX_LEGACY_TRANSACTION_VOLUME_UNIT,
+        "legacy_sparse_fields_allowed": True,
+    },
+    MOOTDX_CURRENT_TRANSACTION_SOURCE_VERSION: {
+        "source_volume_unit": MOOTDX_TRANSACTION_RAW_VOLUME_UNIT,
+        "legacy_sparse_fields_allowed": False,
+    },
+}
 
 
 def attribute_mootdx_minute_intervals(
@@ -139,7 +158,17 @@ def normalize_mootdx_transaction_evidence(
     normalized = deepcopy(transaction_evidence)
     if _require_source(normalized.get("source")) != "mootdx":
         raise ValueError("transaction_evidence_source_not_mootdx")
+    contract, contract_errors = _mootdx_transaction_source_contract(
+        normalized
+    )
+    if contract_errors:
+        raise ValueError(";".join(contract_errors))
+    source_version = str(contract["source_version"])
+    source_volume_unit = str(contract["source_volume_unit"])
     normalized.pop("transaction_evidence_hash", None)
+    normalized["source_version"] = source_version
+    normalized["source_volume_unit"] = source_volume_unit
+    normalized["volume_unit"] = MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
     normalized["attribution_algorithm_version"] = (
         MOOTDX_ATTRIBUTION_ALGORITHM_VERSION
     )
@@ -193,6 +222,9 @@ def normalize_mootdx_transaction_evidence(
             )
             row.update(
                 {
+                    "source": "mootdx",
+                    "source_version": source_version,
+                    "source_volume_unit": source_volume_unit,
                     "source_time_text": source_time,
                     "source_time_origin": source_time_origin,
                     "source_position": int(
@@ -224,6 +256,8 @@ def normalize_mootdx_transaction_evidence(
         precision = _records_precision(records)
         stock.update(
             {
+                "source": "mootdx",
+                "source_version": source_version,
                 "source_timestamp_precision": str(
                     stock.get("source_timestamp_precision")
                     or stock.get("timestamp_precision")
@@ -231,9 +265,7 @@ def normalize_mootdx_transaction_evidence(
                 ),
                 "timestamp_precision": precision,
                 "source_volume_unit": str(
-                    stock.get("source_volume_unit")
-                    or stock.get("volume_unit")
-                    or ""
+                    source_volume_unit
                 ),
                 "volume_unit": MOOTDX_TRANSACTION_RAW_VOLUME_UNIT,
                 "raw_volume_unit": (
@@ -272,9 +304,16 @@ def normalize_mootdx_transaction_evidence(
 def build_mootdx_probe_reanalysis(
     probe_result: dict[str, Any],
 ) -> dict[str, Any]:
-    source = _require_source(probe_result.get("source"))
-    if source != "mootdx":
-        raise ValueError("reanalysis_source_not_mootdx")
+    input_errors, input_verification = (
+        _validate_mootdx_reanalysis_input(probe_result)
+    )
+    if input_errors:
+        return _invalid_reanalysis_result(
+            probe_result,
+            input_errors,
+            input_verification=input_verification,
+        )
+    source = "mootdx"
     normalized_transaction = normalize_mootdx_transaction_evidence(
         dict(probe_result.get("transaction_evidence") or {})
     )
@@ -299,6 +338,16 @@ def build_mootdx_probe_reanalysis(
         "trade_date": str(probe_result.get("trade_date") or "")[:10],
         "reanalysis_version": MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
         "original_probe_status": str(probe_result.get("status") or ""),
+        "input_evidence_verification": input_verification,
+        "original_probe_evidence_hash": str(
+            probe_result.get("probe_evidence_hash") or ""
+        ),
+        "original_transaction_evidence_hash": str(
+            probe_result.get("transaction_evidence_hash") or ""
+        ),
+        "original_combined_evidence_hash": str(
+            probe_result.get("combined_evidence_hash") or ""
+        ),
         "probe_evidence_hash": str(
             probe_result.get("probe_evidence_hash") or ""
         ),
@@ -330,6 +379,253 @@ def build_mootdx_probe_reanalysis(
     }
     result["reanalysis_evidence_hash"] = stable_hash(result)
     return result
+
+
+def _validate_mootdx_reanalysis_input(
+    probe_result: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    errors = []
+    source = str(probe_result.get("source") or "").strip().lower()
+    if source != "mootdx":
+        errors.append("reanalysis_source_not_mootdx")
+
+    for output_name in ("candidates", "tickets", "orders"):
+        if list(probe_result.get(output_name) or []):
+            errors.append(f"reanalysis_input_{output_name}_not_empty")
+
+    errors.extend(_validate_reanalysis_identity(probe_result))
+    _, contract_errors = _mootdx_transaction_source_contract(
+        dict(probe_result.get("transaction_evidence") or {})
+    )
+    errors.extend(contract_errors)
+
+    verification = {
+        "status": "PROBE_EVIDENCE_INVALID",
+        "execution_ok": True,
+        "data_ready": False,
+        "source": source or "mootdx",
+        "errors": [],
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    if source == "mootdx":
+        try:
+            from overnight_quant.data.probe_evidence import (
+                verify_probe_evidence,
+            )
+
+            verification = verify_probe_evidence(
+                probe_result,
+                source="mootdx",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            verification["errors"] = [
+                f"input_evidence_verification_failed:{type(exc).__name__}"
+            ]
+    if verification.get("status") != "PROBE_EVIDENCE_VERIFIED":
+        errors.extend(
+            str(error)
+            for error in (verification.get("errors") or [])
+        )
+        if not verification.get("errors"):
+            errors.append("input_evidence_not_verified")
+    return sorted(set(errors)), verification
+
+
+def _validate_reanalysis_identity(
+    probe_result: dict[str, Any],
+) -> list[str]:
+    errors = []
+    trade_date = str(probe_result.get("trade_date") or "")[:10]
+    try:
+        parsed_trade_date = datetime.strptime(
+            trade_date,
+            "%Y-%m-%d",
+        ).date()
+    except ValueError:
+        parsed_trade_date = None
+        errors.append("reanalysis_trade_date_invalid")
+
+    raw_codes = [
+        str(code).strip().zfill(6)
+        for code in (probe_result.get("tracked_codes") or [])
+        if str(code).strip()
+    ]
+    codes = sorted(set(raw_codes))
+    if not codes or len(codes) != len(raw_codes):
+        errors.append("reanalysis_tracked_codes_invalid")
+    if any(not _is_a_share_code(code) for code in codes):
+        errors.append("reanalysis_non_a_share_code")
+
+    transaction = dict(probe_result.get("transaction_evidence") or {})
+    transaction_date = str(transaction.get("trade_date") or "")[:10]
+    requested_codes = sorted(
+        str(code).strip().zfill(6)
+        for code in (transaction.get("requested_codes") or [])
+        if str(code).strip()
+    )
+    evidence_codes = sorted(
+        str(code).strip().zfill(6)
+        for code in (transaction.get("by_code") or {})
+    )
+    attribution_codes = sorted(
+        str(code).strip().zfill(6)
+        for code in (
+            (probe_result.get("transaction_attribution") or {}).get(
+                "per_stock"
+            )
+            or {}
+        )
+    )
+    if parsed_trade_date is None or transaction_date != trade_date:
+        errors.append("reanalysis_transaction_trade_date_mismatch")
+    if requested_codes != codes or evidence_codes != codes:
+        errors.append("reanalysis_transaction_code_set_mismatch")
+    if attribution_codes != codes:
+        errors.append("reanalysis_attribution_code_set_mismatch")
+
+    for sample in probe_result.get("samples") or []:
+        sample_date = str(
+            sample.get("sample_trade_date")
+            or sample.get("target_at")
+            or sample.get("sampled_at")
+            or ""
+        )[:10]
+        if sample_date != trade_date:
+            errors.append("reanalysis_sample_trade_date_mismatch")
+        sample_requested = sorted(
+            str(code).strip().zfill(6)
+            for code in (sample.get("requested_codes") or [])
+            if str(code).strip()
+        )
+        signatures = sorted(
+            str(code).strip().zfill(6)
+            for code in (sample.get("signatures") or {})
+        )
+        if sample_requested != codes or any(
+            code not in codes for code in signatures
+        ):
+            errors.append("reanalysis_sample_code_set_mismatch")
+    return sorted(set(errors))
+
+
+def _mootdx_transaction_source_contract(
+    transaction_evidence: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    errors = []
+    source = str(transaction_evidence.get("source") or "").strip().lower()
+    source_version = str(
+        transaction_evidence.get("source_version") or ""
+    ).strip()
+    contract = dict(
+        _MOOTDX_TRANSACTION_SOURCE_CONTRACTS.get(source_version) or {}
+    )
+    if source != "mootdx":
+        errors.append("transaction_evidence_source_not_mootdx")
+    if not contract:
+        errors.append("transaction_source_version_not_approved")
+        return {
+            "source_version": source_version,
+            "source_volume_unit": "",
+        }, errors
+
+    expected_unit = str(contract["source_volume_unit"])
+    sparse_allowed = bool(contract["legacy_sparse_fields_allowed"])
+    top_unit = str(
+        transaction_evidence.get("source_volume_unit")
+        or transaction_evidence.get("volume_unit")
+        or ""
+    )
+    if top_unit and top_unit != expected_unit:
+        errors.append("transaction_top_level_volume_unit_mismatch")
+    if not top_unit and not sparse_allowed:
+        errors.append("transaction_top_level_volume_unit_missing")
+
+    requested_codes = {
+        str(code).strip().zfill(6)
+        for code in (transaction_evidence.get("requested_codes") or [])
+        if str(code).strip()
+    }
+    by_code = transaction_evidence.get("by_code") or {}
+    for raw_code, value in by_code.items():
+        code = str(raw_code).strip().zfill(6)
+        stock = dict(value or {})
+        if code not in requested_codes or not _is_a_share_code(code):
+            errors.append("transaction_non_a_share_or_unrequested_code")
+        if str(stock.get("source") or "").strip().lower() != "mootdx":
+            errors.append("transaction_stock_source_mismatch")
+        if str(stock.get("source_version") or "") != source_version:
+            errors.append("transaction_stock_source_version_mismatch")
+        stock_unit = str(
+            stock.get("source_volume_unit")
+            or stock.get("volume_unit")
+            or ""
+        )
+        if stock_unit != expected_unit:
+            errors.append("transaction_stock_volume_unit_mismatch")
+        for row in stock.get("records") or []:
+            row_source = str(row.get("source") or "").strip().lower()
+            row_version = str(row.get("source_version") or "")
+            row_unit = str(
+                row.get("source_volume_unit")
+                or row.get("raw_volume_unit")
+                or ""
+            )
+            if row_source and row_source != "mootdx":
+                errors.append("transaction_record_source_mismatch")
+            if row_version and row_version != source_version:
+                errors.append("transaction_record_source_version_mismatch")
+            if row_unit and row_unit != expected_unit:
+                errors.append("transaction_record_volume_unit_mismatch")
+            if not sparse_allowed and (
+                row_source != "mootdx"
+                or row_version != source_version
+                or row_unit != expected_unit
+            ):
+                errors.append("transaction_record_contract_incomplete")
+            if str(row.get("code") or "").zfill(6) != code:
+                errors.append("transaction_record_code_mismatch")
+    return {
+        "source_version": source_version,
+        "source_volume_unit": expected_unit,
+        "legacy_sparse_fields_allowed": sparse_allowed,
+    }, sorted(set(errors))
+
+
+def _invalid_reanalysis_result(
+    probe_result: dict[str, Any],
+    errors: Iterable[str],
+    *,
+    input_verification: dict[str, Any],
+) -> dict[str, Any]:
+    result = {
+        "status": REANALYSIS_INPUT_INVALID,
+        "execution_ok": False,
+        "data_ready": False,
+        "source": str(probe_result.get("source") or "").strip().lower(),
+        "source_role": "qualification_candidate",
+        "trade_date": str(probe_result.get("trade_date") or "")[:10],
+        "reanalysis_version": MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
+        "minute_label_semantics": ATTRIBUTION_INCONCLUSIVE,
+        "minute_label_validation_status": "INVALID",
+        "input_evidence_verification": input_verification,
+        "reanalysis_errors": sorted(set(str(error) for error in errors)),
+        "automatic_qualification_update": False,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    result["reanalysis_evidence_hash"] = stable_hash(result)
+    return result
+
+
+def _is_a_share_code(code: str) -> bool:
+    return (
+        len(code) == 6
+        and code.isdigit()
+        and code[0] in {"0", "3", "4", "6", "8"}
+    )
 
 
 def compute_transaction_evidence_hash(
@@ -461,8 +757,12 @@ def _attribute_stock(
             normalized_contract=normalized_contract,
         )
     else:
-        aggregate_1449 = _empty_aggregate()
-        aggregate_1450 = _empty_aggregate()
+        aggregate_1449 = _empty_aggregate(
+            normalized_contract=normalized_contract
+        )
+        aggregate_1450 = _empty_aggregate(
+            normalized_contract=normalized_contract
+        )
     if not aggregate_1449.get("complete"):
         errors.append("transaction_1449_interval_incomplete")
     if not aggregate_1450.get("complete"):
@@ -556,6 +856,8 @@ def aggregate_transaction_interval(
             int(row.get("source_position") or 0),
         )
     )
+    if not normalized_contract:
+        return _legacy_transaction_aggregate(selected, start, end)
     if not selected:
         return {
             "interval_start": start.isoformat(timespec="seconds"),
@@ -643,6 +945,32 @@ def aggregate_transaction_interval(
             next(iter(precisions)) if len(precisions) == 1 else "mixed"
         ),
         "boundary_aligned": boundary_aligned,
+    }
+
+
+def _legacy_transaction_aggregate(
+    selected: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    if not selected:
+        return _empty_aggregate(normalized_contract=False)
+    prices = [float(row["price"]) for row in selected]
+    return {
+        "interval_start": start.isoformat(timespec="seconds"),
+        "interval_end": end.isoformat(timespec="seconds"),
+        "complete": all(
+            _finite(row.get(field))
+            for row in selected
+            for field in ("price", "volume", "trade_count")
+        ),
+        "open": prices[0],
+        "high": max(prices),
+        "low": min(prices),
+        "close": prices[-1],
+        "volume": sum(float(row["volume"]) for row in selected),
+        "trade_count": sum(int(row["trade_count"]) for row in selected),
+        "row_count": len(selected),
     }
 
 
@@ -875,8 +1203,11 @@ def _aggregate_matches_bar(
     )
 
 
-def _empty_aggregate() -> dict[str, Any]:
-    return {
+def _empty_aggregate(
+    *,
+    normalized_contract: bool = True,
+) -> dict[str, Any]:
+    base = {
         "interval_start": "",
         "interval_end": "",
         "complete": False,
@@ -885,14 +1216,19 @@ def _empty_aggregate() -> dict[str, Any]:
         "low": None,
         "close": None,
         "volume": None,
+        "trade_count": None,
+        "row_count": 0,
+    }
+    if not normalized_contract:
+        return base
+    return {
+        **base,
         "raw_volume": None,
         "raw_volume_unit": "",
         "normalized_volume": None,
         "normalized_volume_unit": "",
         "volume_conversion_factor": None,
         "volume_conversion_basis": "",
-        "trade_count": None,
-        "row_count": 0,
         "timestamp_precision": "unknown",
         "boundary_aligned": False,
     }
