@@ -47,7 +47,7 @@ def _mootdx_source_version() -> str:
 MOOTDX_MINUTE_SOURCE_VERSION = _mootdx_source_version()
 MOOTDX_TRANSACTION_SOURCE_VERSION = (
     f"mootdx_{_mootdx_package_version()}_"
-    "tdx_std_transaction_v2026-08-03"
+    "tdx_std_transaction_v2026-08-06"
 )
 
 
@@ -216,7 +216,7 @@ class MootdxMinuteProbeCollectors:
                     timespec="milliseconds"
                 ),
                 "timestamp_precision": _timestamp_precision(rows),
-                "volume_unit": "mootdx_native_volume",
+                "volume_unit": "lot",
                 "coverage_complete": _covers_attribution_window(rows),
                 "page_count": page_count,
                 "raw_response_hashes": sorted(raw_hashes),
@@ -239,8 +239,10 @@ class MootdxMinuteProbeCollectors:
         }
         from overnight_quant.data.transaction_attribution import (
             compute_transaction_evidence_hash,
+            normalize_mootdx_transaction_evidence,
         )
 
+        evidence = normalize_mootdx_transaction_evidence(evidence)
         evidence["transaction_evidence_hash"] = (
             compute_transaction_evidence_hash(
                 evidence,
@@ -286,7 +288,7 @@ class MootdxMinuteProbeCollectors:
             "amount": row["amount"],
             "field_units": {
                 "price": "CNY_per_share",
-                "volume": "mootdx_native_volume",
+                "volume": "share",
                 "amount": "CNY",
             },
             "minute_label_semantics": "unverified",
@@ -372,8 +374,11 @@ def _normalize_mootdx_transactions(
     for row_index, item in enumerate(
         frame.to_dict(orient="records")
     ):
+        source_time_text = str(
+            item.get("datetime") or item.get("time") or ""
+        ).strip()
         event, precision = _transaction_event_time(
-            item.get("datetime") or item.get("time"),
+            source_time_text,
             trade_date=trade_date,
         )
         if event is None:
@@ -382,11 +387,17 @@ def _normalize_mootdx_transactions(
             {
                 "code": code,
                 "event_time": event.isoformat(timespec="seconds"),
+                "source_time_text": source_time_text,
+                "source_time_origin": "source",
                 "timestamp_precision": precision,
                 "price": _finite_number(item.get("price")),
                 "volume": _finite_number(
                     item.get("vol", item.get("volume"))
                 ),
+                "raw_volume": _finite_number(
+                    item.get("vol", item.get("volume"))
+                ),
+                "raw_volume_unit": "lot",
                 "trade_count": int(
                     _finite_number(item.get("num", 1))
                 ),
@@ -419,7 +430,13 @@ def _timestamp_precision(rows: list[dict[str, Any]]) -> str:
         str(row.get("timestamp_precision") or "missing")
         for row in rows
     }
-    return "second" if precisions == {"second"} else "insufficient"
+    if precisions == {"minute"}:
+        return "minute"
+    if precisions == {"second"}:
+        return "second"
+    if not precisions or precisions == {"missing"}:
+        return "unknown"
+    return "mixed"
 
 
 def _covers_attribution_window(
@@ -431,6 +448,9 @@ def _covers_attribution_window(
     events = [item for item in events if item is not None]
     if not events:
         return False
+    precision = _timestamp_precision(rows)
+    if precision not in {"minute", "second"}:
+        return False
     day = events[0].date()
     start = datetime.combine(day, time(14, 49), tzinfo=CN_TZ)
     end = datetime.combine(
@@ -438,6 +458,25 @@ def _covers_attribution_window(
         time(14, 50, 59),
         tzinfo=CN_TZ,
     )
+    minutes = {(event.hour, event.minute) for event in events}
+    if not {(14, 49), (14, 50)}.issubset(minutes):
+        return False
+    if precision == "minute":
+        before = datetime.combine(
+            day,
+            time(14, 48),
+            tzinfo=CN_TZ,
+        )
+        after = datetime.combine(
+            day,
+            time(14, 51),
+            tzinfo=CN_TZ,
+        )
+        return (
+            all(event.second == 0 for event in events)
+            and min(events) <= before
+            and max(events) >= after
+        )
     return min(events) <= start and max(events) >= end
 
 

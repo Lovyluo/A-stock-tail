@@ -27,12 +27,18 @@ from overnight_quant.data.minute_probe_sources import (
 from overnight_quant.data.probe_evidence import (
     verify_probe_evidence,
 )
+from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.snapshot_store import close_snapshot_hash
 from overnight_quant.data.snapshot_store import ProviderBatch
 from overnight_quant.data.transaction_attribution import (
     ATTRIBUTION_INCONCLUSIVE,
+    MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
+    MOOTDX_LOT_TO_SHARE_BASIS,
+    aggregate_transaction_interval,
     attribute_mootdx_minute_intervals,
+    build_mootdx_probe_reanalysis,
     compute_transaction_evidence_hash,
+    normalize_mootdx_transaction_evidence,
 )
 from overnight_quant.scripts import run_probe_evidence_verify
 
@@ -71,6 +77,9 @@ def test_same_source_transactions_provisionally_attribute_bar(
         == transaction["transaction_evidence_hash"]
         for row in result["per_stock"].values()
     )
+    assert result["attribution_algorithm_version"] == (
+        MOOTDX_ATTRIBUTION_ALGORITHM_VERSION
+    )
     contract = result["provisional_time_contract"]
     assert contract["minute_label_semantics"] == expected
     assert contract["is_final"] is True
@@ -82,12 +91,243 @@ def test_same_source_transactions_provisionally_attribute_bar(
     ]
 
 
+def test_minute_precision_buckets_preserve_lots_and_normalize_shares():
+    result = attribute_mootdx_minute_intervals(
+        _probe_result(first_present=True),
+        _transaction_evidence("14:49"),
+    )
+
+    stock = result["per_stock"][CODES[0]]
+    aggregate = stock["aggregate_1449"]
+    assert stock["status"] == MINUTE_LABEL_END_PROVISIONAL
+    assert aggregate["timestamp_precision"] == "minute"
+    assert aggregate["boundary_aligned"] is True
+    assert aggregate["raw_volume"] == pytest.approx(1.0)
+    assert aggregate["raw_volume_unit"] == "lot"
+    assert aggregate["normalized_volume"] == pytest.approx(100.0)
+    assert aggregate["normalized_volume_unit"] == "share"
+    assert aggregate["volume_conversion_factor"] == 100.0
+    assert aggregate["volume_conversion_basis"] == (
+        MOOTDX_LOT_TO_SHARE_BASIS
+    )
+    assert stock["stable_bar"]["raw_volume"] == 100.0
+    assert stock["stable_bar"]["normalized_volume"] == 100.0
+
+
+@pytest.mark.parametrize(
+    ("source_time_text", "event_time"),
+    [
+        ("14:49:00", f"{DAY}T14:49:00+08:00"),
+        ("14:99", f"{DAY}T14:49:00+08:00"),
+        ("14:50", f"{DAY}T14:49:00+08:00"),
+    ],
+)
+def test_minute_precision_rejects_invalid_or_mismatched_source_time(
+    source_time_text: str,
+    event_time: str,
+):
+    transaction = _transaction_evidence("14:49")
+    records = transaction["by_code"][CODES[0]]["records"]
+    records[0]["source_time_text"] = source_time_text
+    records[0]["event_time"] = event_time
+
+    aggregate = aggregate_transaction_interval(
+        records,
+        interval_start=f"{DAY}T14:49:00+08:00",
+        interval_end=f"{DAY}T14:49:59+08:00",
+        normalized_contract=True,
+    )
+
+    assert aggregate["complete"] is False
+
+
+def test_non_aligned_minute_interval_is_incomplete():
+    transaction = _transaction_evidence("14:49")
+    records = transaction["by_code"][CODES[0]]["records"]
+
+    aggregate = aggregate_transaction_interval(
+        records,
+        interval_start=f"{DAY}T14:49:00+08:00",
+        interval_end=f"{DAY}T14:49:58+08:00",
+        normalized_contract=True,
+    )
+
+    assert aggregate["boundary_aligned"] is False
+    assert aggregate["complete"] is False
+
+
+def test_both_matching_intervals_are_inconclusive():
+    transaction = _transaction_evidence("14:49")
+    for position, code in enumerate(CODES):
+        stock = transaction["by_code"][code]
+        stock["records"] = _interval_records(
+            code,
+            "14:49",
+            matching=True,
+            start_position=position * 20,
+        ) + _interval_records(
+            code,
+            "14:50",
+            matching=True,
+            start_position=position * 20 + 10,
+        )
+    transaction = normalize_mootdx_transaction_evidence(transaction)
+
+    result = attribute_mootdx_minute_intervals(
+        _probe_result(first_present=True),
+        transaction,
+    )
+
+    assert result["status"] == ATTRIBUTION_INCONCLUSIVE
+    assert all(
+        row["match_1449"] is True and row["match_1450"] is True
+        for row in result["per_stock"].values()
+    )
+
+
+def test_flat_equal_intervals_have_no_unique_attribution():
+    flat = {
+        "open": 10.0,
+        "high": 10.0,
+        "low": 10.0,
+        "close": 10.0,
+        "volume": 100.0,
+        "amount": 1000.0,
+    }
+    probe = _probe_result(first_present=True, ohlcv=flat)
+    transaction = _transaction_evidence(
+        "14:49",
+        matching_values=[(10.0, 0.5), (10.0, 0.5)],
+        other_matching=True,
+    )
+
+    result = attribute_mootdx_minute_intervals(probe, transaction)
+
+    assert result["status"] == ATTRIBUTION_INCONCLUSIVE
+    assert all(
+        row["match_1449"] is True and row["match_1450"] is True
+        for row in result["per_stock"].values()
+    )
+
+
+def test_changed_bar_requires_three_consecutive_stable_observations():
+    probe = _probe_result(first_present=True)
+    first_values = {
+        **probe["samples"][0]["signatures"][CODES[0]]["ohlcv"],
+        "close": 9.9,
+    }
+    for code in CODES:
+        probe["samples"][0]["signatures"][code]["ohlcv"] = first_values
+        probe["samples"][0]["signatures"][code]["ohlcv_hash"] = (
+            stable_hash(first_values)
+        )
+    probe = classify_minute_label_samples(
+        probe["samples"],
+        required_codes=CODES,
+        source="mootdx",
+    )
+
+    result = attribute_mootdx_minute_intervals(
+        probe,
+        _transaction_evidence("14:49"),
+    )
+
+    assert result["status"] == MINUTE_LABEL_END_PROVISIONAL
+    assert all(
+        row["is_final"] is True
+        and row["stable_bar"]
+        and row["finalized_at"].startswith(f"{DAY}T14:51:05")
+        for row in result["per_stock"].values()
+    )
+
+
+def test_late_bar_change_prevents_finalization():
+    probe = _probe_result(first_present=True)
+    for code in CODES:
+        signature = probe["samples"][-1]["signatures"][code]
+        changed = {**signature["ohlcv"], "close": 10.6}
+        signature["ohlcv"] = changed
+        signature["ohlcv_hash"] = stable_hash(changed)
+    probe = classify_minute_label_samples(
+        probe["samples"],
+        required_codes=CODES,
+        source="mootdx",
+    )
+
+    result = attribute_mootdx_minute_intervals(
+        probe,
+        _transaction_evidence("14:49"),
+    )
+
+    assert result["status"] == ATTRIBUTION_INCONCLUSIVE
+    assert result["all_stocks_final"] is False
+    assert all(
+        "minute_bar_not_final" in row["reasons"]
+        for row in result["per_stock"].values()
+    )
+
+
+def test_algorithm_version_changes_combined_hash():
+    probe = _probe_result(first_present=True)
+    transaction = _transaction_evidence("14:49")
+    original = attribute_mootdx_minute_intervals(probe, transaction)
+    changed = deepcopy(transaction)
+    changed["attribution_algorithm_version"] = (
+        "mootdx_minute_transaction_attribution_v3"
+    )
+    changed["transaction_evidence_hash"] = (
+        compute_transaction_evidence_hash(changed, source="mootdx")
+    )
+
+    revised = attribute_mootdx_minute_intervals(probe, changed)
+
+    assert revised["status"] == ATTRIBUTION_INCONCLUSIVE
+    assert revised["combined_evidence_hash"] != original[
+        "combined_evidence_hash"
+    ]
+
+
+def test_transaction_source_mixing_is_rejected():
+    transaction = _transaction_evidence("14:49")
+    transaction["source"] = "eastmoney"
+
+    with pytest.raises(ValueError, match="source_mismatch"):
+        attribute_mootdx_minute_intervals(
+            _probe_result(first_present=True),
+            transaction,
+        )
+
+
+def test_reanalysis_is_deterministic_and_never_updates_qualification():
+    payload = _complete_payload()
+
+    first = build_mootdx_probe_reanalysis(payload)
+    second = build_mootdx_probe_reanalysis(payload)
+
+    assert first == second
+    assert first["status"] == "PM_REVIEW_REQUIRED"
+    assert first["minute_label_semantics"] == (
+        MINUTE_LABEL_END_PROVISIONAL
+    )
+    assert first["automatic_qualification_update"] is False
+    assert first["data_ready"] is False
+    assert first["candidates"] == []
+    assert first["tickets"] == []
+    assert first["orders"] == []
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_reason"),
     [
         ("incomplete", "transaction_records_incomplete"),
-        ("minute_precision", "transaction_timestamp_precision_insufficient"),
-        ("unit_mismatch", "transaction_volume_unit_mismatch"),
+        (
+            "mixed_precision",
+            "transaction_timestamp_precision_unknown_or_mixed",
+        ),
+        (
+            "unit_mismatch",
+            "transaction_volume_conversion_contract_invalid",
+        ),
         ("neither", "transaction_intervals_both_or_neither_match"),
     ],
 )
@@ -99,10 +339,12 @@ def test_incomplete_or_nonmatching_transaction_evidence_is_inconclusive(
     transaction = _transaction_evidence("14:49")
     if mutation == "incomplete":
         transaction["by_code"][CODES[0]]["coverage_complete"] = False
-    elif mutation == "minute_precision":
-        transaction["by_code"][CODES[0]]["timestamp_precision"] = "insufficient"
+    elif mutation == "mixed_precision":
+        transaction["by_code"][CODES[0]]["timestamp_precision"] = "mixed"
     elif mutation == "unit_mismatch":
-        transaction["by_code"][CODES[0]]["volume_unit"] = "lot"
+        transaction["by_code"][CODES[0]][
+            "volume_conversion_factor"
+        ] = 99.0
     else:
         for row in transaction["by_code"][CODES[0]]["records"]:
             row["price"] = 8.0
@@ -232,11 +474,22 @@ def test_mootdx_transaction_collector_preserves_source_specific_evidence():
     assert evidence["source"] == "mootdx"
     assert len(evidence["transaction_evidence_hash"]) == 64
     assert stock["coverage_complete"] is True
-    assert stock["timestamp_precision"] == "second"
-    assert stock["volume_unit"] == "mootdx_native_volume"
-    assert stock["records"][0]["event_time"] == (
-        f"{DAY}T14:49:00+08:00"
+    assert stock["timestamp_precision"] == "minute"
+    assert stock["volume_unit"] == "lot"
+    assert stock["normalized_volume_unit"] == "share"
+    record = next(
+        row
+        for row in stock["records"]
+        if row["source_time_text"] == "14:49"
     )
+    assert record["event_time"] == f"{DAY}T14:49:00+08:00"
+    assert record["timestamp_precision"] == "minute"
+    assert record["raw_volume"] == record["volume"]
+    assert record["normalized_volume"] == record["volume"] * 100
+    assert record["volume_conversion_basis"] == (
+        MOOTDX_LOT_TO_SHARE_BASIS
+    )
+    assert record["source_position"] == 1
     assert client.closed is True
 
 
@@ -325,7 +578,18 @@ def _complete_payload():
     }
 
 
-def _probe_result(*, first_present):
+def _probe_result(*, first_present, ohlcv=None):
+    stable_values = dict(
+        ohlcv
+        or {
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.5,
+            "close": 10.5,
+            "volume": 100.0,
+            "amount": 1050.0,
+        }
+    )
     clocks = ("14:49:55", "14:50:05", "14:50:30", "14:51:05")
     samples = []
     for index, clock in enumerate(clocks):
@@ -333,16 +597,9 @@ def _probe_result(*, first_present):
         if first_present or index > 0:
             signatures = {
                 code: {
-                    "ohlcv": {
-                        "open": 10.0,
-                        "high": 11.0,
-                        "low": 9.5,
-                        "close": 10.5,
-                        "volume": 100.0,
-                        "amount": 1050.0,
-                    },
-                    "ohlcv_hash": "a" * 64,
-                    "volume_unit": "mootdx_native_volume",
+                    "ohlcv": dict(stable_values),
+                    "ohlcv_hash": stable_hash(stable_values),
+                    "volume_unit": "share",
                     "source": "mootdx_tdx_std_minute",
                     "source_version": "mootdx_minute_v1",
                     "raw_hash": f"{index + 1:x}" * 64,
@@ -378,7 +635,12 @@ def _probe_result(*, first_present):
     )
 
 
-def _transaction_evidence(matching_interval):
+def _transaction_evidence(
+    matching_interval,
+    *,
+    matching_values=None,
+    other_matching=False,
+):
     by_code = {}
     for code in CODES:
         rows = []
@@ -388,6 +650,7 @@ def _transaction_evidence(matching_interval):
                 matching_interval,
                 matching=True,
                 start_position=0,
+                values=matching_values,
             )
         )
         other = "14:50" if matching_interval == "14:49" else "14:49"
@@ -395,15 +658,16 @@ def _transaction_evidence(matching_interval):
             _interval_records(
                 code,
                 other,
-                matching=False,
+                matching=other_matching,
                 start_position=10,
+                values=matching_values if other_matching else None,
             )
         )
         by_code[code] = {
             "source": "mootdx",
             "source_version": "mootdx_transaction_v1",
-            "timestamp_precision": "second",
-            "volume_unit": "mootdx_native_volume",
+            "timestamp_precision": "minute",
+            "volume_unit": "lot",
             "coverage_complete": True,
             "records": rows,
             "error": "",
@@ -417,36 +681,41 @@ def _transaction_evidence(matching_interval):
         "request_completed_at": f"{DAY}T14:51:07+08:00",
         "by_code": by_code,
     }
-    evidence["transaction_evidence_hash"] = (
-        compute_transaction_evidence_hash(
-            evidence,
-            source="mootdx",
-        )
-    )
-    return evidence
+    return normalize_mootdx_transaction_evidence(evidence)
 
 
-def _interval_records(code, minute, *, matching, start_position):
-    if matching:
+def _interval_records(
+    code,
+    minute,
+    *,
+    matching,
+    start_position,
+    values=None,
+):
+    if values is not None:
+        values = list(values)
+    elif matching:
         values = [
-            ("00", 10.0, 20),
-            ("20", 11.0, 30),
-            ("40", 9.5, 10),
-            ("59", 10.5, 40),
+            (10.0, 0.2),
+            (11.0, 0.3),
+            (9.5, 0.1),
+            (10.5, 0.4),
         ]
     else:
-        values = [("00", 8.0, 25), ("59", 8.1, 25)]
+        values = [(8.0, 0.25), (8.1, 0.25)]
     return [
         {
             "code": code,
-            "event_time": f"{DAY}T{minute}:{second}+08:00",
-            "timestamp_precision": "second",
+            "event_time": f"{DAY}T{minute}:00+08:00",
+            "source_time_text": minute,
+            "source_time_origin": "source",
+            "timestamp_precision": "minute",
             "price": price,
             "volume": volume,
             "trade_count": 1,
             "source_position": start_position + index,
         }
-        for index, (second, price, volume) in enumerate(values)
+        for index, (price, volume) in enumerate(values)
     ]
 
 
@@ -459,16 +728,30 @@ class _TransactionClient:
         return pd.DataFrame(
             [
                 {
-                    "time": "14:49:00",
+                    "time": "14:48",
+                    "price": 9.9,
+                    "vol": 10,
+                    "num": 1,
+                    "buyorsell": 0,
+                },
+                {
+                    "time": "14:49",
                     "price": 10.0,
                     "vol": 20,
                     "num": 1,
                     "buyorsell": 0,
                 },
                 {
-                    "time": "14:50:59",
+                    "time": "14:50",
                     "price": 10.1,
                     "vol": 30,
+                    "num": 2,
+                    "buyorsell": 1,
+                },
+                {
+                    "time": "14:51",
+                    "price": 10.2,
+                    "vol": 40,
                     "num": 2,
                     "buyorsell": 1,
                 },
@@ -520,7 +803,7 @@ class _ScheduledMootdxCollector:
                         "volume": 100.0,
                         "amount": 1050.0,
                         "field_units": {
-                            "volume": "mootdx_native_volume"
+                            "volume": "share"
                         },
                         "is_final": False,
                     },

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -17,6 +18,16 @@ from overnight_quant.data.point_in_time import (
 
 ATTRIBUTION_INCONCLUSIVE = "INCONCLUSIVE"
 MINIMUM_STABLE_OBSERVATIONS = 3
+MOOTDX_ATTRIBUTION_ALGORITHM_VERSION = (
+    "mootdx_minute_transaction_attribution_v2"
+)
+MOOTDX_VOLUME_NORMALIZATION_VERSION = (
+    "a_share_lot_to_share_v1"
+)
+MOOTDX_TRANSACTION_RAW_VOLUME_UNIT = "lot"
+MOOTDX_MINUTE_BAR_VOLUME_UNIT = "share"
+MOOTDX_LOT_TO_SHARE_FACTOR = 100.0
+MOOTDX_LOT_TO_SHARE_BASIS = "A_share_round_lot_100_shares"
 
 
 def attribute_mootdx_minute_intervals(
@@ -24,6 +35,10 @@ def attribute_mootdx_minute_intervals(
     transaction_evidence: dict[str, Any],
 ) -> dict[str, Any]:
     source = _require_source(probe_result.get("source"))
+    algorithm_version = str(
+        transaction_evidence.get("attribution_algorithm_version")
+        or ""
+    )
     minute_hash = _require_hash(
         probe_result.get("probe_evidence_hash"),
         "minute_probe_evidence_hash_invalid",
@@ -41,6 +56,7 @@ def attribute_mootdx_minute_intervals(
             minute_hash,
             stored_transaction_hash,
             ["transaction_evidence_hash_drift"],
+            algorithm_version=algorithm_version,
         )
 
     samples = sorted(
@@ -61,6 +77,7 @@ def attribute_mootdx_minute_intervals(
             final_bar,
             transaction_rows,
             transaction_hash=stored_transaction_hash,
+            algorithm_version=algorithm_version,
         )
 
     statuses = {
@@ -95,6 +112,10 @@ def attribute_mootdx_minute_intervals(
         "all_stocks_final": all_final,
         "reasons": reasons,
     }
+    if algorithm_version:
+        attribution["attribution_algorithm_version"] = (
+            algorithm_version
+        )
     combined_hash = compute_combined_evidence_hash(
         attribution,
         source=source,
@@ -110,6 +131,205 @@ def attribute_mootdx_minute_intervals(
     else:
         attribution["provisional_time_contract"] = {}
     return attribution
+
+
+def normalize_mootdx_transaction_evidence(
+    transaction_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = deepcopy(transaction_evidence)
+    if _require_source(normalized.get("source")) != "mootdx":
+        raise ValueError("transaction_evidence_source_not_mootdx")
+    normalized.pop("transaction_evidence_hash", None)
+    normalized["attribution_algorithm_version"] = (
+        MOOTDX_ATTRIBUTION_ALGORITHM_VERSION
+    )
+    normalized["volume_normalization_version"] = (
+        MOOTDX_VOLUME_NORMALIZATION_VERSION
+    )
+    normalized["raw_volume_unit"] = (
+        MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+    )
+    normalized["normalized_volume_unit"] = (
+        MOOTDX_MINUTE_BAR_VOLUME_UNIT
+    )
+    normalized["volume_conversion_factor"] = (
+        MOOTDX_LOT_TO_SHARE_FACTOR
+    )
+    normalized["volume_conversion_basis"] = (
+        MOOTDX_LOT_TO_SHARE_BASIS
+    )
+    by_code = {}
+    for code, value in sorted(
+        (normalized.get("by_code") or {}).items()
+    ):
+        stock = dict(value or {})
+        records = []
+        for source_position, value_row in enumerate(
+            stock.get("records") or []
+        ):
+            row = dict(value_row)
+            event = parse_cn_datetime(row.get("event_time"))
+            precision = str(
+                row.get("timestamp_precision") or "unknown"
+            )
+            source_time = str(row.get("source_time_text") or "")
+            source_time_origin = str(
+                row.get("source_time_origin") or "source"
+            )
+            if not source_time and event is not None:
+                source_time = event.strftime(
+                    "%H:%M" if precision == "minute" else "%H:%M:%S"
+                )
+                source_time_origin = (
+                    "derived_from_event_time_for_legacy_replay"
+                )
+            raw_volume = row.get("raw_volume", row.get("volume"))
+            if not _finite(raw_volume):
+                raw_volume = None
+            normalized_volume = (
+                float(raw_volume) * MOOTDX_LOT_TO_SHARE_FACTOR
+                if raw_volume is not None
+                else None
+            )
+            row.update(
+                {
+                    "source_time_text": source_time,
+                    "source_time_origin": source_time_origin,
+                    "source_position": int(
+                        row.get("source_position", source_position)
+                    ),
+                    "raw_volume": raw_volume,
+                    "raw_volume_unit": (
+                        MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+                    ),
+                    "normalized_volume": normalized_volume,
+                    "normalized_volume_unit": (
+                        MOOTDX_MINUTE_BAR_VOLUME_UNIT
+                    ),
+                    "volume_conversion_factor": (
+                        MOOTDX_LOT_TO_SHARE_FACTOR
+                    ),
+                    "volume_conversion_basis": (
+                        MOOTDX_LOT_TO_SHARE_BASIS
+                    ),
+                }
+            )
+            records.append(row)
+        records.sort(
+            key=lambda row: (
+                str(row.get("event_time") or ""),
+                int(row.get("source_position") or 0),
+            )
+        )
+        precision = _records_precision(records)
+        stock.update(
+            {
+                "source_timestamp_precision": str(
+                    stock.get("source_timestamp_precision")
+                    or stock.get("timestamp_precision")
+                    or ""
+                ),
+                "timestamp_precision": precision,
+                "source_volume_unit": str(
+                    stock.get("source_volume_unit")
+                    or stock.get("volume_unit")
+                    or ""
+                ),
+                "volume_unit": MOOTDX_TRANSACTION_RAW_VOLUME_UNIT,
+                "raw_volume_unit": (
+                    MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+                ),
+                "normalized_volume_unit": (
+                    MOOTDX_MINUTE_BAR_VOLUME_UNIT
+                ),
+                "volume_conversion_factor": (
+                    MOOTDX_LOT_TO_SHARE_FACTOR
+                ),
+                "volume_conversion_basis": (
+                    MOOTDX_LOT_TO_SHARE_BASIS
+                ),
+                "volume_normalization_version": (
+                    MOOTDX_VOLUME_NORMALIZATION_VERSION
+                ),
+                "records": records,
+                "coverage_complete": bool(
+                    stock.get("coverage_complete")
+                )
+                and _records_cover_intervals(records, precision),
+            }
+        )
+        by_code[str(code).zfill(6)] = stock
+    normalized["by_code"] = by_code
+    normalized["transaction_evidence_hash"] = (
+        compute_transaction_evidence_hash(
+            normalized,
+            source="mootdx",
+        )
+    )
+    return normalized
+
+
+def build_mootdx_probe_reanalysis(
+    probe_result: dict[str, Any],
+) -> dict[str, Any]:
+    source = _require_source(probe_result.get("source"))
+    if source != "mootdx":
+        raise ValueError("reanalysis_source_not_mootdx")
+    normalized_transaction = normalize_mootdx_transaction_evidence(
+        dict(probe_result.get("transaction_evidence") or {})
+    )
+    attribution = attribute_mootdx_minute_intervals(
+        probe_result,
+        normalized_transaction,
+    )
+    provisional = attribution.get("status") in {
+        MINUTE_LABEL_END_PROVISIONAL,
+        MINUTE_LABEL_START_PROVISIONAL,
+    }
+    result = {
+        "status": (
+            "PM_REVIEW_REQUIRED"
+            if provisional
+            else "REANALYSIS_INCONCLUSIVE"
+        ),
+        "execution_ok": True,
+        "data_ready": False,
+        "source": source,
+        "source_role": "qualification_candidate",
+        "trade_date": str(probe_result.get("trade_date") or "")[:10],
+        "reanalysis_version": MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
+        "original_probe_status": str(probe_result.get("status") or ""),
+        "probe_evidence_hash": str(
+            probe_result.get("probe_evidence_hash") or ""
+        ),
+        "tracked_codes": sorted(
+            str(code).zfill(6)
+            for code in (probe_result.get("tracked_codes") or [])
+        ),
+        "samples": deepcopy(probe_result.get("samples") or []),
+        "transaction_evidence": normalized_transaction,
+        "transaction_evidence_hash": normalized_transaction[
+            "transaction_evidence_hash"
+        ],
+        "transaction_attribution": attribution,
+        "combined_evidence_hash": str(
+            attribution.get("combined_evidence_hash") or ""
+        ),
+        "minute_label_semantics": str(
+            attribution.get("status") or ATTRIBUTION_INCONCLUSIVE
+        ),
+        "minute_label_validation_status": (
+            "PM_REVIEW_REQUIRED"
+            if provisional
+            else "INCONCLUSIVE"
+        ),
+        "automatic_qualification_update": False,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    result["reanalysis_evidence_hash"] = stable_hash(result)
+    return result
 
 
 def compute_transaction_evidence_hash(
@@ -178,6 +398,7 @@ def _attribute_stock(
     transaction_rows: dict[str, Any],
     *,
     transaction_hash: str,
+    algorithm_version: str,
 ) -> dict[str, Any]:
     base = {
         "code": code,
@@ -192,21 +413,35 @@ def _attribute_stock(
         "transaction_evidence_hash": transaction_hash,
     }
     errors = []
+    normalized_contract = (
+        algorithm_version == MOOTDX_ATTRIBUTION_ALGORITHM_VERSION
+    )
+    if algorithm_version and not normalized_contract:
+        errors.append("transaction_attribution_version_unsupported")
     if not final_bar.get("is_final"):
         errors.append("minute_bar_not_final")
     if not transaction_rows.get("coverage_complete"):
         errors.append("transaction_records_incomplete")
-    if transaction_rows.get("timestamp_precision") != "second":
-        errors.append("transaction_timestamp_precision_insufficient")
-    final_volume_unit = str(final_bar.get("volume_unit") or "")
-    transaction_volume_unit = str(
-        transaction_rows.get("volume_unit") or ""
+    timestamp_precision = str(
+        transaction_rows.get("timestamp_precision") or "unknown"
     )
-    if (
-        not final_volume_unit
-        or final_volume_unit != transaction_volume_unit
-    ):
-        errors.append("transaction_volume_unit_mismatch")
+    if normalized_contract:
+        if timestamp_precision not in {"minute", "second"}:
+            errors.append("transaction_timestamp_precision_unknown_or_mixed")
+        if not _volume_contract_valid(transaction_rows):
+            errors.append("transaction_volume_conversion_contract_invalid")
+    else:
+        if timestamp_precision != "second":
+            errors.append("transaction_timestamp_precision_insufficient")
+        final_volume_unit = str(final_bar.get("volume_unit") or "")
+        transaction_volume_unit = str(
+            transaction_rows.get("volume_unit") or ""
+        )
+        if (
+            not final_volume_unit
+            or final_volume_unit != transaction_volume_unit
+        ):
+            errors.append("transaction_volume_unit_mismatch")
     if transaction_rows.get("error"):
         errors.append("transaction_source_failed")
 
@@ -217,11 +452,13 @@ def _attribute_stock(
             records,
             interval_start=f"{day}T14:49:00+08:00",
             interval_end=f"{day}T14:49:59+08:00",
+            normalized_contract=normalized_contract,
         )
         aggregate_1450 = aggregate_transaction_interval(
             records,
             interval_start=f"{day}T14:50:00+08:00",
             interval_end=f"{day}T14:50:59+08:00",
+            normalized_contract=normalized_contract,
         )
     else:
         aggregate_1449 = _empty_aggregate()
@@ -232,16 +469,23 @@ def _attribute_stock(
         errors.append("transaction_1450_interval_incomplete")
 
     stable_ohlcv = final_bar.get("ohlcv") or {}
+    stable_bar = dict(stable_ohlcv)
+    if normalized_contract:
+        stable_bar.update(_normalized_minute_bar(final_bar))
+        if not stable_bar.get("volume_contract_valid"):
+            errors.append("minute_bar_volume_unit_invalid")
     trade_count_comparison = "minute_bar_field_unavailable_audit_only"
     if _finite(stable_ohlcv.get("trade_count")):
         trade_count_comparison = "compared_with_minute_bar"
     match_1449 = not errors and _aggregate_matches_bar(
         aggregate_1449,
-        stable_ohlcv,
+        stable_bar,
+        normalized_contract=normalized_contract,
     )
     match_1450 = not errors and _aggregate_matches_bar(
         aggregate_1450,
-        stable_ohlcv,
+        stable_bar,
+        normalized_contract=normalized_contract,
     )
     if match_1449 and not match_1450:
         status = MINUTE_LABEL_END_PROVISIONAL
@@ -273,7 +517,7 @@ def _attribute_stock(
         "interval_start": selected.get("interval_start", ""),
         "interval_end": selected.get("interval_end", ""),
         "finalization_delay_ms": finalization_delay_ms,
-        "stable_bar": stable_ohlcv,
+        "stable_bar": stable_bar,
         "aggregate_1449": aggregate_1449,
         "aggregate_1450": aggregate_1450,
         "match_1449": match_1449,
@@ -288,11 +532,19 @@ def aggregate_transaction_interval(
     *,
     interval_start: str,
     interval_end: str,
+    normalized_contract: bool = False,
 ) -> dict[str, Any]:
     start = parse_cn_datetime(interval_start)
     end = parse_cn_datetime(interval_end)
     if start is None or end is None:
         raise ValueError("transaction_interval_invalid")
+    boundary_aligned = (
+        start.date() == end.date()
+        and start.hour == end.hour
+        and start.minute == end.minute
+        and start.second == 0
+        and end.second == 59
+    )
     selected = []
     for row in records:
         event = parse_cn_datetime(row.get("event_time"))
@@ -316,25 +568,212 @@ def aggregate_transaction_interval(
             "volume": None,
             "trade_count": None,
             "row_count": 0,
+            "boundary_aligned": boundary_aligned,
         }
     prices = [float(row["price"]) for row in selected]
+    raw_volume = sum(
+        float(row.get("raw_volume", row.get("volume")))
+        for row in selected
+    )
+    normalized_volume = sum(
+        float(
+            row.get(
+                "normalized_volume",
+                row.get("volume"),
+            )
+        )
+        for row in selected
+    )
+    precisions = {
+        str(row.get("timestamp_precision") or "unknown")
+        for row in selected
+    }
+    precision_valid = precisions in ({"minute"}, {"second"})
+    if precisions == {"minute"}:
+        precision_valid = precision_valid and all(
+            _minute_source_time_matches_event(row)
+            for row in selected
+        )
     return {
         "interval_start": start.isoformat(timespec="seconds"),
         "interval_end": end.isoformat(timespec="seconds"),
-        "complete": all(
+        "complete": boundary_aligned and precision_valid and all(
             _finite(row.get(field))
             for row in selected
             for field in ("price", "volume", "trade_count")
+        ) and (
+            not normalized_contract
+            or all(
+                _record_volume_contract_valid(row)
+                for row in selected
+            )
         ),
         "open": prices[0],
         "high": max(prices),
         "low": min(prices),
         "close": prices[-1],
-        "volume": sum(float(row["volume"]) for row in selected),
+        "volume": raw_volume,
+        "raw_volume": raw_volume,
+        "raw_volume_unit": (
+            MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+            if normalized_contract
+            else ""
+        ),
+        "normalized_volume": normalized_volume,
+        "normalized_volume_unit": (
+            MOOTDX_MINUTE_BAR_VOLUME_UNIT
+            if normalized_contract
+            else ""
+        ),
+        "volume_conversion_factor": (
+            MOOTDX_LOT_TO_SHARE_FACTOR
+            if normalized_contract
+            else 1.0
+        ),
+        "volume_conversion_basis": (
+            MOOTDX_LOT_TO_SHARE_BASIS
+            if normalized_contract
+            else ""
+        ),
         "trade_count": sum(
             int(row["trade_count"]) for row in selected
         ),
         "row_count": len(selected),
+        "timestamp_precision": (
+            next(iter(precisions)) if len(precisions) == 1 else "mixed"
+        ),
+        "boundary_aligned": boundary_aligned,
+    }
+
+
+def _records_precision(records: Iterable[dict[str, Any]]) -> str:
+    precisions = {
+        str(row.get("timestamp_precision") or "unknown")
+        for row in records
+    }
+    if precisions == {"minute"}:
+        return "minute"
+    if precisions == {"second"}:
+        return "second"
+    if not precisions or precisions == {"unknown"}:
+        return "unknown"
+    return "mixed"
+
+
+def _minute_source_time_matches_event(row: dict[str, Any]) -> bool:
+    source_time = str(row.get("source_time_text") or "")
+    if (
+        len(source_time) != 5
+        or source_time[2] != ":"
+        or not source_time[:2].isdigit()
+        or not source_time[3:].isdigit()
+    ):
+        return False
+    hour = int(source_time[:2])
+    minute = int(source_time[3:])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False
+    event = parse_cn_datetime(row.get("event_time"))
+    return bool(
+        event is not None
+        and event.second == 0
+        and event.hour == hour
+        and event.minute == minute
+    )
+
+
+def _records_cover_intervals(
+    records: Iterable[dict[str, Any]],
+    precision: str,
+) -> bool:
+    events = [
+        parse_cn_datetime(row.get("event_time")) for row in records
+    ]
+    events = [event for event in events if event is not None]
+    if not events or precision not in {"minute", "second"}:
+        return False
+    minutes = {(event.hour, event.minute) for event in events}
+    if not {(14, 49), (14, 50)}.issubset(minutes):
+        return False
+    if precision == "minute":
+        return all(event.second == 0 for event in events)
+    return True
+
+
+def _volume_contract_valid(transaction_rows: dict[str, Any]) -> bool:
+    return (
+        str(transaction_rows.get("volume_unit") or "")
+        == MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+        and str(transaction_rows.get("raw_volume_unit") or "")
+        == MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+        and str(transaction_rows.get("normalized_volume_unit") or "")
+        == MOOTDX_MINUTE_BAR_VOLUME_UNIT
+        and _numbers_match(
+            transaction_rows.get("volume_conversion_factor"),
+            MOOTDX_LOT_TO_SHARE_FACTOR,
+            absolute_tolerance=0.0,
+        )
+        and str(transaction_rows.get("volume_conversion_basis") or "")
+        == MOOTDX_LOT_TO_SHARE_BASIS
+        and str(transaction_rows.get("volume_normalization_version") or "")
+        == MOOTDX_VOLUME_NORMALIZATION_VERSION
+    )
+
+
+def _record_volume_contract_valid(row: dict[str, Any]) -> bool:
+    raw_volume = row.get("raw_volume")
+    normalized_volume = row.get("normalized_volume")
+    return (
+        _finite(raw_volume)
+        and _finite(normalized_volume)
+        and str(row.get("raw_volume_unit") or "")
+        == MOOTDX_TRANSACTION_RAW_VOLUME_UNIT
+        and str(row.get("normalized_volume_unit") or "")
+        == MOOTDX_MINUTE_BAR_VOLUME_UNIT
+        and _numbers_match(
+            row.get("volume_conversion_factor"),
+            MOOTDX_LOT_TO_SHARE_FACTOR,
+            absolute_tolerance=0.0,
+        )
+        and str(row.get("volume_conversion_basis") or "")
+        == MOOTDX_LOT_TO_SHARE_BASIS
+        and _numbers_match(
+            normalized_volume,
+            float(raw_volume) * MOOTDX_LOT_TO_SHARE_FACTOR,
+            absolute_tolerance=0.001,
+            relative_tolerance=0.000001,
+        )
+    )
+
+
+def _normalized_minute_bar(
+    final_bar: dict[str, Any],
+) -> dict[str, Any]:
+    values = final_bar.get("ohlcv") or {}
+    raw_volume = values.get("volume")
+    source_unit = str(final_bar.get("volume_unit") or "")
+    source = str(final_bar.get("source") or "")
+    source_version = str(final_bar.get("source_version") or "")
+    legacy_unit = (
+        source_unit == "mootdx_native_volume"
+        and source == "mootdx_tdx_std_minute"
+        and "tdx_std_bars_1m" in source_version
+    )
+    valid = source_unit == MOOTDX_MINUTE_BAR_VOLUME_UNIT or legacy_unit
+    return {
+        "raw_volume": raw_volume,
+        "raw_volume_unit": source_unit,
+        "normalized_volume": raw_volume if valid else None,
+        "normalized_volume_unit": (
+            MOOTDX_MINUTE_BAR_VOLUME_UNIT if valid else ""
+        ),
+        "volume_conversion_factor": 1.0 if valid else None,
+        "volume_conversion_basis": (
+            "mootdx_minute_bar_volume_is_share"
+            if valid
+            else ""
+        ),
+        "volume_contract_valid": valid and _finite(raw_volume),
     }
 
 
@@ -388,12 +827,19 @@ def _finalized_bar(
         "volume_unit": str(
             final_signature.get("volume_unit") or ""
         ),
+        "source": str(final_signature.get("source") or ""),
+        "source_version": str(
+            final_signature.get("source_version") or ""
+        ),
+        "stable_observation_count": MINIMUM_STABLE_OBSERVATIONS,
     }
 
 
 def _aggregate_matches_bar(
     aggregate: dict[str, Any],
     bar: dict[str, Any],
+    *,
+    normalized_contract: bool = False,
 ) -> bool:
     if not aggregate.get("complete"):
         return False
@@ -404,9 +850,19 @@ def _aggregate_matches_bar(
             absolute_tolerance=0.0001,
         ):
             return False
+    aggregate_volume = (
+        aggregate.get("normalized_volume")
+        if normalized_contract
+        else aggregate.get("volume")
+    )
+    bar_volume = (
+        bar.get("normalized_volume")
+        if normalized_contract
+        else bar.get("volume")
+    )
     return _numbers_match(
-        aggregate.get("volume"),
-        bar.get("volume"),
+        aggregate_volume,
+        bar_volume,
         absolute_tolerance=0.001,
         relative_tolerance=0.000001,
     ) and (
@@ -429,8 +885,16 @@ def _empty_aggregate() -> dict[str, Any]:
         "low": None,
         "close": None,
         "volume": None,
+        "raw_volume": None,
+        "raw_volume_unit": "",
+        "normalized_volume": None,
+        "normalized_volume_unit": "",
+        "volume_conversion_factor": None,
+        "volume_conversion_basis": "",
         "trade_count": None,
         "row_count": 0,
+        "timestamp_precision": "unknown",
+        "boundary_aligned": False,
     }
 
 
@@ -490,6 +954,8 @@ def _inconclusive_attribution(
     minute_hash: str,
     transaction_hash: str,
     reasons: list[str],
+    *,
+    algorithm_version: str = "",
 ) -> dict[str, Any]:
     attribution = {
         "status": ATTRIBUTION_INCONCLUSIVE,
@@ -501,6 +967,10 @@ def _inconclusive_attribution(
         "reasons": reasons,
         "provisional_time_contract": {},
     }
+    if algorithm_version:
+        attribution["attribution_algorithm_version"] = (
+            algorithm_version
+        )
     if _is_hash(transaction_hash):
         attribution["combined_evidence_hash"] = (
             compute_combined_evidence_hash(
