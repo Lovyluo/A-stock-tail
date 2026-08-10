@@ -626,6 +626,10 @@ def test_v2_complete_endpoint_and_2000ms_contract_passes_both_gates():
         minimum_stock_count=len(CODES),
     )
 
+    assert payload["data_ready"] is False
+    assert payload["candidates"] == []
+    assert payload["tickets"] == []
+    assert payload["orders"] == []
     assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
     assert qualification_errors == []
     changed_endpoint = deepcopy(payload["transaction_evidence"])
@@ -634,6 +638,105 @@ def test_v2_complete_endpoint_and_2000ms_contract_passes_both_gates():
         changed_endpoint,
         source="mootdx",
     ) != payload["transaction_evidence_hash"]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_timing_errors"),
+    [
+        ("normal", set()),
+        (
+            "timeout",
+            {"probe_timing_audit_failed:deadline_exceeded_count"},
+        ),
+        (
+            "late_start",
+            {
+                "probe_timing_audit_failed:late_start_count",
+                "probe_timing_audit_failed:deadline_exceeded_count",
+            },
+        ),
+        (
+            "missed_window",
+            {
+                "probe_timing_audit_failed:late_start_count",
+                "probe_timing_audit_failed:missed_sample_count",
+            },
+        ),
+    ],
+)
+def test_v2_verified_failure_evidence_is_not_a_qualified_day(
+    scenario,
+    expected_timing_errors,
+):
+    payload = _v2_qualification_payload()
+    sample = payload["samples"][0]
+    if scenario == "timeout":
+        sample.update(
+            {
+                "request_completed_at": f"{DAY}T14:49:57.000+08:00",
+                "completion_lag_ms": 2000.0,
+                "request_elapsed_ms": 2000.0,
+                "request_timed_out": True,
+                "worker_terminated": True,
+                "error_code": "REQUEST_DEADLINE_EXCEEDED",
+                "error": "REQUEST_DEADLINE_EXCEEDED",
+                "returned_record_count": 0,
+            }
+        )
+        payload["deadline_exceeded_count"] = 1
+    elif scenario == "late_start":
+        sample.update(
+            {
+                "request_started_at": f"{DAY}T14:49:57.100+08:00",
+                "request_completed_at": f"{DAY}T14:49:57.200+08:00",
+                "schedule_lag_ms": 2100.0,
+                "completion_lag_ms": 2200.0,
+                "request_elapsed_ms": 100.0,
+                "error_code": "HTTP_REQUEST_FAILED",
+                "error": "HTTP_REQUEST_FAILED",
+            }
+        )
+        payload["late_start_count"] = 1
+        payload["deadline_exceeded_count"] = 1
+    elif scenario == "missed_window":
+        sample.update(
+            {
+                "request_started_at": f"{DAY}T14:49:57.100+08:00",
+                "request_completed_at": f"{DAY}T14:49:57.100+08:00",
+                "schedule_lag_ms": 2100.0,
+                "completion_lag_ms": 2100.0,
+                "request_elapsed_ms": 0.0,
+                "sample_window_missed": True,
+                "error_code": "SAMPLE_WINDOW_MISSED",
+                "error": "SAMPLE_WINDOW_MISSED",
+                "returned_record_count": 0,
+            }
+        )
+        payload["late_start_count"] = 1
+        payload["missed_sample_count"] = 1
+    _rehash_v2_payload(payload)
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert verification["data_ready"] is False
+    assert verification["candidates"] == []
+    assert verification["tickets"] == []
+    assert verification["orders"] == []
+    timing_errors = {
+        error
+        for error in qualification_errors
+        if error.startswith("probe_timing_audit_failed:")
+    }
+    assert timing_errors == expected_timing_errors
+    if scenario == "normal":
+        assert qualification_errors == []
 
 
 @pytest.mark.parametrize(

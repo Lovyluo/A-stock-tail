@@ -231,6 +231,14 @@ def _validate_probe_day(
     elif late_record_count != 0:
         errors.append("probe_late_records_present")
     if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+        for key in (
+            "late_start_count",
+            "deadline_exceeded_count",
+            "missed_sample_count",
+        ):
+            value = _nonnegative_int(result.get(key))
+            if value is not None and value != 0:
+                errors.append(f"probe_timing_audit_failed:{key}")
         errors.extend(
             validate_probe_v2_semantics(
                 result,
