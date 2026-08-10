@@ -320,3 +320,26 @@ provider 失败，`ProviderSpec` 仍保留预期数据类型和版本，使 `FAI
 
 来源验证结果本身始终 `data_ready=false`，只用于验证真实字段、时间和连通性，不是
 冻结快照，也不会生成评分、候选、票据或订单。
+
+## 14. 分钟采样证据 v2
+
+`probe_evidence_schema_version=v2` 在 v1 的四时点行情证据之上增加可审计的调度
+合同。每个采样点必须记录：
+
+- `target_at`、`request_started_at`、`request_completed_at`；
+- `schedule_lag_ms`、`completion_lag_ms`、`request_deadline_ms`；
+- `request_timed_out`、`sample_window_missed`、`worker_terminated`；
+- 稳定的 `error_code`、固定的 `endpoint_id` 和 `returned_record_count`。
+
+顶层汇总分别记录 `late_start_count`、`deadline_exceeded_count`、
+`missed_sample_count` 和 `late_record_count`。其中 `late_record_count` 只统计成功
+返回、但晚于目标采样截止时间的数据记录；请求失败或被强制终止且没有返回记录时仍为
+零。超时和错失时点由另外三个字段表达，不能相互替代。
+
+mootdx 在四时点前执行 5/5 覆盖预检并固定一个健康端点。预检失败使用
+`SOURCE_PREFLIGHT_FAILED`，不进入四时点采样，也不生成候选、票据或订单。每个网络
+请求在独立子进程内执行；分钟请求硬截止为 2000ms，超时后必须终止并等待子进程退出。
+
+v2 的 `probe_evidence_hash` 覆盖来源预检、上述逐点审计字段和顶层汇总。缺少
+`probe_evidence_schema_version` 的历史证据继续按 v1 原始规范验证，不能用 v2 字段
+重新解释或改变 2026-08-06、2026-08-07、2026-08-10 的原始哈希。

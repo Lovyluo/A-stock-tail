@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from typing import Any, Iterable
 
 from overnight_quant.data.minute_label_probe import (
+    PROBE_EVIDENCE_SCHEMA_V1,
+    PROBE_EVIDENCE_SCHEMA_V2,
     compute_probe_evidence_hash,
 )
 from overnight_quant.data.minute_probe_sources import (
@@ -20,6 +22,9 @@ from overnight_quant.data.transaction_attribution import (
     compute_transaction_evidence_hash,
 )
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.probe_v2_contract import (
+    validate_probe_v2_semantics,
+)
 
 
 REQUIRED_PROBE_CLOCKS = (
@@ -195,6 +200,15 @@ def _validate_probe_day(
     minimum_stock_count: int,
 ) -> list[str]:
     errors = []
+    schema_version = str(
+        result.get("probe_evidence_schema_version")
+        or PROBE_EVIDENCE_SCHEMA_V1
+    ).strip().lower()
+    if schema_version not in {
+        PROBE_EVIDENCE_SCHEMA_V1,
+        PROBE_EVIDENCE_SCHEMA_V2,
+    }:
+        errors.append("probe_evidence_schema_unsupported")
     result_source = str(result.get("source") or "").strip().lower()
     if result_source != source:
         errors.append(
@@ -211,8 +225,27 @@ def _validate_probe_day(
         errors.append("probe_provisional_semantics_invalid")
     if result.get("source_role") != "qualification_candidate":
         errors.append("probe_source_role_not_eligible")
-    if int(result.get("late_record_count") or 0) != 0:
+    late_record_count = _nonnegative_int(result.get("late_record_count"))
+    if late_record_count is None:
+        errors.append("probe_audit_summary_invalid:late_record_count")
+    elif late_record_count != 0:
         errors.append("probe_late_records_present")
+    if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+        for key in (
+            "late_start_count",
+            "deadline_exceeded_count",
+            "missed_sample_count",
+        ):
+            value = _nonnegative_int(result.get(key))
+            if value is not None and value != 0:
+                errors.append(f"probe_timing_audit_failed:{key}")
+        errors.extend(
+            validate_probe_v2_semantics(
+                result,
+                source=source,
+                tracked_codes=(result.get("tracked_codes") or []),
+            )
+        )
     if any(result.get(key) for key in ("candidates", "tickets", "orders")):
         errors.append("probe_created_strategy_outputs")
 
@@ -224,7 +257,17 @@ def _validate_probe_day(
     if expected_codes and codes != expected_codes:
         errors.append("probe_expected_codes_mismatch")
 
-    samples = list(result.get("samples") or [])
+    samples_value = result.get("samples")
+    samples = (
+        [item for item in samples_value if isinstance(item, dict)]
+        if isinstance(samples_value, list)
+        else []
+    )
+    if samples_value is not None and (
+        not isinstance(samples_value, list)
+        or len(samples) != len(samples_value)
+    ):
+        errors.append("probe_samples_invalid")
     clocks = sorted(
         str(sample.get("target_at") or "")[11:19]
         for sample in samples
@@ -235,11 +278,31 @@ def _validate_probe_day(
         clock = str(sample.get("target_at") or "")[11:19]
         if str(sample.get("probe_source") or "").strip().lower() != source:
             errors.append(f"probe_sample_source_mismatch:{clock}")
-        if sample.get("error"):
-            errors.append(f"probe_sample_failed:{clock}")
         covered = _normalize_codes(sample.get("covered_codes") or [])
         if covered != codes:
             errors.append(f"probe_sample_coverage_incomplete:{clock}")
+        if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+            if (
+                str(sample.get("error") or "").strip()
+                or str(sample.get("error_code") or "").strip()
+                or sample.get("request_timed_out") is not False
+                or sample.get("sample_window_missed") is not False
+                or sample.get("worker_terminated") is not False
+            ):
+                errors.append(f"probe_sample_failed:{clock}")
+            returned_count = sample.get("returned_record_count")
+            if (
+                not isinstance(returned_count, int)
+                or isinstance(returned_count, bool)
+                or returned_count <= 0
+                or returned_count < len(codes)
+            ):
+                errors.append(
+                    "probe_sample_returned_record_count_invalid:"
+                    f"{clock}"
+                )
+        elif sample.get("error"):
+            errors.append(f"probe_sample_failed:{clock}")
         if not sample.get("request_started_at"):
             errors.append(f"probe_request_started_missing:{clock}")
         if not sample.get("request_completed_at"):
@@ -253,17 +316,55 @@ def _validate_probe_day(
         if len(source_versions) != 1:
             errors.append(f"probe_source_version_invalid:{clock}")
 
-    expected_hash = compute_probe_evidence_hash(
-        samples,
-        codes,
-        source=source,
-    )
+    audit_summary = {}
+    for key in (
+        "late_start_count",
+        "deadline_exceeded_count",
+        "missed_sample_count",
+        "late_record_count",
+    ):
+        value = _nonnegative_int(result.get(key))
+        if value is None:
+            errors.append(f"probe_audit_summary_invalid:{key}")
+            value = 0
+        audit_summary[key] = value
+    try:
+        expected_hash = compute_probe_evidence_hash(
+            samples,
+            codes,
+            source=source,
+            schema_version=schema_version,
+            source_preflight=(
+                result.get("source_preflight")
+                if isinstance(result.get("source_preflight"), dict)
+                else {}
+            ),
+            audit_summary=audit_summary,
+        )
+    except (TypeError, ValueError):
+        expected_hash = ""
     actual_hash = str(result.get("probe_evidence_hash") or "")
     if not _is_hash(actual_hash) or actual_hash != expected_hash:
         errors.append("probe_evidence_hash_drift")
 
-    transaction = dict(result.get("transaction_evidence") or {})
-    attribution = dict(result.get("transaction_attribution") or {})
+    transaction_value = result.get("transaction_evidence")
+    transaction = (
+        transaction_value if isinstance(transaction_value, dict) else {}
+    )
+    attribution_value = result.get("transaction_attribution")
+    attribution = (
+        attribution_value if isinstance(attribution_value, dict) else {}
+    )
+    if transaction_value is not None and not isinstance(
+        transaction_value,
+        dict,
+    ):
+        errors.append("transaction_evidence_invalid")
+    if attribution_value is not None and not isinstance(
+        attribution_value,
+        dict,
+    ):
+        errors.append("transaction_attribution_invalid")
     try:
         expected_transaction_hash = compute_transaction_evidence_hash(
             transaction,
@@ -291,7 +392,7 @@ def _validate_probe_day(
             expected_attribution
         ):
             errors.append("transaction_attribution_derivation_drift")
-    except (KeyError, ValueError):
+    except (KeyError, TypeError, ValueError):
         expected_combined_hash = ""
     actual_combined_hash = str(
         result.get("combined_evidence_hash") or ""
@@ -390,6 +491,13 @@ def _number(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number < 0:
+    if not isfinite(number) or number < 0:
         return None
     return number
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    number = _number(value or 0)
+    if number is None or not number.is_integer():
+        return None
+    return int(number)

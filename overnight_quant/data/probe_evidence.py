@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from overnight_quant.data.minute_label_probe import (
+    PROBE_EVIDENCE_SCHEMA_V1,
+    PROBE_EVIDENCE_SCHEMA_V2,
     compute_probe_evidence_hash,
 )
 from overnight_quant.data.minute_probe_sources import (
@@ -14,6 +16,9 @@ from overnight_quant.data.transaction_attribution import (
     compute_transaction_evidence_hash,
 )
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.probe_v2_contract import (
+    validate_probe_v2_semantics,
+)
 
 
 def verify_probe_evidence(
@@ -23,6 +28,17 @@ def verify_probe_evidence(
 ) -> dict[str, Any]:
     normalized_source = normalize_probe_source(source)
     errors = []
+    schema_version = str(
+        payload.get("probe_evidence_schema_version")
+        or PROBE_EVIDENCE_SCHEMA_V1
+    ).strip().lower()
+    if schema_version not in {
+        PROBE_EVIDENCE_SCHEMA_V1,
+        PROBE_EVIDENCE_SCHEMA_V2,
+    }:
+        errors.append(
+            f"probe_evidence_schema_unsupported:{schema_version}"
+        )
     payload_source = str(payload.get("source") or "").strip().lower()
     if payload_source != normalized_source:
         errors.append(
@@ -30,13 +46,27 @@ def verify_probe_evidence(
             f"{payload_source or '<empty>'}:{normalized_source}"
         )
 
-    samples = list(payload.get("samples") or [])
+    samples_value = payload.get("samples")
+    samples = (
+        [item for item in samples_value if isinstance(item, dict)]
+        if isinstance(samples_value, list)
+        else []
+    )
+    if samples_value is not None and (
+        not isinstance(samples_value, list)
+        or len(samples) != len(samples_value)
+    ):
+        errors.append("minute_probe_samples_invalid")
     codes = sorted(
         str(code).strip().zfill(6)
         for code in (payload.get("tracked_codes") or [])
         if str(code).strip()
     )
-    if not samples:
+    preflight_failed_evidence = (
+        schema_version == PROBE_EVIDENCE_SCHEMA_V2
+        and payload.get("status") == "SOURCE_PREFLIGHT_FAILED"
+    )
+    if not samples and not preflight_failed_evidence:
         errors.append("minute_probe_samples_missing")
     if not codes:
         errors.append("minute_probe_codes_missing")
@@ -44,13 +74,35 @@ def verify_probe_evidence(
         str(sample.get("probe_source") or "").strip().lower()
         for sample in samples
     }
-    if sample_sources != {normalized_source}:
+    if samples and sample_sources != {normalized_source}:
         errors.append("minute_probe_sources_mixed_or_mismatched")
+    preflight_value = payload.get("source_preflight")
+    source_preflight = (
+        preflight_value if isinstance(preflight_value, dict) else {}
+    )
+    if preflight_value is not None and not isinstance(preflight_value, dict):
+        errors.append("probe_source_preflight_invalid")
+    audit_summary, audit_errors = _normalized_audit_summary(payload)
+    if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+        errors.extend(audit_errors)
+    if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+        if not source_preflight:
+            errors.append("probe_source_preflight_missing")
+        errors.extend(
+            validate_probe_v2_semantics(
+                payload,
+                source=normalized_source,
+                tracked_codes=(payload.get("tracked_codes") or []),
+            )
+        )
     try:
         expected_minute_hash = compute_probe_evidence_hash(
             samples,
             codes,
             source=normalized_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
     except ValueError:
         expected_minute_hash = ""
@@ -60,8 +112,24 @@ def verify_probe_evidence(
     if actual_minute_hash != expected_minute_hash:
         errors.append("minute_probe_evidence_hash_drift")
 
-    transaction = dict(payload.get("transaction_evidence") or {})
-    attribution = dict(payload.get("transaction_attribution") or {})
+    transaction_value = payload.get("transaction_evidence")
+    transaction = (
+        transaction_value if isinstance(transaction_value, dict) else {}
+    )
+    attribution_value = payload.get("transaction_attribution")
+    attribution = (
+        attribution_value if isinstance(attribution_value, dict) else {}
+    )
+    if transaction_value is not None and not isinstance(
+        transaction_value,
+        dict,
+    ):
+        errors.append("transaction_evidence_invalid")
+    if attribution_value is not None and not isinstance(
+        attribution_value,
+        dict,
+    ):
+        errors.append("transaction_attribution_invalid")
     expected_transaction_hash = ""
     expected_combined_hash = ""
     if transaction or attribution:
@@ -113,7 +181,7 @@ def verify_probe_evidence(
                     attribution,
                     source=normalized_source,
                 )
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             expected_combined_hash = ""
         if str(payload.get("combined_evidence_hash") or "") != (
             expected_combined_hash
@@ -130,6 +198,7 @@ def verify_probe_evidence(
         "execution_ok": True,
         "data_ready": False,
         "source": normalized_source,
+        "probe_evidence_schema_version": schema_version,
         "probe_evidence_hash": expected_minute_hash,
         "transaction_evidence_hash": expected_transaction_hash,
         "combined_evidence_hash": expected_combined_hash,
@@ -138,3 +207,27 @@ def verify_probe_evidence(
         "tickets": [],
         "orders": [],
     }
+
+
+def _normalized_audit_summary(
+    payload: dict[str, Any],
+) -> tuple[dict[str, int], list[str]]:
+    summary = {}
+    errors = []
+    for key in (
+        "late_start_count",
+        "deadline_exceeded_count",
+        "missed_sample_count",
+        "late_record_count",
+    ):
+        value = payload.get(key)
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            number = -1.0
+        if number < 0 or not number.is_integer():
+            errors.append(f"probe_audit_summary_invalid:{key}")
+            summary[key] = 0
+        else:
+            summary[key] = int(number)
+    return summary, errors

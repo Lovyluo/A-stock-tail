@@ -17,6 +17,7 @@ from overnight_quant.data.close_time_contract import (
 )
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_label_probe import (
+    PROBE_EVIDENCE_SCHEMA_V2,
     classify_minute_label_samples,
     compute_probe_evidence_hash,
     run_scheduled_minute_label_probe,
@@ -30,6 +31,11 @@ from overnight_quant.data.probe_evidence import (
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.snapshot_store import close_snapshot_hash
 from overnight_quant.data.snapshot_store import ProviderBatch
+from overnight_quant.data.source_qualification import (
+    MinuteQualificationPolicy,
+    _validate_probe_day,
+    evaluate_minute_source_qualification,
+)
 from overnight_quant.data.transaction_attribution import (
     ATTRIBUTION_INCONCLUSIVE,
     MOOTDX_ATTRIBUTION_ALGORITHM_VERSION,
@@ -585,6 +591,377 @@ def test_evidence_verifier_recomputes_all_three_hash_layers():
     assert "transaction_evidence_hash_drift" in invalid["errors"]
 
 
+def test_v2_reanalysis_is_byte_deterministic_and_independently_verified():
+    payload = _v2_qualification_payload()
+
+    first = build_mootdx_probe_reanalysis(payload)
+    second = build_mootdx_probe_reanalysis(deepcopy(payload))
+    first_bytes = json.dumps(
+        first,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    second_bytes = json.dumps(
+        second,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert first["status"] == "PM_REVIEW_REQUIRED"
+    assert first_bytes == second_bytes
+    assert verify_probe_evidence(
+        first,
+        source="mootdx",
+    )["status"] == "PROBE_EVIDENCE_VERIFIED"
+
+
+def test_v2_complete_endpoint_and_2000ms_contract_passes_both_gates():
+    payload = _v2_qualification_payload()
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert payload["data_ready"] is False
+    assert payload["candidates"] == []
+    assert payload["tickets"] == []
+    assert payload["orders"] == []
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert qualification_errors == []
+    changed_endpoint = deepcopy(payload["transaction_evidence"])
+    changed_endpoint["endpoint_id"] = "other-endpoint"
+    assert compute_transaction_evidence_hash(
+        changed_endpoint,
+        source="mootdx",
+    ) != payload["transaction_evidence_hash"]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_timing_errors"),
+    [
+        ("normal", set()),
+        (
+            "timeout",
+            {"probe_timing_audit_failed:deadline_exceeded_count"},
+        ),
+        (
+            "late_start",
+            {
+                "probe_timing_audit_failed:late_start_count",
+                "probe_timing_audit_failed:deadline_exceeded_count",
+            },
+        ),
+        (
+            "missed_window",
+            {
+                "probe_timing_audit_failed:late_start_count",
+                "probe_timing_audit_failed:missed_sample_count",
+            },
+        ),
+    ],
+)
+def test_v2_verified_failure_evidence_is_not_a_qualified_day(
+    scenario,
+    expected_timing_errors,
+):
+    payload = _v2_qualification_payload()
+    sample = payload["samples"][0]
+    if scenario == "timeout":
+        sample.update(
+            {
+                "request_completed_at": f"{DAY}T14:49:57.000+08:00",
+                "completion_lag_ms": 2000.0,
+                "request_elapsed_ms": 2000.0,
+                "request_timed_out": True,
+                "worker_terminated": True,
+                "error_code": "REQUEST_DEADLINE_EXCEEDED",
+                "error": "",
+                "returned_record_count": 0,
+            }
+        )
+        payload["deadline_exceeded_count"] = 1
+    elif scenario == "late_start":
+        sample.update(
+            {
+                "request_started_at": f"{DAY}T14:49:57.100+08:00",
+                "request_completed_at": f"{DAY}T14:49:57.200+08:00",
+                "schedule_lag_ms": 2100.0,
+                "completion_lag_ms": 2200.0,
+                "request_elapsed_ms": 100.0,
+                "error_code": "HTTP_REQUEST_FAILED",
+                "error": "",
+                "returned_record_count": 0,
+            }
+        )
+        payload["late_start_count"] = 1
+        payload["deadline_exceeded_count"] = 1
+    elif scenario == "missed_window":
+        sample.update(
+            {
+                "request_started_at": f"{DAY}T14:49:57.100+08:00",
+                "request_completed_at": f"{DAY}T14:49:57.100+08:00",
+                "schedule_lag_ms": 2100.0,
+                "completion_lag_ms": 2100.0,
+                "request_elapsed_ms": 0.0,
+                "sample_window_missed": True,
+                "error_code": "SAMPLE_WINDOW_MISSED",
+                "error": "",
+                "returned_record_count": 0,
+            }
+        )
+        payload["late_start_count"] = 1
+        payload["missed_sample_count"] = 1
+    _rehash_v2_payload(payload)
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert verification["data_ready"] is False
+    assert verification["candidates"] == []
+    assert verification["tickets"] == []
+    assert verification["orders"] == []
+    timing_errors = {
+        error
+        for error in qualification_errors
+        if error.startswith("probe_timing_audit_failed:")
+    }
+    assert timing_errors == expected_timing_errors
+    if scenario == "normal":
+        assert qualification_errors == []
+    else:
+        assert {
+            "probe_sample_failed:14:49:55",
+            "probe_sample_returned_record_count_invalid:14:49:55",
+        }.issubset(qualification_errors)
+
+
+def test_v2_http_failure_is_verified_but_rejected_from_qualification():
+    payload = _v2_http_failure_payload()
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert qualification_errors == ["probe_sample_failed:14:49:55"]
+    _assert_safe_probe_outputs(payload, verification)
+
+
+def test_v2_zero_return_count_cannot_impersonate_complete_coverage():
+    payload = _v2_qualification_payload()
+    payload["samples"][0]["returned_record_count"] = 0
+    _rehash_v2_payload(payload)
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert qualification_errors == [
+        "probe_sample_returned_record_count_invalid:14:49:55"
+    ]
+    _assert_safe_probe_outputs(payload, verification)
+
+
+def test_v2_failed_day_does_not_count_with_one_day_policy():
+    payload = _v2_http_failure_payload()
+
+    qualification = evaluate_minute_source_qualification(
+        [payload],
+        source="mootdx",
+        trading_calendar=_one_day_calendar_contract(),
+        expected_codes=CODES,
+        policy=MinuteQualificationPolicy(
+            minimum_consecutive_trading_days=1,
+        ),
+    )
+
+    assert qualification["days"][0]["qualified"] is False
+    assert qualification["maximum_consecutive_qualified_days"] == 0
+    assert qualification["qualified_for_configuration_review"] is False
+    assert "probe_sample_failed:14:49:55" in qualification[
+        "qualification_errors"
+    ]
+    assert qualification["data_ready"] is False
+    assert qualification["candidates"] == []
+    assert qualification["tickets"] == []
+    assert qualification["orders"] == []
+
+
+def test_v2_normal_day_counts_with_one_day_policy():
+    payload = _v2_qualification_payload()
+
+    qualification = evaluate_minute_source_qualification(
+        [payload],
+        source="mootdx",
+        trading_calendar=_one_day_calendar_contract(),
+        expected_codes=CODES,
+        policy=MinuteQualificationPolicy(
+            minimum_consecutive_trading_days=1,
+        ),
+    )
+
+    assert qualification["days"][0]["qualified"] is True
+    assert qualification["maximum_consecutive_qualified_days"] == 1
+    assert qualification["qualified_for_configuration_review"] is True
+    assert qualification["data_ready"] is False
+    assert qualification["candidates"] == []
+    assert qualification["tickets"] == []
+    assert qualification["orders"] == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        (
+            "preflight_zero_coverage",
+            "probe_source_preflight_coverage_mismatch",
+        ),
+        (
+            "preflight_ratio_forged",
+            "probe_source_preflight_ratio_invalid",
+        ),
+        (
+            "preflight_selected_endpoint_mismatch",
+            "probe_source_preflight_selected_endpoint_mismatch",
+        ),
+        (
+            "preflight_attempt_deadline_too_large",
+            "probe_preflight_deadline_invalid:0",
+        ),
+        (
+            "preflight_success_attempt_timed_out",
+            "probe_source_preflight_success_attempt_missing",
+        ),
+        (
+            "sample_endpoint_mismatch",
+            "probe_sample_endpoint_id_mismatch:14:49:55",
+        ),
+        (
+            "sample_requested_codes_mismatch",
+            "probe_sample_requested_codes_mismatch:14:49:55",
+        ),
+        (
+            "sample_covered_codes_mismatch",
+            "probe_sample_covered_codes_mismatch:14:49:55",
+        ),
+        (
+            "transaction_endpoint_missing",
+            "transaction_endpoint_id_missing",
+        ),
+        (
+            "transaction_endpoint_mismatch",
+            "transaction_endpoint_id_mismatch",
+        ),
+        (
+            "deadline_too_large",
+            "probe_sample_deadline_invalid:14:49:55",
+        ),
+        (
+            "timing_field_forged",
+            "probe_sample_timing_mismatch:14:49:55:schedule_lag_ms",
+        ),
+        (
+            "timezone_forged",
+            "probe_sample_timestamp_invalid:14:49:55",
+        ),
+        (
+            "completion_before_start",
+            "probe_sample_completion_before_start:14:49:55",
+        ),
+        (
+            "timeout_contract_forged",
+            "probe_sample_timeout_contract_invalid:14:49:55",
+        ),
+    ],
+)
+def test_v2_semantic_forgery_is_rejected_after_all_hashes_are_rebuilt(
+    mutation,
+    expected_error,
+):
+    payload = _v2_qualification_payload()
+    if mutation == "preflight_zero_coverage":
+        payload["source_preflight"]["covered_codes"] = []
+    elif mutation == "preflight_ratio_forged":
+        payload["source_preflight"]["coverage_ratio"] = 0.8
+    elif mutation == "preflight_selected_endpoint_mismatch":
+        payload["source_preflight"]["selected_endpoint"]["id"] = (
+            "other-endpoint"
+        )
+    elif mutation == "preflight_attempt_deadline_too_large":
+        payload["source_preflight"]["attempts"][0][
+            "request_deadline_ms"
+        ] = 10000
+    elif mutation == "preflight_success_attempt_timed_out":
+        payload["source_preflight"]["attempts"][0][
+            "request_timed_out"
+        ] = True
+    elif mutation == "sample_endpoint_mismatch":
+        payload["samples"][0]["endpoint_id"] = "other-endpoint"
+    elif mutation == "sample_requested_codes_mismatch":
+        payload["samples"][0]["requested_codes"] = CODES[:-1]
+    elif mutation == "sample_covered_codes_mismatch":
+        payload["samples"][0]["covered_codes"] = CODES[:-1]
+    elif mutation == "transaction_endpoint_missing":
+        payload["transaction_evidence"].pop("endpoint_id")
+    elif mutation == "transaction_endpoint_mismatch":
+        payload["transaction_evidence"]["endpoint_id"] = "other-endpoint"
+    elif mutation == "deadline_too_large":
+        payload["samples"][0]["request_deadline_ms"] = 10000
+    elif mutation == "timing_field_forged":
+        payload["samples"][0]["schedule_lag_ms"] = 999.0
+    elif mutation == "timezone_forged":
+        payload["samples"][0]["request_started_at"] = (
+            f"{DAY}T06:49:55+00:00"
+        )
+    elif mutation == "completion_before_start":
+        payload["samples"][0]["request_completed_at"] = (
+            f"{DAY}T14:49:54.900+08:00"
+        )
+    else:
+        payload["samples"][0].update(
+            {
+                "request_timed_out": True,
+                "error_code": "REQUEST_DEADLINE_EXCEEDED",
+                "worker_terminated": False,
+                "returned_record_count": len(CODES),
+            }
+        )
+    _rehash_v2_payload(payload)
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_INVALID"
+    assert expected_error in verification["errors"]
+    assert expected_error in qualification_errors
+
+
 def test_verify_cli_requires_explicit_source_and_rejects_bom(
     tmp_path,
     monkeypatch,
@@ -671,6 +1048,7 @@ def test_mootdx_transaction_collector_preserves_source_specific_evidence():
 
     stock = evidence["by_code"]["000001"]
     assert evidence["source"] == "mootdx"
+    assert evidence["endpoint_id"] == "mootdx_default"
     assert len(evidence["transaction_evidence_hash"]) == 64
     assert stock["coverage_complete"] is True
     assert stock["timestamp_precision"] == "minute"
@@ -776,6 +1154,124 @@ def _complete_payload():
         "tickets": [],
         "orders": [],
     }
+
+
+def _v2_qualification_payload():
+    payload = _complete_payload()
+    for sample in payload["samples"]:
+        sample.update(
+            {
+                "schedule_lag_ms": 0.0,
+                "completion_lag_ms": 0.0,
+                "request_deadline_ms": 2000,
+                "request_elapsed_ms": 0.0,
+                "request_timed_out": False,
+                "sample_window_missed": False,
+                "worker_terminated": False,
+                "error_code": "",
+                "returned_record_count": len(CODES),
+                "endpoint_id": "unit-mootdx",
+            }
+        )
+    payload.update(
+        {
+            "probe_evidence_schema_version": PROBE_EVIDENCE_SCHEMA_V2,
+            "source_preflight": {
+                "status": "SOURCE_PREFLIGHT_READY",
+                "source": "mootdx",
+                "started_at": f"{DAY}T14:49:40.000+08:00",
+                "completed_at": f"{DAY}T14:49:40.100+08:00",
+                "endpoint_id": "unit-mootdx",
+                "selected_endpoint": {
+                    "id": "unit-mootdx",
+                    "host": "127.0.0.1",
+                    "port": 7709,
+                },
+                "covered_codes": list(CODES),
+                "coverage_ratio": 1.0,
+                "request_elapsed_ms": 100.0,
+                "attempts": [
+                    {
+                        "endpoint_id": "unit-mootdx",
+                        "request_deadline_ms": 2000,
+                        "request_timed_out": False,
+                        "worker_terminated": False,
+                        "covered_codes": list(CODES),
+                        "coverage_ratio": 1.0,
+                        "error_code": "",
+                    }
+                ],
+            },
+            "late_start_count": 0,
+            "deadline_exceeded_count": 0,
+            "missed_sample_count": 0,
+            "late_record_count": 0,
+            "status": "MINUTE_LABEL_PROVISIONAL",
+            "minute_label_validation_status": (
+                "PROVISIONAL_TRANSACTION_ATTRIBUTION"
+            ),
+            "source_role": "qualification_candidate",
+            "execution_ok": True,
+            "data_ready": False,
+        }
+    )
+    payload["transaction_evidence"]["endpoint_id"] = "unit-mootdx"
+    _rehash_v2_payload(payload)
+    return payload
+
+
+def _v2_http_failure_payload():
+    payload = _v2_qualification_payload()
+    payload["samples"][0].update(
+        {
+            "error_code": "HTTP_REQUEST_FAILED",
+            "error": "",
+        }
+    )
+    _rehash_v2_payload(payload)
+    return payload
+
+
+def _one_day_calendar_contract():
+    return {
+        "trade_dates": [DAY],
+        "source": "unit_a_share_calendar",
+        "source_version": "unit_calendar_v1",
+        "raw_hash": "c" * 64,
+    }
+
+
+def _assert_safe_probe_outputs(payload, verification):
+    for result in (payload, verification):
+        assert result["data_ready"] is False
+        assert result["candidates"] == []
+        assert result["tickets"] == []
+        assert result["orders"] == []
+
+
+def _rehash_v2_payload(payload):
+    payload["probe_evidence_hash"] = compute_probe_evidence_hash(
+        payload["samples"],
+        payload["tracked_codes"],
+        source="mootdx",
+        schema_version=PROBE_EVIDENCE_SCHEMA_V2,
+        source_preflight=payload["source_preflight"],
+        audit_summary={
+            key: int(payload.get(key) or 0)
+            for key in (
+                "late_start_count",
+                "deadline_exceeded_count",
+                "missed_sample_count",
+                "late_record_count",
+            )
+        },
+    )
+    _rebuild_original_evidence(payload)
+    attribution = payload["transaction_attribution"]
+    payload["minute_label_semantics"] = attribution["status"]
+    payload["recommended_time_contract"] = attribution[
+        "provisional_time_contract"
+    ]
 
 
 def _legacy_complete_payload():
