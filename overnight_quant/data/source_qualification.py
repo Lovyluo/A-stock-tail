@@ -278,11 +278,31 @@ def _validate_probe_day(
         clock = str(sample.get("target_at") or "")[11:19]
         if str(sample.get("probe_source") or "").strip().lower() != source:
             errors.append(f"probe_sample_source_mismatch:{clock}")
-        if sample.get("error"):
-            errors.append(f"probe_sample_failed:{clock}")
         covered = _normalize_codes(sample.get("covered_codes") or [])
         if covered != codes:
             errors.append(f"probe_sample_coverage_incomplete:{clock}")
+        if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+            if (
+                str(sample.get("error") or "").strip()
+                or str(sample.get("error_code") or "").strip()
+                or sample.get("request_timed_out") is not False
+                or sample.get("sample_window_missed") is not False
+                or sample.get("worker_terminated") is not False
+            ):
+                errors.append(f"probe_sample_failed:{clock}")
+            returned_count = sample.get("returned_record_count")
+            if (
+                not isinstance(returned_count, int)
+                or isinstance(returned_count, bool)
+                or returned_count <= 0
+                or returned_count < len(codes)
+            ):
+                errors.append(
+                    "probe_sample_returned_record_count_invalid:"
+                    f"{clock}"
+                )
+        elif sample.get("error"):
+            errors.append(f"probe_sample_failed:{clock}")
         if not sample.get("request_started_at"):
             errors.append(f"probe_request_started_missing:{clock}")
         if not sample.get("request_completed_at"):

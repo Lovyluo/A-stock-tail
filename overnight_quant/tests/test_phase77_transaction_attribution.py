@@ -32,7 +32,9 @@ from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.snapshot_store import close_snapshot_hash
 from overnight_quant.data.snapshot_store import ProviderBatch
 from overnight_quant.data.source_qualification import (
+    MinuteQualificationPolicy,
     _validate_probe_day,
+    evaluate_minute_source_qualification,
 )
 from overnight_quant.data.transaction_attribution import (
     ATTRIBUTION_INCONCLUSIVE,
@@ -736,7 +738,96 @@ def test_v2_verified_failure_evidence_is_not_a_qualified_day(
         if error.startswith("probe_timing_audit_failed:")
     }
     assert timing_errors == expected_timing_errors
-    assert set(qualification_errors) == expected_timing_errors
+    if scenario == "normal":
+        assert qualification_errors == []
+    else:
+        assert {
+            "probe_sample_failed:14:49:55",
+            "probe_sample_returned_record_count_invalid:14:49:55",
+        }.issubset(qualification_errors)
+
+
+def test_v2_http_failure_is_verified_but_rejected_from_qualification():
+    payload = _v2_http_failure_payload()
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert qualification_errors == ["probe_sample_failed:14:49:55"]
+    _assert_safe_probe_outputs(payload, verification)
+
+
+def test_v2_zero_return_count_cannot_impersonate_complete_coverage():
+    payload = _v2_qualification_payload()
+    payload["samples"][0]["returned_record_count"] = 0
+    _rehash_v2_payload(payload)
+
+    verification = verify_probe_evidence(payload, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        payload,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
+
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert qualification_errors == [
+        "probe_sample_returned_record_count_invalid:14:49:55"
+    ]
+    _assert_safe_probe_outputs(payload, verification)
+
+
+def test_v2_failed_day_does_not_count_with_one_day_policy():
+    payload = _v2_http_failure_payload()
+
+    qualification = evaluate_minute_source_qualification(
+        [payload],
+        source="mootdx",
+        trading_calendar=_one_day_calendar_contract(),
+        expected_codes=CODES,
+        policy=MinuteQualificationPolicy(
+            minimum_consecutive_trading_days=1,
+        ),
+    )
+
+    assert qualification["days"][0]["qualified"] is False
+    assert qualification["maximum_consecutive_qualified_days"] == 0
+    assert qualification["qualified_for_configuration_review"] is False
+    assert "probe_sample_failed:14:49:55" in qualification[
+        "qualification_errors"
+    ]
+    assert qualification["data_ready"] is False
+    assert qualification["candidates"] == []
+    assert qualification["tickets"] == []
+    assert qualification["orders"] == []
+
+
+def test_v2_normal_day_counts_with_one_day_policy():
+    payload = _v2_qualification_payload()
+
+    qualification = evaluate_minute_source_qualification(
+        [payload],
+        source="mootdx",
+        trading_calendar=_one_day_calendar_contract(),
+        expected_codes=CODES,
+        policy=MinuteQualificationPolicy(
+            minimum_consecutive_trading_days=1,
+        ),
+    )
+
+    assert qualification["days"][0]["qualified"] is True
+    assert qualification["maximum_consecutive_qualified_days"] == 1
+    assert qualification["qualified_for_configuration_review"] is True
+    assert qualification["data_ready"] is False
+    assert qualification["candidates"] == []
+    assert qualification["tickets"] == []
+    assert qualification["orders"] == []
 
 
 @pytest.mark.parametrize(
@@ -1127,6 +1218,35 @@ def _v2_qualification_payload():
     payload["transaction_evidence"]["endpoint_id"] = "unit-mootdx"
     _rehash_v2_payload(payload)
     return payload
+
+
+def _v2_http_failure_payload():
+    payload = _v2_qualification_payload()
+    payload["samples"][0].update(
+        {
+            "error_code": "HTTP_REQUEST_FAILED",
+            "error": "HTTP_REQUEST_FAILED",
+        }
+    )
+    _rehash_v2_payload(payload)
+    return payload
+
+
+def _one_day_calendar_contract():
+    return {
+        "trade_dates": [DAY],
+        "source": "unit_a_share_calendar",
+        "source_version": "unit_calendar_v1",
+        "raw_hash": "c" * 64,
+    }
+
+
+def _assert_safe_probe_outputs(payload, verification):
+    for result in (payload, verification):
+        assert result["data_ready"] is False
+        assert result["candidates"] == []
+        assert result["tickets"] == []
+        assert result["orders"] == []
 
 
 def _rehash_v2_payload(payload):
