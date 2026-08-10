@@ -1225,7 +1225,7 @@ def _v2_http_failure_payload():
     payload["samples"][0].update(
         {
             "error_code": "HTTP_REQUEST_FAILED",
-            "error": "HTTP_REQUEST_FAILED",
+            "error": "",
         }
     )
     _rehash_v2_payload(payload)
