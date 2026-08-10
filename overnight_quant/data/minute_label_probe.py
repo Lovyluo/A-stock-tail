@@ -1037,6 +1037,7 @@ def _collect_transaction_evidence(
         evidence = {
             "source": source,
             "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+            "endpoint_id": str((endpoint or {}).get("id") or ""),
             "trade_date": trade_date.isoformat(),
             "requested_codes": list(codes),
             "request_started_at": request_started.isoformat(
@@ -1062,6 +1063,10 @@ def _collect_transaction_evidence(
                 worker_result.get("error_code") or ""
             ),
         }
+    )
+    evidence.setdefault(
+        "endpoint_id",
+        str((endpoint or {}).get("id") or ""),
     )
     evidence["transaction_evidence_hash"] = (
         compute_transaction_evidence_hash(evidence, source=source)

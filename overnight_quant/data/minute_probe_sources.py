@@ -248,6 +248,7 @@ class MootdxMinuteProbeCollectors:
         evidence = {
             "source": self.probe_source,
             "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+            "endpoint_id": self.endpoint_id,
             "source_volume_unit": "lot",
             "volume_unit": "lot",
             "trade_date": observed_at.date().isoformat(),

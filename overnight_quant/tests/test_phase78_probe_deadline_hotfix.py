@@ -16,6 +16,9 @@ from overnight_quant.data.probe_worker_process import (
     WORKER_TIMEOUT_ERROR,
     run_probe_worker_process,
 )
+from overnight_quant.data.source_qualification import (
+    _validate_probe_day,
+)
 
 
 DAY = "2026-08-11"
@@ -251,12 +254,14 @@ def test_mootdx_preflight_pins_one_healthy_endpoint_for_all_requests():
         worker_runner=worker,
         endpoint_candidates=[bad, good],
     )
+    verification = verify_probe_evidence(result, source="mootdx")
 
     minute_tasks = [item for item in calls if item["operation"] == "minute"]
     assert result["source_preflight"]["status"] == "SOURCE_PREFLIGHT_READY"
     assert result["source_preflight"]["endpoint_id"] == "good"
     assert len(result["source_preflight"]["attempts"]) == 2
     assert all(item["endpoint"]["id"] == "good" for item in minute_tasks)
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
     _assert_research_only(result)
 
 
@@ -287,10 +292,17 @@ def test_failed_preflight_stops_sampling_and_produces_verifiable_evidence():
         ],
     )
     verification = verify_probe_evidence(result, source="mootdx")
+    qualification_errors = _validate_probe_day(
+        result,
+        source="mootdx",
+        expected_codes=list(CODES),
+        minimum_stock_count=len(CODES),
+    )
 
     assert result["status"] == "SOURCE_PREFLIGHT_FAILED"
     assert calls == ["preflight"]
     assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    assert "probe_day_not_provisional" in qualification_errors
     _assert_research_only(result)
 
 
@@ -347,6 +359,7 @@ def test_v2_hash_includes_timing_audit_and_is_deterministic():
     payload = {
         "status": "MINUTE_LABEL_INCONCLUSIVE",
         "source": "eastmoney",
+        "trade_date": DAY,
         "probe_evidence_schema_version": PROBE_EVIDENCE_SCHEMA_V2,
         "source_preflight": preflight,
         "tracked_codes": list(CODES),
@@ -401,6 +414,7 @@ def _legacy_sample():
         "request_started_at": f"{DAY}T14:49:55+08:00",
         "request_completed_at": f"{DAY}T14:49:55.100+08:00",
         "request_elapsed_ms": 100.0,
+        "requested_codes": list(CODES),
         "covered_codes": list(CODES),
         "presence_by_code": {code: False for code in CODES},
         "signatures": {},
