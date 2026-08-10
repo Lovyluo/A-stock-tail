@@ -679,7 +679,7 @@ def test_v2_verified_failure_evidence_is_not_a_qualified_day(
                 "request_timed_out": True,
                 "worker_terminated": True,
                 "error_code": "REQUEST_DEADLINE_EXCEEDED",
-                "error": "REQUEST_DEADLINE_EXCEEDED",
+                "error": "",
                 "returned_record_count": 0,
             }
         )
@@ -693,7 +693,8 @@ def test_v2_verified_failure_evidence_is_not_a_qualified_day(
                 "completion_lag_ms": 2200.0,
                 "request_elapsed_ms": 100.0,
                 "error_code": "HTTP_REQUEST_FAILED",
-                "error": "HTTP_REQUEST_FAILED",
+                "error": "",
+                "returned_record_count": 0,
             }
         )
         payload["late_start_count"] = 1
@@ -708,7 +709,7 @@ def test_v2_verified_failure_evidence_is_not_a_qualified_day(
                 "request_elapsed_ms": 0.0,
                 "sample_window_missed": True,
                 "error_code": "SAMPLE_WINDOW_MISSED",
-                "error": "SAMPLE_WINDOW_MISSED",
+                "error": "",
                 "returned_record_count": 0,
             }
         )
@@ -735,8 +736,7 @@ def test_v2_verified_failure_evidence_is_not_a_qualified_day(
         if error.startswith("probe_timing_audit_failed:")
     }
     assert timing_errors == expected_timing_errors
-    if scenario == "normal":
-        assert qualification_errors == []
+    assert set(qualification_errors) == expected_timing_errors
 
 
 @pytest.mark.parametrize(
