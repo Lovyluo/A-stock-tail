@@ -5,6 +5,8 @@ from math import ceil
 from typing import Any, Iterable
 
 from overnight_quant.data.minute_label_probe import (
+    PROBE_EVIDENCE_SCHEMA_V1,
+    PROBE_EVIDENCE_SCHEMA_V2,
     compute_probe_evidence_hash,
 )
 from overnight_quant.data.minute_probe_sources import (
@@ -195,6 +197,15 @@ def _validate_probe_day(
     minimum_stock_count: int,
 ) -> list[str]:
     errors = []
+    schema_version = str(
+        result.get("probe_evidence_schema_version")
+        or PROBE_EVIDENCE_SCHEMA_V1
+    ).strip().lower()
+    if schema_version not in {
+        PROBE_EVIDENCE_SCHEMA_V1,
+        PROBE_EVIDENCE_SCHEMA_V2,
+    }:
+        errors.append("probe_evidence_schema_unsupported")
     result_source = str(result.get("source") or "").strip().lower()
     if result_source != source:
         errors.append(
@@ -213,6 +224,17 @@ def _validate_probe_day(
         errors.append("probe_source_role_not_eligible")
     if int(result.get("late_record_count") or 0) != 0:
         errors.append("probe_late_records_present")
+    if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+        preflight = dict(result.get("source_preflight") or {})
+        if preflight.get("status") != "SOURCE_PREFLIGHT_READY":
+            errors.append("probe_source_preflight_not_ready")
+        for key in (
+            "late_start_count",
+            "deadline_exceeded_count",
+            "missed_sample_count",
+        ):
+            if int(result.get(key) or 0) != 0:
+                errors.append(f"probe_timing_audit_failed:{key}")
     if any(result.get(key) for key in ("candidates", "tickets", "orders")):
         errors.append("probe_created_strategy_outputs")
 
@@ -237,6 +259,13 @@ def _validate_probe_day(
             errors.append(f"probe_sample_source_mismatch:{clock}")
         if sample.get("error"):
             errors.append(f"probe_sample_failed:{clock}")
+        if schema_version == PROBE_EVIDENCE_SCHEMA_V2:
+            if sample.get("request_timed_out") is True:
+                errors.append(f"probe_sample_timed_out:{clock}")
+            if sample.get("sample_window_missed") is True:
+                errors.append(f"probe_sample_window_missed:{clock}")
+            if sample.get("worker_terminated") is True:
+                errors.append(f"probe_worker_terminated:{clock}")
         covered = _normalize_codes(sample.get("covered_codes") or [])
         if covered != codes:
             errors.append(f"probe_sample_coverage_incomplete:{clock}")
@@ -257,6 +286,17 @@ def _validate_probe_day(
         samples,
         codes,
         source=source,
+        schema_version=schema_version,
+        source_preflight=(result.get("source_preflight") or {}),
+        audit_summary={
+            key: int(result.get(key) or 0)
+            for key in (
+                "late_start_count",
+                "deadline_exceeded_count",
+                "missed_sample_count",
+                "late_record_count",
+            )
+        },
     )
     actual_hash = str(result.get("probe_evidence_hash") or "")
     if not _is_hash(actual_hash) or actual_hash != expected_hash:

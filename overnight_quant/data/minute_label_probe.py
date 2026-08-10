@@ -16,12 +16,18 @@ from overnight_quant.data.close_time_contract import (
 )
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_probe_sources import (
+    MOOTDX_TRANSACTION_SOURCE_VERSION,
     PROBE_SOURCE_EASTMONEY,
     PROBE_SOURCE_MOOTDX,
     build_minute_probe_collector,
+    mootdx_server_candidates,
     normalize_probe_source,
 )
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.probe_worker_process import (
+    WORKER_TIMEOUT_ERROR,
+    run_probe_worker_process,
+)
 from overnight_quant.data.transaction_attribution import (
     ATTRIBUTION_INCONCLUSIVE,
     attribute_mootdx_minute_intervals,
@@ -36,6 +42,10 @@ PROBE_CLOCKS = (
     time(14, 51, 5),
 )
 MAX_PROBE_START_LAG_SECONDS = 2.0
+MINUTE_REQUEST_DEADLINE_MS = 2000
+TRANSACTION_REQUEST_DEADLINE_MS = 5000
+PROBE_EVIDENCE_SCHEMA_V1 = "v1"
+PROBE_EVIDENCE_SCHEMA_V2 = "v2"
 
 
 def minute_1450_signature(
@@ -80,6 +90,9 @@ def classify_minute_label_samples(
     *,
     required_codes: list[str] | None = None,
     source: str | None = None,
+    schema_version: str | None = None,
+    source_preflight: dict[str, Any] | None = None,
+    audit_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ordered = sorted(
         samples,
@@ -124,6 +137,9 @@ def classify_minute_label_samples(
             samples=ordered,
             reasons=["probe_sources_mixed_or_mismatched"],
             source=resolved_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
     missing_points = [
         value for value in expected if value not in by_clock
@@ -138,6 +154,9 @@ def classify_minute_label_samples(
                 + ",".join(missing_points)
             ],
             source=resolved_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
 
     tracked_codes = sorted(
@@ -169,6 +188,9 @@ def classify_minute_label_samples(
         ordered,
         tracked_codes,
         source=resolved_source,
+        schema_version=schema_version,
+        source_preflight=source_preflight,
+        audit_summary=audit_summary,
     )
     timing_errors = _probe_timing_errors(by_clock, expected)
     if timing_errors:
@@ -180,6 +202,9 @@ def classify_minute_label_samples(
             tracked_codes=tracked_codes,
             probe_evidence_hash=evidence_hash,
             source=resolved_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
     coverage_errors = []
     for clock in expected:
@@ -204,6 +229,9 @@ def classify_minute_label_samples(
             tracked_codes=tracked_codes,
             probe_evidence_hash=evidence_hash,
             source=resolved_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
     if not tracked_codes:
         return _probe_result(
@@ -213,6 +241,9 @@ def classify_minute_label_samples(
             reasons=["probe_required_codes_missing"],
             probe_evidence_hash=evidence_hash,
             source=resolved_source,
+            schema_version=schema_version,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
 
     first_present = []
@@ -285,6 +316,9 @@ def classify_minute_label_samples(
         tracked_codes=tracked_codes,
         probe_evidence_hash=evidence_hash,
         source=resolved_source,
+        schema_version=schema_version,
+        source_preflight=source_preflight,
+        audit_summary=audit_summary,
     )
 
 
@@ -297,11 +331,23 @@ def run_scheduled_minute_label_probe(
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     monotonic: Callable[[], float] | None = None,
+    worker_runner: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
+    endpoint_candidates: list[dict[str, Any]] | None = None,
+    request_deadline_ms: int = MINUTE_REQUEST_DEADLINE_MS,
+    transaction_deadline_ms: int = TRANSACTION_REQUEST_DEADLINE_MS,
 ) -> dict[str, Any]:
     normalized_source = normalize_probe_source(source)
     runtime_clock = clock or (lambda: datetime.now(CN_TZ))
     runtime_sleep = sleep or time_module.sleep
     runtime_monotonic = monotonic or time_module.monotonic
+    runtime_worker = worker_runner or run_probe_worker_process
+    runtime_codes = sorted(
+        {
+            str(code).strip().zfill(6)
+            for code in codes
+            if str(code).strip()
+        }
+    )
     current = runtime_clock()
     day = (
         current.date()
@@ -316,41 +362,73 @@ def run_scheduled_minute_label_probe(
         datetime.combine(day, value, tzinfo=CN_TZ)
         for value in PROBE_CLOCKS
     ]
-    if current > targets[0]:
-        return {
-            "status": "PROBE_WINDOW_MISSED",
-            "execution_ok": True,
-            "data_ready": False,
-            "trade_date": day.isoformat(),
-            "source": normalized_source,
-            "required_sample_times": [
-                item.isoformat(timespec="seconds")
-                for item in targets
-            ],
-            "samples": [],
-            "candidates": [],
-            "tickets": [],
-            "orders": [],
-        }
+    runtime_collectors = collectors
+    process_isolated = runtime_collectors is None
+    if runtime_collectors is not None:
+        collector_source = str(
+            getattr(
+                runtime_collectors,
+                "probe_source",
+                normalized_source,
+            )
+            or ""
+        ).strip().lower()
+        if collector_source != normalized_source:
+            raise ValueError(
+                "minute_probe_collector_source_mismatch:"
+                f"{collector_source}:{normalized_source}"
+            )
+        runtime_codes = list(runtime_collectors.codes)
 
-    runtime_collectors = collectors or build_minute_probe_collector(
+    source_preflight = _source_preflight(
         normalized_source,
-        codes,
+        runtime_codes,
+        observed_at=current,
+        process_isolated=process_isolated,
+        worker_runner=runtime_worker,
+        endpoint_candidates=endpoint_candidates,
+        deadline_ms=int(request_deadline_ms),
         clock=runtime_clock,
+        monotonic=runtime_monotonic,
     )
-    collector_source = str(
-        getattr(
-            runtime_collectors,
-            "probe_source",
-            normalized_source,
+    if source_preflight.get("status") == "SOURCE_PREFLIGHT_FAILED":
+        audit_summary = _probe_audit_summary([])
+        evidence_hash = compute_probe_evidence_hash(
+            [],
+            runtime_codes,
+            source=normalized_source,
+            schema_version=PROBE_EVIDENCE_SCHEMA_V2,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
-        or ""
-    ).strip().lower()
-    if collector_source != normalized_source:
-        raise ValueError(
-            "minute_probe_collector_source_mismatch:"
-            f"{collector_source}:{normalized_source}"
+        result = _probe_result(
+            MINUTE_LABEL_UNVERIFIED,
+            "INCONCLUSIVE",
+            samples=[],
+            reasons=["source_preflight_failed"],
+            tracked_codes=runtime_codes,
+            probe_evidence_hash=evidence_hash,
+            source=normalized_source,
+            schema_version=PROBE_EVIDENCE_SCHEMA_V2,
+            source_preflight=source_preflight,
+            audit_summary=audit_summary,
         )
+        result.update(
+            {
+                "status": "SOURCE_PREFLIGHT_FAILED",
+                "execution_ok": True,
+                "data_ready": False,
+                "trade_date": day.isoformat(),
+                "requires_manual_review": True,
+                **audit_summary,
+                "candidates": [],
+                "tickets": [],
+                "orders": [],
+            }
+        )
+        return result
+
+    selected_endpoint = source_preflight.get("selected_endpoint") or None
     samples = []
     transaction_evidence: dict[str, Any] = {}
     try:
@@ -362,141 +440,94 @@ def run_scheduled_minute_label_probe(
             if wait_seconds:
                 runtime_sleep(wait_seconds)
             request_started = runtime_clock()
+            schedule_lag_ms = round(
+                max(0.0, (request_started - target).total_seconds() * 1000),
+                3,
+            )
+            if schedule_lag_ms > MAX_PROBE_START_LAG_SECONDS * 1000:
+                samples.append(
+                    _empty_probe_sample(
+                        source=normalized_source,
+                        target=target,
+                        request_started=request_started,
+                        request_completed=request_started,
+                        codes=runtime_codes,
+                        schedule_lag_ms=schedule_lag_ms,
+                        request_deadline_ms=int(request_deadline_ms),
+                        error_code="SAMPLE_WINDOW_MISSED",
+                        error="SAMPLE_WINDOW_MISSED",
+                        sample_window_missed=True,
+                    )
+                )
+                continue
             started_monotonic = runtime_monotonic()
-            signatures = {}
-            covered_codes = []
-            raw_response_hashes = []
-            source_versions = []
-            provider_raw_hash = ""
-            try:
-                batch = runtime_collectors.collect_minute_bars(
-                    request_started
-                )
-                request_completed = runtime_clock()
-                signatures = minute_1450_signature(batch.records)
-                covered_codes = sorted(
+            if process_isolated:
+                worker_result = runtime_worker(
                     {
-                        str(
-                            (row.get("payload") or {}).get("code")
-                            or ""
-                        ).zfill(6)
-                        for row in batch.records
-                        if str(row.get("data_type") or "")
-                        == "minute_bar"
-                        and (row.get("payload") or {}).get("code")
-                    }
+                        "operation": "minute",
+                        "source": normalized_source,
+                        "codes": runtime_codes,
+                        "observed_at": request_started.isoformat(),
+                        "endpoint": selected_endpoint,
+                        "provider_timeout_seconds": (
+                            int(request_deadline_ms) / 1000.0
+                        ),
+                    },
+                    int(request_deadline_ms),
                 )
-                raw_response_hashes = sorted(
-                    {
-                        str(row.get("raw_hash") or "")
-                        for row in batch.records
-                        if row.get("raw_hash")
-                    }
+            else:
+                worker_result = _run_inline_minute_request(
+                    runtime_collectors,
+                    request_started,
                 )
-                source_versions = sorted(
-                    {
-                        str(row.get("source_version") or "")
-                        for row in batch.records
-                        if row.get("source_version")
-                    }
-                )
-                provider_raw_hash = str(batch.raw_hash or "")
-                error = ""
-            except Exception as exc:
-                request_completed = runtime_clock()
-                signatures = {}
-                error = f"{type(exc).__name__}: {exc}"
+            request_completed = runtime_clock()
             elapsed_ms = round(
                 (runtime_monotonic() - started_monotonic) * 1000,
                 3,
             )
             samples.append(
-                {
-                    "probe_source": normalized_source,
-                    "target_at": target.isoformat(
-                        timespec="seconds"
+                _sample_from_worker_result(
+                    worker_result,
+                    source=normalized_source,
+                    target=target,
+                    request_started=request_started,
+                    request_completed=request_completed,
+                    elapsed_ms=elapsed_ms,
+                    codes=runtime_codes,
+                    schedule_lag_ms=schedule_lag_ms,
+                    request_deadline_ms=int(request_deadline_ms),
+                    endpoint_id=str(
+                        source_preflight.get("endpoint_id") or ""
                     ),
-                    "sampled_at": request_started.isoformat(
-                        timespec="seconds"
-                    ),
-                    "request_started_at": (
-                        request_started.isoformat(
-                            timespec="milliseconds"
-                        )
-                    ),
-                    "request_completed_at": (
-                        request_completed.isoformat(
-                            timespec="milliseconds"
-                        )
-                    ),
-                    "request_elapsed_ms": elapsed_ms,
-                    "requested_codes": list(runtime_collectors.codes),
-                    "covered_codes": covered_codes,
-                    "presence_by_code": {
-                        code: code in signatures
-                        for code in runtime_collectors.codes
-                    },
-                    "signatures": signatures,
-                    "raw_response_hashes": raw_response_hashes,
-                    "provider_raw_hash": provider_raw_hash,
-                    "source_versions": source_versions,
-                    "sample_trade_date": day.isoformat(),
-                    "error": error,
-                }
+                )
             )
         if normalized_source == PROBE_SOURCE_MOOTDX:
-            collect_transactions = getattr(
-                runtime_collectors,
-                "collect_transaction_evidence",
-                None,
+            transaction_evidence = _collect_transaction_evidence(
+                collectors=runtime_collectors,
+                process_isolated=process_isolated,
+                worker_runner=runtime_worker,
+                source=normalized_source,
+                codes=runtime_codes,
+                endpoint=selected_endpoint,
+                observed_at=runtime_clock(),
+                deadline_ms=int(transaction_deadline_ms),
+                clock=runtime_clock,
+                monotonic=runtime_monotonic,
+                trade_date=day,
             )
-            if callable(collect_transactions):
-                transaction_started = runtime_clock()
-                try:
-                    transaction_evidence = collect_transactions(
-                        transaction_started
-                    )
-                except Exception as exc:
-                    transaction_evidence = {
-                        "source": normalized_source,
-                        "source_version": str(
-                            getattr(
-                                runtime_collectors,
-                                "source_version",
-                                "",
-                            )
-                        ),
-                        "trade_date": day.isoformat(),
-                        "requested_codes": list(
-                            runtime_collectors.codes
-                        ),
-                        "request_started_at": (
-                            transaction_started.isoformat(
-                                timespec="milliseconds"
-                            )
-                        ),
-                        "request_completed_at": (
-                            runtime_clock().isoformat(
-                                timespec="milliseconds"
-                            )
-                        ),
-                        "by_code": {},
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                    transaction_evidence[
-                        "transaction_evidence_hash"
-                    ] = compute_transaction_evidence_hash(
-                        transaction_evidence,
-                        source=normalized_source,
-                    )
     finally:
-        close = getattr(runtime_collectors, "close", None)
-        if callable(close):
-            close()
+        if runtime_collectors is not None:
+            close = getattr(runtime_collectors, "close", None)
+            if callable(close):
+                close()
+    audit_summary = _probe_audit_summary(samples)
     result = classify_minute_label_samples(
         samples,
-        required_codes=list(runtime_collectors.codes),
+        required_codes=runtime_codes,
         source=normalized_source,
+        schema_version=PROBE_EVIDENCE_SCHEMA_V2,
+        source_preflight=source_preflight,
+        audit_summary=audit_summary,
     )
     result["source_role"] = (
         "qualification_candidate"
@@ -553,13 +584,500 @@ def run_scheduled_minute_label_probe(
             "source": normalized_source,
             "source_versions": all_source_versions,
             "requires_manual_review": True,
-            "late_record_count": 0,
+            **audit_summary,
             "candidates": [],
             "tickets": [],
             "orders": [],
         }
     )
     return result
+
+
+def _source_preflight(
+    source: str,
+    codes: list[str],
+    *,
+    observed_at: datetime,
+    process_isolated: bool,
+    worker_runner: Callable[[dict[str, Any], int], dict[str, Any]],
+    endpoint_candidates: list[dict[str, Any]] | None,
+    deadline_ms: int,
+    clock: Callable[[], datetime],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    if not process_isolated:
+        now = clock().isoformat(timespec="milliseconds")
+        return {
+            "status": "INJECTED_COLLECTOR",
+            "source": source,
+            "started_at": now,
+            "completed_at": now,
+            "endpoint_id": "injected",
+            "covered_codes": list(codes),
+            "coverage_ratio": 1.0 if codes else 0.0,
+            "request_elapsed_ms": 0.0,
+            "attempts": [],
+        }
+    if source != PROBE_SOURCE_MOOTDX:
+        now = clock().isoformat(timespec="milliseconds")
+        return {
+            "status": "NOT_REQUIRED",
+            "source": source,
+            "started_at": now,
+            "completed_at": now,
+            "endpoint_id": "",
+            "covered_codes": [],
+            "coverage_ratio": 0.0,
+            "request_elapsed_ms": 0.0,
+            "attempts": [],
+        }
+
+    candidates = list(
+        endpoint_candidates
+        if endpoint_candidates is not None
+        else mootdx_server_candidates()
+    )
+    preflight_started = clock()
+    total_started = monotonic()
+    attempts = []
+    for endpoint in candidates:
+        request_started = clock()
+        started_monotonic = monotonic()
+        worker_result = worker_runner(
+            {
+                "operation": "preflight",
+                "source": source,
+                "codes": codes,
+                "observed_at": observed_at.isoformat(),
+                "endpoint": endpoint,
+                "provider_timeout_seconds": deadline_ms / 1000.0,
+            },
+            deadline_ms,
+        )
+        request_completed = clock()
+        payload = worker_result.get("payload") or {}
+        effective_started = _sample_datetime(
+            payload.get("worker_request_started_at")
+        ) or request_started
+        effective_completed = _sample_datetime(
+            payload.get("worker_request_completed_at")
+        ) or request_completed
+        covered = sorted(payload.get("covered_codes") or [])
+        successful = worker_result.get("ok") is True and covered == codes
+        attempt = {
+            "endpoint_id": str(endpoint.get("id") or ""),
+            "request_started_at": effective_started.isoformat(
+                timespec="milliseconds"
+            ),
+            "request_completed_at": effective_completed.isoformat(
+                timespec="milliseconds"
+            ),
+            "request_elapsed_ms": float(
+                payload.get("worker_request_elapsed_ms")
+                or round(
+                    (monotonic() - started_monotonic) * 1000,
+                    3,
+                )
+            ),
+            "request_deadline_ms": deadline_ms,
+            "request_timed_out": bool(
+                worker_result.get("request_timed_out")
+            ),
+            "worker_terminated": bool(
+                worker_result.get("worker_terminated")
+            ),
+            "covered_codes": covered,
+            "coverage_ratio": (
+                len(covered) / len(codes) if codes else 0.0
+            ),
+            "provider_raw_hash": str(
+                payload.get("provider_raw_hash") or ""
+            ),
+            "raw_response_hashes": sorted(
+                payload.get("raw_response_hashes") or []
+            ),
+            "source_versions": sorted(
+                payload.get("source_versions") or []
+            ),
+            "error_code": str(
+                worker_result.get("error_code") or ""
+            ),
+        }
+        attempts.append(attempt)
+        if successful:
+            return {
+                "status": "SOURCE_PREFLIGHT_READY",
+                "source": source,
+                "started_at": preflight_started.isoformat(
+                    timespec="milliseconds"
+                ),
+                "completed_at": effective_completed.isoformat(
+                    timespec="milliseconds"
+                ),
+                "endpoint_id": str(endpoint.get("id") or ""),
+                "selected_endpoint": endpoint,
+                "covered_codes": covered,
+                "coverage_ratio": 1.0,
+                "request_elapsed_ms": round(
+                    (monotonic() - total_started) * 1000,
+                    3,
+                ),
+                "attempts": attempts,
+            }
+    completed = clock()
+    return {
+        "status": "SOURCE_PREFLIGHT_FAILED",
+        "source": source,
+        "started_at": preflight_started.isoformat(timespec="milliseconds"),
+        "completed_at": completed.isoformat(timespec="milliseconds"),
+        "endpoint_id": "",
+        "selected_endpoint": None,
+        "covered_codes": [],
+        "coverage_ratio": 0.0,
+        "request_elapsed_ms": round(
+            (monotonic() - total_started) * 1000,
+            3,
+        ),
+        "attempts": attempts,
+    }
+
+
+def _run_inline_minute_request(
+    collectors: Any,
+    request_started: datetime,
+) -> dict[str, Any]:
+    try:
+        batch = collectors.collect_minute_bars(request_started)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_code": _stable_sample_error_code(exc),
+            "error": f"{type(exc).__name__}: {exc}",
+            "request_timed_out": False,
+            "worker_terminated": False,
+        }
+    records = list(batch.records or [])
+    signatures = minute_1450_signature(records)
+    covered_codes = sorted(
+        {
+            str((row.get("payload") or {}).get("code") or "").zfill(6)
+            for row in records
+            if str(row.get("data_type") or "") == "minute_bar"
+            and (row.get("payload") or {}).get("code")
+        }
+    )
+    return {
+        "ok": True,
+        "payload": {
+            "requested_codes": list(collectors.codes),
+            "covered_codes": covered_codes,
+            "presence_by_code": {
+                code: code in signatures for code in collectors.codes
+            },
+            "signatures": signatures,
+            "raw_response_hashes": sorted(
+                {
+                    str(row.get("raw_hash") or "")
+                    for row in records
+                    if row.get("raw_hash")
+                }
+            ),
+            "provider_raw_hash": str(batch.raw_hash or ""),
+            "source_versions": sorted(
+                {
+                    str(row.get("source_version") or "")
+                    for row in records
+                    if row.get("source_version")
+                }
+            ),
+            "returned_record_count": len(records),
+            "endpoint_id": "injected",
+        },
+        "request_timed_out": False,
+        "worker_terminated": False,
+        "error_code": "",
+        "error": "",
+    }
+
+
+def _sample_from_worker_result(
+    worker_result: dict[str, Any],
+    *,
+    source: str,
+    target: datetime,
+    request_started: datetime,
+    request_completed: datetime,
+    elapsed_ms: float,
+    codes: list[str],
+    schedule_lag_ms: float,
+    request_deadline_ms: int,
+    endpoint_id: str,
+) -> dict[str, Any]:
+    payload = worker_result.get("payload") or {}
+    signatures = payload.get("signatures") or {}
+    effective_started = _sample_datetime(
+        payload.get("worker_request_started_at")
+    ) or request_started
+    effective_completed = _sample_datetime(
+        payload.get("worker_request_completed_at")
+    ) or request_completed
+    effective_schedule_lag_ms = round(
+        max(0.0, (effective_started - target).total_seconds() * 1000),
+        3,
+    )
+    completion_lag_ms = round(
+        max(0.0, (effective_completed - target).total_seconds() * 1000),
+        3,
+    )
+    error_code = str(worker_result.get("error_code") or "")
+    error = str(worker_result.get("error") or "")
+    if error_code and not error:
+        error = error_code
+    return {
+        "probe_source": source,
+        "target_at": target.isoformat(timespec="seconds"),
+        "sampled_at": effective_started.isoformat(timespec="seconds"),
+        "request_started_at": effective_started.isoformat(
+            timespec="milliseconds"
+        ),
+        "request_completed_at": effective_completed.isoformat(
+            timespec="milliseconds"
+        ),
+        "schedule_lag_ms": max(
+            schedule_lag_ms,
+            effective_schedule_lag_ms,
+        ),
+        "completion_lag_ms": completion_lag_ms,
+        "request_deadline_ms": request_deadline_ms,
+        "request_elapsed_ms": float(
+            payload.get("worker_request_elapsed_ms") or elapsed_ms
+        ),
+        "request_timed_out": bool(
+            worker_result.get("request_timed_out")
+        ),
+        "sample_window_missed": False,
+        "worker_terminated": bool(
+            worker_result.get("worker_terminated")
+        ),
+        "error_code": error_code,
+        "requested_codes": list(codes),
+        "covered_codes": sorted(payload.get("covered_codes") or []),
+        "presence_by_code": payload.get("presence_by_code")
+        or {code: code in signatures for code in codes},
+        "signatures": signatures,
+        "raw_response_hashes": sorted(
+            payload.get("raw_response_hashes") or []
+        ),
+        "provider_raw_hash": str(
+            payload.get("provider_raw_hash") or ""
+        ),
+        "source_versions": sorted(
+            payload.get("source_versions") or []
+        ),
+        "returned_record_count": int(
+            payload.get("returned_record_count") or 0
+        ),
+        "endpoint_id": str(payload.get("endpoint_id") or endpoint_id),
+        "sample_trade_date": target.date().isoformat(),
+        "error": error,
+    }
+
+
+def _empty_probe_sample(
+    *,
+    source: str,
+    target: datetime,
+    request_started: datetime,
+    request_completed: datetime,
+    codes: list[str],
+    schedule_lag_ms: float,
+    request_deadline_ms: int,
+    error_code: str,
+    error: str,
+    sample_window_missed: bool,
+) -> dict[str, Any]:
+    return {
+        "probe_source": source,
+        "target_at": target.isoformat(timespec="seconds"),
+        "sampled_at": request_started.isoformat(timespec="seconds"),
+        "request_started_at": request_started.isoformat(
+            timespec="milliseconds"
+        ),
+        "request_completed_at": request_completed.isoformat(
+            timespec="milliseconds"
+        ),
+        "schedule_lag_ms": schedule_lag_ms,
+        "completion_lag_ms": round(
+            max(0.0, (request_completed - target).total_seconds() * 1000),
+            3,
+        ),
+        "request_deadline_ms": request_deadline_ms,
+        "request_elapsed_ms": 0.0,
+        "request_timed_out": error_code == WORKER_TIMEOUT_ERROR,
+        "sample_window_missed": sample_window_missed,
+        "worker_terminated": error_code == WORKER_TIMEOUT_ERROR,
+        "error_code": error_code,
+        "requested_codes": list(codes),
+        "covered_codes": [],
+        "presence_by_code": {code: False for code in codes},
+        "signatures": {},
+        "raw_response_hashes": [],
+        "provider_raw_hash": "",
+        "source_versions": [],
+        "returned_record_count": 0,
+        "endpoint_id": "",
+        "sample_trade_date": target.date().isoformat(),
+        "error": error,
+    }
+
+
+def _probe_audit_summary(
+    samples: list[dict[str, Any]],
+) -> dict[str, int]:
+    late_record_count = 0
+    for sample in samples:
+        if (
+            not sample.get("error")
+            and float(sample.get("completion_lag_ms") or 0)
+            > float(sample.get("request_deadline_ms") or 0)
+        ):
+            late_record_count += int(
+                sample.get("returned_record_count") or 0
+            )
+    return {
+        "late_start_count": sum(
+            float(sample.get("schedule_lag_ms") or 0)
+            > MAX_PROBE_START_LAG_SECONDS * 1000
+            for sample in samples
+        ),
+        "deadline_exceeded_count": sum(
+            sample.get("sample_window_missed") is not True
+            and (
+                sample.get("request_timed_out") is True
+                or float(sample.get("completion_lag_ms") or 0)
+                > float(sample.get("request_deadline_ms") or 0)
+            )
+            for sample in samples
+        ),
+        "missed_sample_count": sum(
+            sample.get("sample_window_missed") is True
+            for sample in samples
+        ),
+        "late_record_count": late_record_count,
+    }
+
+
+def _collect_transaction_evidence(
+    *,
+    collectors: Any | None,
+    process_isolated: bool,
+    worker_runner: Callable[[dict[str, Any], int], dict[str, Any]],
+    source: str,
+    codes: list[str],
+    endpoint: dict[str, Any] | None,
+    observed_at: datetime,
+    deadline_ms: int,
+    clock: Callable[[], datetime],
+    monotonic: Callable[[], float],
+    trade_date: date,
+) -> dict[str, Any]:
+    request_started = clock()
+    started_monotonic = monotonic()
+    if process_isolated:
+        worker_result = worker_runner(
+            {
+                "operation": "transaction",
+                "source": source,
+                "codes": codes,
+                "observed_at": observed_at.isoformat(),
+                "endpoint": endpoint,
+                "provider_timeout_seconds": deadline_ms / 1000.0,
+            },
+            deadline_ms,
+        )
+    else:
+        collect = getattr(
+            collectors,
+            "collect_transaction_evidence",
+            None,
+        )
+        if not callable(collect):
+            return {}
+        try:
+            worker_result = {
+                "ok": True,
+                "payload": {
+                    "transaction_evidence": collect(observed_at)
+                },
+                "request_timed_out": False,
+                "worker_terminated": False,
+                "error_code": "",
+                "error": "",
+            }
+        except Exception as exc:
+            worker_result = {
+                "ok": False,
+                "request_timed_out": False,
+                "worker_terminated": False,
+                "error_code": _stable_sample_error_code(exc),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    request_completed = clock()
+    elapsed_ms = round(
+        (monotonic() - started_monotonic) * 1000,
+        3,
+    )
+    evidence = dict(
+        (worker_result.get("payload") or {}).get(
+            "transaction_evidence"
+        )
+        or {}
+    )
+    if not evidence:
+        evidence = {
+            "source": source,
+            "source_version": MOOTDX_TRANSACTION_SOURCE_VERSION,
+            "trade_date": trade_date.isoformat(),
+            "requested_codes": list(codes),
+            "request_started_at": request_started.isoformat(
+                timespec="milliseconds"
+            ),
+            "request_completed_at": request_completed.isoformat(
+                timespec="milliseconds"
+            ),
+            "by_code": {},
+            "error": str(worker_result.get("error") or ""),
+        }
+    evidence.update(
+        {
+            "request_deadline_ms": deadline_ms,
+            "request_elapsed_ms": elapsed_ms,
+            "request_timed_out": bool(
+                worker_result.get("request_timed_out")
+            ),
+            "worker_terminated": bool(
+                worker_result.get("worker_terminated")
+            ),
+            "error_code": str(
+                worker_result.get("error_code") or ""
+            ),
+        }
+    )
+    evidence["transaction_evidence_hash"] = (
+        compute_transaction_evidence_hash(evidence, source=source)
+    )
+    return evidence
+
+
+def _stable_sample_error_code(exc: Exception) -> str:
+    text = str(exc or "").lower()
+    if "mootdx_minute_bar_empty" in text:
+        return "MOOTDX_MINUTE_BAR_EMPTY"
+    if "mootdx_trade_date_rows_empty" in text:
+        return "MOOTDX_TRADE_DATE_ROWS_EMPTY"
+    if "http_request_failed" in text:
+        return "HTTP_REQUEST_FAILED"
+    return "PROBE_REQUEST_FAILED"
 
 
 def _probe_result(
@@ -571,6 +1089,9 @@ def _probe_result(
     tracked_codes: list[str] | None = None,
     probe_evidence_hash: str = "",
     source: str = "",
+    schema_version: str | None = None,
+    source_preflight: dict[str, Any] | None = None,
+    audit_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     verified = conclusion == "VERIFIED"
     contract = build_close_time_contract(
@@ -583,7 +1104,7 @@ def _probe_result(
             probe_evidence_hash if verified else ""
         ),
     )
-    return {
+    result = {
         "status": (
             "MINUTE_LABEL_VERIFIED"
             if verified
@@ -598,6 +1119,11 @@ def _probe_result(
         "samples": samples,
         "recommended_time_contract": contract.as_dict(),
     }
+    if schema_version:
+        result["probe_evidence_schema_version"] = schema_version
+        result["source_preflight"] = source_preflight or {}
+        result.update(audit_summary or _probe_audit_summary(samples))
+    return result
 
 
 def _probe_timing_errors(
@@ -607,9 +1133,6 @@ def _probe_timing_errors(
     errors = []
     for clock in expected:
         sample = by_clock[clock]
-        if sample.get("error"):
-            errors.append(f"probe_request_failed:{clock}")
-            continue
         target = _sample_datetime(
             sample.get("target_at") or sample.get("sampled_at")
         )
@@ -623,13 +1146,23 @@ def _probe_timing_errors(
         )
         if target is None or started is None or completed is None:
             errors.append(f"probe_timing_missing:{clock}")
-            continue
-        if completed < started:
-            errors.append(f"probe_completion_before_start:{clock}")
-        if (
-            started - target
-        ).total_seconds() > MAX_PROBE_START_LAG_SECONDS:
+        else:
+            if completed < started:
+                errors.append(f"probe_completion_before_start:{clock}")
+            if (
+                started - target
+            ).total_seconds() > MAX_PROBE_START_LAG_SECONDS:
+                errors.append(f"probe_started_late:{clock}")
+        if float(sample.get("schedule_lag_ms") or 0) > (
+            MAX_PROBE_START_LAG_SECONDS * 1000
+        ):
             errors.append(f"probe_started_late:{clock}")
+        if sample.get("sample_window_missed") is True:
+            errors.append(f"probe_sample_window_missed:{clock}")
+        if sample.get("request_timed_out") is True:
+            errors.append(f"probe_request_deadline_exceeded:{clock}")
+        if sample.get("error"):
+            errors.append(f"probe_request_failed:{clock}")
     return errors
 
 
@@ -638,7 +1171,18 @@ def _probe_evidence_hash(
     tracked_codes: list[str],
     *,
     source: str = "",
+    schema_version: str | None = None,
+    source_preflight: dict[str, Any] | None = None,
+    audit_summary: dict[str, Any] | None = None,
 ) -> str:
+    resolved_schema = schema_version or PROBE_EVIDENCE_SCHEMA_V1
+    if resolved_schema not in {
+        PROBE_EVIDENCE_SCHEMA_V1,
+        PROBE_EVIDENCE_SCHEMA_V2,
+    }:
+        raise ValueError(
+            f"probe_evidence_schema_unsupported:{resolved_schema}"
+        )
     evidence = {
         "source": str(source or "").strip().lower(),
         "tracked_codes": list(tracked_codes),
@@ -693,6 +1237,53 @@ def _probe_evidence_hash(
             for item in samples
         ],
     }
+    if resolved_schema == PROBE_EVIDENCE_SCHEMA_V2:
+        evidence = {
+            "probe_evidence_schema_version": PROBE_EVIDENCE_SCHEMA_V2,
+            "source": evidence["source"],
+            "tracked_codes": sorted(evidence["tracked_codes"]),
+            "source_preflight": source_preflight or {},
+            "audit_summary": {
+                key: int((audit_summary or {}).get(key) or 0)
+                for key in (
+                    "late_start_count",
+                    "deadline_exceeded_count",
+                    "missed_sample_count",
+                    "late_record_count",
+                )
+            },
+            "samples": [
+                {
+                    **sample,
+                    "schedule_lag_ms": item.get("schedule_lag_ms"),
+                    "completion_lag_ms": item.get(
+                        "completion_lag_ms"
+                    ),
+                    "request_deadline_ms": item.get(
+                        "request_deadline_ms"
+                    ),
+                    "request_timed_out": bool(
+                        item.get("request_timed_out")
+                    ),
+                    "sample_window_missed": bool(
+                        item.get("sample_window_missed")
+                    ),
+                    "worker_terminated": bool(
+                        item.get("worker_terminated")
+                    ),
+                    "error_code": str(
+                        item.get("error_code") or ""
+                    ),
+                    "endpoint_id": str(
+                        item.get("endpoint_id") or ""
+                    ),
+                    "returned_record_count": int(
+                        item.get("returned_record_count") or 0
+                    ),
+                }
+                for sample, item in zip(evidence["samples"], samples)
+            ],
+        }
     return stable_hash(evidence)
 
 
@@ -701,6 +1292,9 @@ def compute_probe_evidence_hash(
     tracked_codes: list[str],
     *,
     source: str,
+    schema_version: str | None = None,
+    source_preflight: dict[str, Any] | None = None,
+    audit_summary: dict[str, Any] | None = None,
 ) -> str:
     normalized_source = str(source or "").strip().lower()
     if not normalized_source:
@@ -709,6 +1303,9 @@ def compute_probe_evidence_hash(
         samples,
         tracked_codes,
         source=normalized_source,
+        schema_version=schema_version,
+        source_preflight=source_preflight,
+        audit_summary=audit_summary,
     )
 
 

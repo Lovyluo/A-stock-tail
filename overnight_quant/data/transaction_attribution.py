@@ -377,6 +377,16 @@ def build_mootdx_probe_reanalysis(
         "tickets": [],
         "orders": [],
     }
+    for key in (
+        "probe_evidence_schema_version",
+        "source_preflight",
+        "late_start_count",
+        "deadline_exceeded_count",
+        "missed_sample_count",
+        "late_record_count",
+    ):
+        if key in probe_result:
+            result[key] = deepcopy(probe_result[key])
     result["reanalysis_evidence_hash"] = stable_hash(result)
     return result
 

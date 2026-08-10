@@ -56,6 +56,8 @@ def build_minute_probe_collector(
     codes: Iterable[str],
     *,
     clock: Callable[[], datetime] | None = None,
+    endpoint: dict[str, Any] | None = None,
+    request_timeout_seconds: float = 2.0,
 ) -> Any:
     normalized = normalize_probe_source(source)
     if normalized == PROBE_SOURCE_EASTMONEY:
@@ -68,6 +70,8 @@ def build_minute_probe_collector(
     return MootdxMinuteProbeCollectors(
         codes,
         clock=clock,
+        endpoint=endpoint,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -92,12 +96,28 @@ class MootdxMinuteProbeCollectors:
         clock: Callable[[], datetime] | None = None,
         client_factory: Callable[[], Any] | None = None,
         time_contract: dict[str, Any] | CloseTimeContract | None = None,
+        endpoint: dict[str, Any] | None = None,
+        request_timeout_seconds: float = 2.0,
     ):
         self.codes = _normalize_codes(codes)
         self.clock = clock or (lambda: datetime.now(CN_TZ))
-        self.client_factory = client_factory or _default_mootdx_client
+        self.endpoint = _normalize_mootdx_endpoint(endpoint)
+        self.request_timeout_seconds = max(
+            0.1,
+            float(request_timeout_seconds),
+        )
+        self.client_factory = client_factory or (
+            lambda: _default_mootdx_client(
+                endpoint=self.endpoint,
+                timeout_seconds=self.request_timeout_seconds,
+            )
+        )
         self.time_contract = normalize_close_time_contract(time_contract)
         self._client: Any | None = None
+
+    @property
+    def endpoint_id(self) -> str:
+        return str((self.endpoint or {}).get("id") or "mootdx_default")
 
     def collect_minute_bars(
         self,
@@ -304,6 +324,7 @@ class MootdxMinuteProbeCollectors:
             "start": 0,
             "offset": 800,
             "market": "std",
+            "endpoint_id": self.endpoint_id,
         }
         return {
             "event_time": event.isoformat(timespec="seconds"),
@@ -332,10 +353,72 @@ class MootdxMinuteProbeCollectors:
         }
 
 
-def _default_mootdx_client() -> Any:
+def mootdx_server_candidates(
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    from mootdx import quotes as quotes_module
+
+    configured = quotes_module.config.get("SERVER").get("HQ") or []
+    candidates = []
+    for name, host, port in configured:
+        endpoint = _normalize_mootdx_endpoint(
+            {
+                "name": name,
+                "host": host,
+                "port": port,
+            }
+        )
+        if endpoint is not None:
+            candidates.append(endpoint)
+        if len(candidates) >= max(1, int(limit)):
+            break
+    return candidates
+
+
+def _default_mootdx_client(
+    *,
+    endpoint: dict[str, Any] | None = None,
+    timeout_seconds: float = 2.0,
+) -> Any:
     from mootdx.quotes import Quotes
 
-    return Quotes.factory(market="std")
+    kwargs: dict[str, Any] = {
+        "timeout": max(0.1, float(timeout_seconds)),
+        "auto_retry": False,
+        "raise_exception": True,
+    }
+    normalized = _normalize_mootdx_endpoint(endpoint)
+    if normalized is not None:
+        kwargs["server"] = (
+            normalized["host"],
+            normalized["port"],
+        )
+    return Quotes.factory(market="std", **kwargs)
+
+
+def _normalize_mootdx_endpoint(
+    endpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not endpoint:
+        return None
+    host = str(endpoint.get("host") or "").strip()
+    try:
+        port = int(endpoint.get("port") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not host or port <= 0:
+        return None
+    name = str(endpoint.get("name") or "").strip()
+    identifier = str(endpoint.get("id") or "").strip()
+    if not identifier:
+        identifier = f"{name or 'mootdx'}@{host}:{port}"
+    return {
+        "id": identifier,
+        "name": name,
+        "host": host,
+        "port": port,
+    }
 
 
 def _normalize_mootdx_rows(

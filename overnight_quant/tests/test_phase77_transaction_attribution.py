@@ -17,6 +17,7 @@ from overnight_quant.data.close_time_contract import (
 )
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_label_probe import (
+    PROBE_EVIDENCE_SCHEMA_V2,
     classify_minute_label_samples,
     compute_probe_evidence_hash,
     run_scheduled_minute_label_probe,
@@ -583,6 +584,85 @@ def test_evidence_verifier_recomputes_all_three_hash_layers():
     assert verified["data_ready"] is False
     assert invalid["status"] == "PROBE_EVIDENCE_INVALID"
     assert "transaction_evidence_hash_drift" in invalid["errors"]
+
+
+def test_v2_reanalysis_is_byte_deterministic_and_independently_verified():
+    payload = _complete_payload()
+    for sample in payload["samples"]:
+        sample.update(
+            {
+                "schedule_lag_ms": 0.0,
+                "completion_lag_ms": 0.0,
+                "request_deadline_ms": 2000,
+                "request_timed_out": False,
+                "sample_window_missed": False,
+                "worker_terminated": False,
+                "error_code": "",
+                "returned_record_count": len(CODES),
+                "endpoint_id": "unit-mootdx",
+            }
+        )
+    payload.update(
+        {
+            "probe_evidence_schema_version": PROBE_EVIDENCE_SCHEMA_V2,
+            "source_preflight": {
+                "status": "SOURCE_PREFLIGHT_READY",
+                "source": "mootdx",
+                "started_at": f"{DAY}T14:49:40.000+08:00",
+                "completed_at": f"{DAY}T14:49:40.100+08:00",
+                "endpoint_id": "unit-mootdx",
+                "selected_endpoint": {
+                    "id": "unit-mootdx",
+                    "host": "127.0.0.1",
+                    "port": 7709,
+                },
+                "covered_codes": list(CODES),
+                "coverage_ratio": 1.0,
+                "request_elapsed_ms": 100.0,
+                "attempts": [],
+            },
+            "late_start_count": 0,
+            "deadline_exceeded_count": 0,
+            "missed_sample_count": 0,
+            "late_record_count": 0,
+        }
+    )
+    payload["probe_evidence_hash"] = compute_probe_evidence_hash(
+        payload["samples"],
+        payload["tracked_codes"],
+        source="mootdx",
+        schema_version=PROBE_EVIDENCE_SCHEMA_V2,
+        source_preflight=payload["source_preflight"],
+        audit_summary={
+            "late_start_count": 0,
+            "deadline_exceeded_count": 0,
+            "missed_sample_count": 0,
+            "late_record_count": 0,
+        },
+    )
+    _rebuild_original_evidence(payload)
+
+    first = build_mootdx_probe_reanalysis(payload)
+    second = build_mootdx_probe_reanalysis(deepcopy(payload))
+    first_bytes = json.dumps(
+        first,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    second_bytes = json.dumps(
+        second,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert first["status"] == "PM_REVIEW_REQUIRED"
+    assert first_bytes == second_bytes
+    assert verify_probe_evidence(
+        first,
+        source="mootdx",
+    )["status"] == "PROBE_EVIDENCE_VERIFIED"
 
 
 def test_verify_cli_requires_explicit_source_and_rejects_bom(
