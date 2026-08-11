@@ -57,6 +57,24 @@ function Write-HarnessBinaryFile {
         -Force
 }
 
+function Get-HarnessSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $hasher.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($bytes)).Replace('-', '')
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
 $parent = Split-Path -Parent $OutputPath
 [IO.Directory]::CreateDirectory($parent) | Out-Null
 if ($Scenario -eq 'existing_valid_output') {
@@ -71,7 +89,7 @@ elseif ($Scenario -eq 'existing_unreadable_output') {
 }
 
 $initialHash = if (Test-Path -LiteralPath $OutputPath) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath).Hash
+    Get-HarnessSha256 -Path $OutputPath
 }
 else {
     ''
@@ -127,9 +145,8 @@ $afterScheduledStart = {
         Write-HarnessTextFile `
             -Path $OutputPath `
             -Content '{"status":"SCHEDULED_TERMINAL"}'
-        $script:hashAfterScheduledWrite = (
-            Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath
-        ).Hash
+        $script:hashAfterScheduledWrite = Get-HarnessSha256 `
+            -Path $OutputPath
     }
 }
 $startDirect = {
@@ -168,7 +185,7 @@ $recordEvent = {
 }
 
 $finalHash = if (Test-Path -LiteralPath $OutputPath) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath).Hash
+    Get-HarnessSha256 -Path $OutputPath
 }
 else {
     ''
