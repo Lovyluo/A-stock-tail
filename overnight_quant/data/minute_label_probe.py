@@ -460,7 +460,6 @@ def run_scheduled_minute_label_probe(
                     )
                 )
                 continue
-            started_monotonic = runtime_monotonic()
             if process_isolated:
                 worker_result = runtime_worker(
                     {
@@ -481,10 +480,6 @@ def run_scheduled_minute_label_probe(
                     request_started,
                 )
             request_completed = runtime_clock()
-            elapsed_ms = round(
-                (runtime_monotonic() - started_monotonic) * 1000,
-                3,
-            )
             samples.append(
                 _sample_from_worker_result(
                     worker_result,
@@ -492,7 +487,6 @@ def run_scheduled_minute_label_probe(
                     target=target,
                     request_started=request_started,
                     request_completed=request_completed,
-                    elapsed_ms=elapsed_ms,
                     codes=runtime_codes,
                     schedule_lag_ms=schedule_lag_ms,
                     request_deadline_ms=int(request_deadline_ms),
@@ -807,7 +801,6 @@ def _sample_from_worker_result(
     target: datetime,
     request_started: datetime,
     request_completed: datetime,
-    elapsed_ms: float,
     codes: list[str],
     schedule_lag_ms: float,
     request_deadline_ms: int,
@@ -827,6 +820,14 @@ def _sample_from_worker_result(
     )
     completion_lag_ms = round(
         max(0.0, (effective_completed - target).total_seconds() * 1000),
+        3,
+    )
+    effective_elapsed_ms = round(
+        max(
+            0.0,
+            (effective_completed - effective_started).total_seconds()
+            * 1000,
+        ),
         3,
     )
     error_code = str(worker_result.get("error_code") or "")
@@ -849,9 +850,7 @@ def _sample_from_worker_result(
         ),
         "completion_lag_ms": completion_lag_ms,
         "request_deadline_ms": request_deadline_ms,
-        "request_elapsed_ms": float(
-            payload.get("worker_request_elapsed_ms") or elapsed_ms
-        ),
+        "request_elapsed_ms": effective_elapsed_ms,
         "request_timed_out": bool(
             worker_result.get("request_timed_out")
         ),

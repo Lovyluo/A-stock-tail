@@ -42,6 +42,8 @@ $compactDate = $Date.Replace('-', '')
 $sources = @('mootdx', 'eastmoney')
 $events = [Collections.Generic.List[object]]::new()
 $directProcesses = @{}
+$launchAttempted = @{}
+$terminalOutputRecorded = @{}
 
 function Add-WatchdogEvent {
     param(
@@ -110,6 +112,7 @@ function Start-DirectProbe {
         -WindowStyle Hidden `
         -PassThru
     $directProcesses[$Source] = $process.Id
+    $launchAttempted[$Source] = $true
     Add-WatchdogEvent $Source 'direct_fallback_started' "pid=$($process.Id)"
 }
 
@@ -117,8 +120,23 @@ function Ensure-ProbeRunning {
     param([string]$Source)
     $output = Get-OutputPath $Source
     $existing = Get-ProbeResult $output
-    if ($null -ne $existing -and @($existing.samples).Count -eq 4) {
-        Add-WatchdogEvent $Source 'valid_output_already_present' ([string]$existing.status)
+    if (Test-Path -LiteralPath $output -PathType Leaf) {
+        $status = if ($null -ne $existing) {
+            [string]$existing.status
+        }
+        else {
+            'UNREADABLE_OUTPUT'
+        }
+        if (-not $terminalOutputRecorded.ContainsKey($Source)) {
+            Add-WatchdogEvent `
+                $Source `
+                'terminal_output_already_present' `
+                $status
+            $terminalOutputRecorded[$Source] = $true
+        }
+        return
+    }
+    if ($launchAttempted.ContainsKey($Source)) {
         return
     }
     if (Test-ProbeProcessRunning $Source) {
@@ -137,6 +155,7 @@ function Ensure-ProbeRunning {
         Start-Sleep -Seconds 2
         if ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running' -or
             (Test-ProbeProcessRunning $Source)) {
+            $launchAttempted[$Source] = $true
             Add-WatchdogEvent $Source 'scheduled_task_started' $taskName
             return
         }

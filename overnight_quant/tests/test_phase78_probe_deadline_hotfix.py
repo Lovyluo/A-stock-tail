@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import Path
 import sys
 import time
 
@@ -156,7 +157,32 @@ def test_first_request_timeout_does_not_delay_the_later_three_samples():
     assert result["deadline_exceeded_count"] == 1
     assert result["missed_sample_count"] == 0
     assert result["late_record_count"] == 0
+    verification = verify_probe_evidence(result, source="eastmoney")
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    for sample in result["samples"]:
+        started = datetime.fromisoformat(sample["request_started_at"])
+        completed = datetime.fromisoformat(sample["request_completed_at"])
+        expected_elapsed_ms = (
+            completed - started
+        ).total_seconds() * 1000
+        assert abs(
+            sample["request_elapsed_ms"] - expected_elapsed_ms
+        ) <= 1.0
     _assert_research_only(result)
+
+
+def test_watchdog_never_restarts_or_overwrites_terminal_source_output():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_minute_probe_watchdog.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "$launchAttempted.ContainsKey($Source)" in script
+    assert "$launchAttempted[$Source] = $true" in script
+    assert "$terminalOutputRecorded.ContainsKey($Source)" in script
+    assert "terminal_output_already_present" in script
+    assert "Test-Path -LiteralPath $output -PathType Leaf" in script
 
 
 def test_missed_sample_is_not_replayed_and_later_points_continue():
