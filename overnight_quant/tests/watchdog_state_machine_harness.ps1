@@ -24,20 +24,50 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . $StateMachineScript
 
+function Write-HarnessTextFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    Set-Content `
+        -LiteralPath $Path `
+        -Value $Content `
+        -Encoding UTF8 `
+        -NoNewline `
+        -Force
+}
+
+function Write-HarnessBinaryFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Content
+    )
+
+    Set-Content `
+        -LiteralPath $Path `
+        -Value $Content `
+        -Encoding Byte `
+        -Force
+}
+
 $parent = Split-Path -Parent $OutputPath
 [IO.Directory]::CreateDirectory($parent) | Out-Null
 if ($Scenario -eq 'existing_valid_output') {
-    [IO.File]::WriteAllText(
-        $OutputPath,
-        '{"status":"TERMINAL"}',
-        [Text.UTF8Encoding]::new($false)
-    )
+    Write-HarnessTextFile `
+        -Path $OutputPath `
+        -Content '{"status":"TERMINAL"}'
 }
 elseif ($Scenario -eq 'existing_unreadable_output') {
-    [IO.File]::WriteAllBytes(
-        $OutputPath,
-        [byte[]](0xff, 0xfe, 0xfd)
-    )
+    Write-HarnessBinaryFile `
+        -Path $OutputPath `
+        -Content ([byte[]](0xff, 0xfe, 0xfd))
 }
 
 $initialHash = if (Test-Path -LiteralPath $OutputPath) {
@@ -94,11 +124,9 @@ $scheduledTaskRunning = {
 $afterScheduledStart = {
     param([string]$Source)
     if ($Scenario -eq 'scheduled_fast_complete') {
-        [IO.File]::WriteAllText(
-            $OutputPath,
-            '{"status":"SCHEDULED_TERMINAL"}',
-            [Text.UTF8Encoding]::new($false)
-        )
+        Write-HarnessTextFile `
+            -Path $OutputPath `
+            -Content '{"status":"SCHEDULED_TERMINAL"}'
         $script:hashAfterScheduledWrite = (
             Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath
         ).Hash
@@ -107,11 +135,9 @@ $afterScheduledStart = {
 $startDirect = {
     param([string]$Source)
     $script:directStartCount += 1
-    [IO.File]::WriteAllText(
-        $OutputPath,
-        '{"status":"DIRECT_TERMINAL"}',
-        [Text.UTF8Encoding]::new($false)
-    )
+    Write-HarnessTextFile `
+        -Path $OutputPath `
+        -Content '{"status":"DIRECT_TERMINAL"}'
     return 'pid=1234'
 }
 $recordEvent = {

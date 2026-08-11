@@ -539,11 +539,18 @@ def _run_watchdog_state_scenario(tmp_path, scenario):
             "-OutputPath",
             str(output_path),
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=30,
+    )
+    assert completed.returncode == 0, (
+        f"watchdog harness failed for {scenario}: "
+        f"exit={completed.returncode}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
     )
     return json.loads(completed.stdout)
 
