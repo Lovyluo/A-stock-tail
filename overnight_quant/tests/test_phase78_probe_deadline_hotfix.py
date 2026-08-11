@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+import json
+from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -24,6 +27,11 @@ from overnight_quant.data.source_qualification import (
 DAY = "2026-08-11"
 CODES = ["000001", "600000"]
 TARGET_CLOCKS = ("14:49:55", "14:50:05", "14:50:30", "14:51:05")
+TESTS_DIR = Path(__file__).resolve().parent
+WATCHDOG_STATE_SCRIPT = (
+    TESTS_DIR.parent / "scripts" / "minute_probe_watchdog_state.ps1"
+)
+WATCHDOG_HARNESS = TESTS_DIR / "watchdog_state_machine_harness.ps1"
 
 
 class _AdvancingClock:
@@ -156,7 +164,136 @@ def test_first_request_timeout_does_not_delay_the_later_three_samples():
     assert result["deadline_exceeded_count"] == 1
     assert result["missed_sample_count"] == 0
     assert result["late_record_count"] == 0
+    verification = verify_probe_evidence(result, source="eastmoney")
+    assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
+    for sample in result["samples"]:
+        started = datetime.fromisoformat(sample["request_started_at"])
+        completed = datetime.fromisoformat(sample["request_completed_at"])
+        expected_elapsed_ms = (
+            completed - started
+        ).total_seconds() * 1000
+        assert abs(
+            sample["request_elapsed_ms"] - expected_elapsed_ms
+        ) <= 1.0
     _assert_research_only(result)
+
+
+def test_watchdog_scheduled_fast_completion_is_not_overwritten(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "scheduled_fast_complete",
+    )
+
+    assert result["scheduled_start_count"] == 1
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "TERMINAL_OUTPUT_PRESENT"
+    assert result["state"]["scheduled_task_attempted"] is True
+    assert result["state"]["scheduled_start_accepted"] is True
+    assert result["state"]["direct_start_attempted"] is False
+    assert result["state"]["terminal_output_present"] is True
+    assert result["hash_after_scheduled_write"]
+    assert result["final_hash"] == result["hash_after_scheduled_write"]
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_scheduled_task_running_is_started_once(tmp_path):
+    result = _run_watchdog_state_scenario(tmp_path, "scheduled_running")
+
+    assert result["scheduled_start_count"] == 1
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "SCHEDULED_TASK_RUNNING"
+    assert result["state"]["scheduled_task_attempted"] is True
+    assert result["state"]["scheduled_start_accepted"] is True
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_quick_scheduled_exit_never_uses_direct_fallback(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "scheduled_quick_exit",
+    )
+
+    assert result["scheduled_start_count"] == 1
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == (
+        "SCHEDULED_TASK_COMPLETED_OR_DETACHED"
+    )
+    assert result["scheduled_running_check_count"] == 1
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_missing_task_starts_direct_once(tmp_path):
+    result = _run_watchdog_state_scenario(tmp_path, "scheduled_missing")
+
+    assert result["scheduled_start_count"] == 0
+    assert result["direct_start_count"] == 1
+    assert result["state"]["lifecycle"] == "TERMINAL_OUTPUT_PRESENT"
+    assert result["state"]["direct_start_attempted"] is True
+    assert result["state"]["direct_start_accepted"] is True
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_adopts_existing_process_without_restart(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "adopted_process_exit",
+    )
+
+    assert result["process_check_count"] == 1
+    assert result["scheduled_start_count"] == 0
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "ADOPTED_RUNNING_PROCESS"
+    assert result["state"]["adopted_running_process"] is True
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_preserves_existing_valid_output(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "existing_valid_output",
+    )
+
+    assert result["initial_hash"]
+    assert result["final_hash"] == result["initial_hash"]
+    assert result["scheduled_start_count"] == 0
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "TERMINAL_OUTPUT_PRESENT"
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_preserves_existing_unreadable_output(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "existing_unreadable_output",
+    )
+
+    assert result["initial_hash"]
+    assert result["final_hash"] == result["initial_hash"]
+    assert result["scheduled_start_count"] == 0
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "TERMINAL_OUTPUT_PRESENT"
+    _assert_watchdog_state_safe(result)
+
+
+def test_watchdog_scheduled_start_error_fails_closed(tmp_path):
+    result = _run_watchdog_state_scenario(
+        tmp_path,
+        "scheduled_start_failure",
+    )
+
+    assert result["scheduled_start_count"] == 1
+    assert result["direct_start_count"] == 0
+    assert result["state"]["lifecycle"] == "SCHEDULED_TASK_START_FAILED"
+    assert result["state"]["error_code"] == (
+        "SCHEDULED_TASK_START_FAILED"
+    )
+    assert result["state"]["scheduled_task_attempted"] is True
+    assert result["state"]["scheduled_start_accepted"] is False
+    assert any(
+        event["action"] == "scheduled_task_start_failed"
+        for event in result["events"]
+    )
+    _assert_watchdog_state_safe(result)
 
 
 def test_missed_sample_is_not_replayed_and_later_points_continue():
@@ -382,6 +519,50 @@ def test_v2_hash_includes_timing_audit_and_is_deterministic():
     assert verification["status"] == "PROBE_EVIDENCE_VERIFIED"
     assert drift_verification["status"] == "PROBE_EVIDENCE_INVALID"
     assert "minute_probe_evidence_hash_drift" in drift_verification["errors"]
+
+
+def _run_watchdog_state_scenario(tmp_path, scenario):
+    output_path = tmp_path / f"{scenario}.json"
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(WATCHDOG_HARNESS),
+            "-Scenario",
+            scenario,
+            "-StateMachineScript",
+            str(WATCHDOG_STATE_SCRIPT),
+            "-OutputPath",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    return json.loads(completed.stdout)
+
+
+def _assert_watchdog_state_safe(result):
+    assert result["scheduled_start_count"] <= 1
+    assert result["direct_start_count"] <= 1
+    assert (
+        result["scheduled_start_count"] + result["direct_start_count"]
+        <= 1
+    )
+    assert result["data_ready"] is False
+    assert result["candidates"] == []
+    assert result["tickets"] == []
+    assert result["orders"] == []
+    assert result["state"]["data_ready"] is False
+    assert result["state"]["candidates"] == []
+    assert result["state"]["tickets"] == []
+    assert result["state"]["orders"] == []
 
 
 def _successful_minute_worker(task):

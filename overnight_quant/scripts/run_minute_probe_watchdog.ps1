@@ -29,6 +29,9 @@ else {
     if ($null -eq $pythonCommand) { '' } else { $pythonCommand.Source }
 }
 $probeScript = Join-Path $ProjectRoot 'overnight_quant\scripts\run_minute_label_probe.py'
+$stateMachineScript = Join-Path `
+    $ProjectRoot `
+    'overnight_quant\scripts\minute_probe_watchdog_state.ps1'
 $cacheDir = Join-Path $ProjectRoot 'overnight_quant\data\cache'
 $day = [datetime]::ParseExact(
     $Date,
@@ -42,6 +45,16 @@ $compactDate = $Date.Replace('-', '')
 $sources = @('mootdx', 'eastmoney')
 $events = [Collections.Generic.List[object]]::new()
 $directProcesses = @{}
+
+if (-not (Test-Path -LiteralPath $stateMachineScript -PathType Leaf)) {
+    throw "state_machine_script_missing:$stateMachineScript"
+}
+. $stateMachineScript
+
+$sourceStates = @{}
+foreach ($source in $sources) {
+    $sourceStates[$source] = New-WatchdogSourceState -Source $source
+}
 
 function Add-WatchdogEvent {
     param(
@@ -110,55 +123,115 @@ function Start-DirectProbe {
         -WindowStyle Hidden `
         -PassThru
     $directProcesses[$Source] = $process.Id
-    Add-WatchdogEvent $Source 'direct_fallback_started' "pid=$($process.Id)"
+    return "pid=$($process.Id)"
+}
+
+function Get-ProbeTaskName {
+    param([string]$Source)
+    $label = if ($Source -eq 'mootdx') { 'Mootdx' } else { 'Eastmoney' }
+    return "AStockMinuteProbe${label}-${compactDate}"
+}
+
+function Test-ProbeOutputExists {
+    param([string]$Source)
+    return Test-Path -LiteralPath (Get-OutputPath $Source) -PathType Leaf
+}
+
+function Test-ProbeCanStart {
+    param([string]$Source)
+    return [datetime]::Now -le $lastSafeStart
+}
+
+function Test-ProbeScheduledTaskExists {
+    param([string]$Source)
+    $taskName = Get-ProbeTaskName $Source
+    return $null -ne (
+        Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    )
+}
+
+function Start-ProbeScheduledTask {
+    param([string]$Source)
+    Start-ScheduledTask -TaskName (Get-ProbeTaskName $Source)
+}
+
+function Test-ProbeScheduledTaskRunning {
+    param([string]$Source)
+    $task = Get-ScheduledTask `
+        -TaskName (Get-ProbeTaskName $Source) `
+        -ErrorAction SilentlyContinue
+    return $null -ne $task -and $task.State -eq 'Running'
+}
+
+function Wait-ProbeScheduledStart {
+    param([string]$Source)
+    Start-Sleep -Seconds 2
+}
+
+function Write-ProbeStateEvent {
+    param(
+        [string]$Source,
+        [string]$Action,
+        [string]$Detail
+    )
+    if ($Action -like 'terminal_output_*') {
+        $existing = Get-ProbeResult (Get-OutputPath $Source)
+        $Detail = if ($null -ne $existing) {
+            [string]$existing.status
+        }
+        else {
+            'UNREADABLE_OUTPUT'
+        }
+    }
+    elseif ($Action -like 'scheduled_task_*') {
+        $taskName = Get-ProbeTaskName $Source
+        $Detail = if ([string]::IsNullOrWhiteSpace($Detail)) {
+            $taskName
+        }
+        else {
+            "$taskName|$Detail"
+        }
+    }
+    Add-WatchdogEvent $Source $Action $Detail
 }
 
 function Ensure-ProbeRunning {
     param([string]$Source)
-    $output = Get-OutputPath $Source
-    $existing = Get-ProbeResult $output
-    if ($null -ne $existing -and @($existing.samples).Count -eq 4) {
-        Add-WatchdogEvent $Source 'valid_output_already_present' ([string]$existing.status)
-        return
-    }
-    if (Test-ProbeProcessRunning $Source) {
-        return
-    }
-    if ([datetime]::Now -gt $lastSafeStart) {
-        Add-WatchdogEvent $Source 'late_restart_blocked' 'past_14:49:50'
-        return
-    }
-
-    $label = if ($Source -eq 'mootdx') { 'Mootdx' } else { 'Eastmoney' }
-    $taskName = "AStockMinuteProbe${label}-${compactDate}"
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($null -ne $task) {
-        Start-ScheduledTask -TaskName $taskName
-        Start-Sleep -Seconds 2
-        if ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running' -or
-            (Test-ProbeProcessRunning $Source)) {
-            Add-WatchdogEvent $Source 'scheduled_task_started' $taskName
-            return
-        }
-        Add-WatchdogEvent $Source 'scheduled_task_not_running' $taskName
-    }
-    else {
-        Add-WatchdogEvent $Source 'scheduled_task_missing' $taskName
-    }
-    Start-DirectProbe $Source
+    Invoke-WatchdogSourceStep `
+        -State $sourceStates[$Source] `
+        -OutputExists ${function:Test-ProbeOutputExists} `
+        -ProcessRunning ${function:Test-ProbeProcessRunning} `
+        -CanStart ${function:Test-ProbeCanStart} `
+        -ScheduledTaskExists ${function:Test-ProbeScheduledTaskExists} `
+        -StartScheduledTask ${function:Start-ProbeScheduledTask} `
+        -ScheduledTaskRunning ${function:Test-ProbeScheduledTaskRunning} `
+        -AfterScheduledStart ${function:Wait-ProbeScheduledStart} `
+        -StartDirect ${function:Start-DirectProbe} `
+        -RecordEvent ${function:Write-ProbeStateEvent} |
+        Out-Null
 }
 
 function Write-WatchdogResult {
     $sourceResults = [ordered]@{}
     $allPresent = $true
     foreach ($source in $sources) {
-        $path = Get-OutputPath $source
-        $result = Get-ProbeResult $path
+        $output = Get-OutputPath $source
+        $filePresent = Test-Path -LiteralPath $output -PathType Leaf
+        $result = Get-ProbeResult $output
         $present = $null -ne $result
         $sampleCount = if ($present) { @($result.samples).Count } else { 0 }
         $sourceResults[$source] = [ordered]@{
-            output_present = $present
-            status = if ($present) { [string]$result.status } else { 'MISSING' }
+            output_present = $filePresent
+            output_readable = $present
+            status = if ($present) {
+                [string]$result.status
+            }
+            elseif ($filePresent) {
+                'UNREADABLE_OUTPUT'
+            }
+            else {
+                'MISSING'
+            }
             sample_count = $sampleCount
             probe_evidence_hash = if ($present) {
                 [string]$result.probe_evidence_hash
@@ -167,6 +240,7 @@ function Write-WatchdogResult {
             candidates = if ($present) { @($result.candidates).Count } else { 0 }
             tickets = if ($present) { @($result.tickets).Count } else { 0 }
             orders = if ($present) { @($result.orders).Count } else { 0 }
+            source_state = $sourceStates[$source]
         }
         if (-not $present -or $sampleCount -ne 4) {
             $allPresent = $false

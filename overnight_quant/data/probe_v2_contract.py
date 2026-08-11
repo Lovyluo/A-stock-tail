@@ -243,8 +243,13 @@ def _validate_v2_samples(
             tracked_codes
         ):
             errors.append(f"probe_sample_requested_codes_mismatch:{clock}")
-        if _normalized_codes(sample.get("covered_codes") or []) != (
-            tracked_codes
+        covered_codes = _normalized_codes(
+            sample.get("covered_codes") or []
+        )
+        sample_failed = _sample_has_failure(sample)
+        if (
+            (not sample_failed and covered_codes != tracked_codes)
+            or any(code not in tracked_codes for code in covered_codes)
         ):
             errors.append(f"probe_sample_covered_codes_mismatch:{clock}")
         if source == "mootdx" and str(
@@ -259,6 +264,15 @@ def _validate_v2_samples(
             )
         )
     return errors
+
+
+def _sample_has_failure(sample: dict[str, Any]) -> bool:
+    return (
+        sample.get("request_timed_out") is True
+        or sample.get("sample_window_missed") is True
+        or bool(str(sample.get("error_code") or "").strip())
+        or bool(str(sample.get("error") or "").strip())
+    )
 
 
 def _validate_sample_timing(
