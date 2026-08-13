@@ -67,6 +67,7 @@ def test_mootdx_candidates_prefer_dynamic_pool_and_deduplicate(
     ]
     original_get = quotes_module.config.get
 
+    monkeypatch.delenv("A_STOCK_MOOTDX_ENDPOINT", raising=False)
     monkeypatch.setattr(tdx_constants, "hq_hosts", dynamic)
     monkeypatch.setattr(
         quotes_module.config,
@@ -100,6 +101,7 @@ def test_mootdx_candidates_keep_configured_fallback_without_dynamic_pool(
     ]
     original_get = quotes_module.config.get
 
+    monkeypatch.delenv("A_STOCK_MOOTDX_ENDPOINT", raising=False)
     monkeypatch.setattr(tdx_constants, "hq_hosts", [])
     monkeypatch.setattr(
         quotes_module.config,
@@ -135,6 +137,7 @@ def test_mootdx_candidates_default_budget_reaches_twenty_dynamic_nodes(
     ]
     original_get = quotes_module.config.get
 
+    monkeypatch.delenv("A_STOCK_MOOTDX_ENDPOINT", raising=False)
     monkeypatch.setattr(tdx_constants, "hq_hosts", dynamic)
     monkeypatch.setattr(
         quotes_module.config,
@@ -150,6 +153,68 @@ def test_mootdx_candidates_default_budget_reaches_twenty_dynamic_nodes(
 
     assert len(candidates) == 20
     assert candidates[-1]["host"] == "10.2.0.20"
+
+
+def test_mootdx_candidates_put_explicit_endpoint_first_and_deduplicate(
+    monkeypatch,
+):
+    from mootdx import quotes as quotes_module
+    from tdxpy import constants as tdx_constants
+
+    dynamic = [
+        ("dynamic-duplicate", "10.3.0.1", 7709),
+        ("dynamic-next", "10.3.0.2", 7709),
+    ]
+    original_get = quotes_module.config.get
+
+    monkeypatch.setenv("A_STOCK_MOOTDX_ENDPOINT", "10.3.0.1:7709")
+    monkeypatch.setattr(tdx_constants, "hq_hosts", dynamic)
+    monkeypatch.setattr(
+        quotes_module.config,
+        "get",
+        lambda key, default=None: (
+            {"HQ": []}
+            if key == "SERVER"
+            else original_get(key, default)
+        ),
+    )
+
+    candidates = mootdx_server_candidates(limit=8)
+
+    assert [(item["host"], item["port"]) for item in candidates] == [
+        ("10.3.0.1", 7709),
+        ("10.3.0.2", 7709),
+    ]
+    assert candidates[0]["id"] == (
+        "mootdx_preferred@10.3.0.1:7709"
+    )
+
+
+def test_mootdx_candidates_ignore_malformed_explicit_endpoint(monkeypatch):
+    from mootdx import quotes as quotes_module
+    from tdxpy import constants as tdx_constants
+
+    original_get = quotes_module.config.get
+
+    monkeypatch.setenv("A_STOCK_MOOTDX_ENDPOINT", "not-an-endpoint")
+    monkeypatch.setattr(
+        tdx_constants,
+        "hq_hosts",
+        [("dynamic", "10.4.0.1", 7709)],
+    )
+    monkeypatch.setattr(
+        quotes_module.config,
+        "get",
+        lambda key, default=None: (
+            {"HQ": []}
+            if key == "SERVER"
+            else original_get(key, default)
+        ),
+    )
+
+    candidates = mootdx_server_candidates(limit=8)
+
+    assert candidates[0]["id"] == "dynamic@10.4.0.1:7709"
 
 
 def test_killable_worker_terminates_a_40_second_block_without_late_write(
