@@ -4,6 +4,7 @@ from datetime import date, datetime, time
 import json
 import os
 from pathlib import Path
+import sys
 import time as time_module
 from typing import Any, Callable, Iterable
 from uuid import uuid4
@@ -46,7 +47,7 @@ def run_mootdx_boundary_audit(
     normalized_endpoint = normalize_audit_endpoint(endpoint)
     runtime_clock = clock or (lambda: datetime.now(CN_TZ))
     runtime_sleep = sleep or time_module.sleep
-    runtime_worker = worker_runner or run_probe_worker_process
+    runtime_worker = worker_runner or _run_boundary_audit_worker_process
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     targets = [
@@ -82,7 +83,7 @@ def run_mootdx_boundary_audit(
         else:
             worker_result = runtime_worker(
                 {
-                    "operation": "transaction",
+                    "operation": "boundary_audit_transaction",
                     "source": "mootdx",
                     "codes": [AUDIT_CODE],
                     "observed_at": target.isoformat(),
@@ -395,3 +396,18 @@ def _as_cn(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=CN_TZ)
     return value.astimezone(CN_TZ)
+
+
+def _run_boundary_audit_worker_process(
+    task: dict[str, Any],
+    deadline_ms: int,
+) -> dict[str, Any]:
+    return run_probe_worker_process(
+        task,
+        deadline_ms,
+        worker_command=[
+            sys.executable,
+            "-m",
+            "overnight_quant.data.mootdx_boundary_audit_worker",
+        ],
+    )

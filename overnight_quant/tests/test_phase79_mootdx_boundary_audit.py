@@ -16,6 +16,9 @@ from overnight_quant.data.mootdx_boundary_audit import (
     run_mootdx_boundary_audit,
     write_json_exclusive,
 )
+from overnight_quant.data.mootdx_boundary_audit_worker import (
+    execute_boundary_audit_worker_task,
+)
 
 
 DAY = "2026-08-14"
@@ -65,7 +68,10 @@ def test_three_points_are_isolated_fixed_endpoint_and_non_trading(tmp_path):
     assert all(call[1] == AUDIT_REQUEST_DEADLINE_MS for call in calls)
     assert all(call[0]["codes"] == [AUDIT_CODE] for call in calls)
     assert all(call[0]["endpoint"] == ENDPOINT for call in calls)
-    assert all(call[0]["operation"] == "transaction" for call in calls)
+    assert all(
+        call[0]["operation"] == "boundary_audit_transaction"
+        for call in calls
+    )
     assert len({item["output_file"] for item in result["samples"]}) == 3
     _assert_safe(result)
     for target in TARGETS:
@@ -290,6 +296,26 @@ def test_validate_only_is_safe_and_fixed_to_600000():
     _assert_safe(result)
 
 
+def test_boundary_worker_fetches_one_page_without_waiting_for_full_window():
+    collector = FakeBoundaryCollector()
+
+    result = execute_boundary_audit_worker_task(
+        {
+            "operation": "boundary_audit_transaction",
+            "source": "mootdx",
+            "codes": [AUDIT_CODE],
+            "observed_at": f"{DAY}T14:49:57+08:00",
+            "endpoint": ENDPOINT,
+            "provider_timeout_seconds": 2.0,
+        },
+        collector_factory=lambda *args, **kwargs: collector,
+    )
+
+    assert collector.calls == [(800, 1)]
+    assert collector.closed is True
+    assert result["transaction_evidence"]["endpoint_id"] == ENDPOINT["id"]
+
+
 def _worker_success(task, *, packet_suffix: int):
     row = {
         "event_time": f"{DAY}T14:49:00+08:00",
@@ -320,6 +346,32 @@ def _worker_success(task, *, packet_suffix: int):
         "request_timed_out": False,
         "worker_terminated": False,
     }
+
+
+class FakeBoundaryCollector:
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def collect_transaction_evidence(
+        self,
+        observed_at,
+        *,
+        page_size,
+        max_pages,
+    ):
+        self.calls.append((page_size, max_pages))
+        return {
+            "source": "mootdx",
+            "source_version": (
+                "mootdx_0.11.7_tdx_std_transaction_v2026-08-06"
+            ),
+            "endpoint_id": ENDPOINT["id"],
+            "by_code": {AUDIT_CODE: {"records": []}},
+        }
+
+    def close(self):
+        self.closed = True
 
 
 def _read_target(path: Path, value: time):
