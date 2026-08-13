@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from importlib.metadata import PackageNotFoundError, version
+import os
 from typing import Any, Callable, Iterable
 
 from overnight_quant.data.close_time_contract import (
@@ -356,25 +357,72 @@ class MootdxMinuteProbeCollectors:
 
 def mootdx_server_candidates(
     *,
-    limit: int = 8,
+    limit: int = 20,
 ) -> list[dict[str, Any]]:
     from mootdx import quotes as quotes_module
 
+    try:
+        from tdxpy.constants import hq_hosts as discovered_hosts
+    except (ImportError, AttributeError):
+        discovered_hosts = []
+
     configured = quotes_module.config.get("SERVER").get("HQ") or []
+    # mootdx's server probe uses tdxpy's broader legacy pool. Prefer that
+    # pool here as well, while retaining mootdx's configured list as fallback.
+    preferred = _mootdx_endpoint_override(
+        os.environ.get("A_STOCK_MOOTDX_ENDPOINT", "")
+    )
+    pools = (
+        [
+            (
+                preferred["name"],
+                preferred["host"],
+                preferred["port"],
+            )
+        ]
+        if preferred is not None
+        else [],
+        discovered_hosts or [],
+        configured,
+    )
     candidates = []
-    for name, host, port in configured:
-        endpoint = _normalize_mootdx_endpoint(
-            {
-                "name": name,
-                "host": host,
-                "port": port,
-            }
-        )
-        if endpoint is not None:
+    seen = set()
+    for pool in pools:
+        for item in pool:
+            try:
+                name, host, port = item
+            except (TypeError, ValueError):
+                continue
+            endpoint = _normalize_mootdx_endpoint(
+                {
+                    "name": name,
+                    "host": host,
+                    "port": port,
+                }
+            )
+            if endpoint is None:
+                continue
+            address = (endpoint["host"], endpoint["port"])
+            if address in seen:
+                continue
+            seen.add(address)
             candidates.append(endpoint)
-        if len(candidates) >= max(1, int(limit)):
-            break
+            if len(candidates) >= max(1, int(limit)):
+                return candidates
     return candidates
+
+
+def _mootdx_endpoint_override(value: str) -> dict[str, Any] | None:
+    host, separator, raw_port = str(value or "").strip().rpartition(":")
+    if not separator:
+        return None
+    return _normalize_mootdx_endpoint(
+        {
+            "name": "mootdx_preferred",
+            "host": host,
+            "port": raw_port,
+        }
+    )
 
 
 def _default_mootdx_client(
