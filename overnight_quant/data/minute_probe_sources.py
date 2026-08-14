@@ -59,6 +59,7 @@ def build_minute_probe_collector(
     clock: Callable[[], datetime] | None = None,
     endpoint: dict[str, Any] | None = None,
     request_timeout_seconds: float = 2.0,
+    minute_offset: int = 800,
 ) -> Any:
     normalized = normalize_probe_source(source)
     if normalized == PROBE_SOURCE_EASTMONEY:
@@ -73,6 +74,7 @@ def build_minute_probe_collector(
         clock=clock,
         endpoint=endpoint,
         request_timeout_seconds=request_timeout_seconds,
+        minute_offset=minute_offset,
     )
 
 
@@ -99,6 +101,7 @@ class MootdxMinuteProbeCollectors:
         time_contract: dict[str, Any] | CloseTimeContract | None = None,
         endpoint: dict[str, Any] | None = None,
         request_timeout_seconds: float = 2.0,
+        minute_offset: int = 800,
     ):
         self.codes = _normalize_codes(codes)
         self.clock = clock or (lambda: datetime.now(CN_TZ))
@@ -107,6 +110,7 @@ class MootdxMinuteProbeCollectors:
             0.1,
             float(request_timeout_seconds),
         )
+        self.minute_offset = max(1, int(minute_offset))
         self.client_factory = client_factory or (
             lambda: _default_mootdx_client(
                 endpoint=self.endpoint,
@@ -134,7 +138,7 @@ class MootdxMinuteProbeCollectors:
                 symbol=code,
                 frequency="1m",
                 start=0,
-                offset=800,
+                offset=self.minute_offset,
             )
             if frame is None or getattr(frame, "empty", True):
                 raise SourceContractError(
@@ -324,7 +328,7 @@ class MootdxMinuteProbeCollectors:
             "symbol": row["code"],
             "frequency": "1m",
             "start": 0,
-            "offset": 800,
+            "offset": self.minute_offset,
             "market": "std",
             "endpoint_id": self.endpoint_id,
         }
