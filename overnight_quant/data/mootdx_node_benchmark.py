@@ -1,22 +1,28 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time
 import math
 from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
 
 from overnight_quant.data.market_calendar import CN_TZ
-from overnight_quant.data.minute_probe_sources import (
-    mootdx_server_candidates,
-)
-from overnight_quant.data.point_in_time import stable_hash
-from overnight_quant.data.probe_worker_process import (
-    run_probe_worker_process,
-)
+from overnight_quant.data.minute_probe_sources import mootdx_server_candidates
+from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
+from overnight_quant.data.probe_worker_process import run_probe_worker_process
 
 
-NODE_BENCHMARK_VERSION = "mootdx_node_benchmark_v1"
+NODE_BENCHMARK_VERSION_V1 = "mootdx_node_benchmark_v1"
+NODE_BENCHMARK_VERSION = "mootdx_node_benchmark_v2"
+BENCHMARK_EVIDENCE_SCHEMA_V1 = "v1"
+BENCHMARK_EVIDENCE_SCHEMA_V2 = "v2"
+FORMAL_VALIDATION_CODES = (
+    "000001",
+    "000333",
+    "600000",
+    "600519",
+    "601318",
+)
 FORMAL_MINUTE_OFFSET = 800
 COMPARISON_MINUTE_OFFSET = 320
 REQUEST_DEADLINE_MS = 2000
@@ -33,6 +39,7 @@ def run_mootdx_node_benchmark(
     deadline_ms: int = REQUEST_DEADLINE_MS,
     recommendation_max_ms: int = RECOMMENDATION_MAX_ELAPSED_MS,
     compare_offsets: bool = True,
+    diagnostic_only: bool = False,
     worker_runner: Callable[[dict[str, Any], int], dict[str, Any]] = (
         run_probe_worker_process
     ),
@@ -41,6 +48,11 @@ def run_mootdx_node_benchmark(
     """Benchmark mootdx endpoints without changing runtime configuration."""
     if int(deadline_ms) != REQUEST_DEADLINE_MS:
         raise ValueError("node_benchmark_deadline_must_be_2000ms")
+    if int(recommendation_max_ms) > RECOMMENDATION_MAX_ELAPSED_MS:
+        raise ValueError("node_benchmark_recommendation_limit_exceeds_1500ms")
+    if int(recommendation_max_ms) <= 0:
+        raise ValueError("node_benchmark_recommendation_limit_invalid")
+
     normalized_codes = sorted(
         {
             str(code).strip().zfill(6)
@@ -50,12 +62,18 @@ def run_mootdx_node_benchmark(
     )
     if not normalized_codes:
         raise ValueError("node_benchmark_codes_missing")
+    formal_codes = sorted(FORMAL_VALIDATION_CODES)
+    non_formal_scope = normalized_codes != formal_codes
+    if non_formal_scope and not diagnostic_only:
+        raise ValueError("node_benchmark_formal_codes_mismatch")
+
     rounds = max(5, int(qualification_rounds))
     limit = max(1, min(3, int(top_count)))
     runtime_clock = clock or (lambda: datetime.now(CN_TZ))
-    clock_now = runtime_clock()
-    expected_date = _trade_date_text(trade_date or clock_now.date())
-    observed = _benchmark_observed_at(clock_now, expected_date)
+    benchmark_started_at = _as_cn(runtime_clock())
+    data_trade_date = _trade_date_text(
+        trade_date or benchmark_started_at.date()
+    )
     candidates = _deduplicate_endpoints(
         endpoint_candidates
         if endpoint_candidates is not None
@@ -66,15 +84,21 @@ def run_mootdx_node_benchmark(
         _run_endpoint(
             endpoint,
             normalized_codes,
-            observed_at=observed,
+            data_trade_date=data_trade_date,
             deadline_ms=deadline_ms,
             worker_runner=worker_runner,
-            operation="preflight",
+            operation="benchmark_preflight",
+            clock=runtime_clock,
         )
         for endpoint in candidates
     ]
-    ranked = sorted(screening, key=_screening_rank)
-    finalists = [row["endpoint"] for row in ranked[:limit]]
+    survivors = [
+        row
+        for row in screening
+        if _is_screening_survivor(row, normalized_codes)
+    ]
+    ranked_survivors = sorted(survivors, key=_screening_rank)
+    finalists = [row["endpoint"] for row in ranked_survivors[:limit]]
 
     qualification: list[dict[str, Any]] = []
     for endpoint in finalists:
@@ -82,10 +106,11 @@ def run_mootdx_node_benchmark(
             _run_endpoint(
                 endpoint,
                 normalized_codes,
-                observed_at=observed,
+                data_trade_date=data_trade_date,
                 deadline_ms=deadline_ms,
                 worker_runner=worker_runner,
-                operation="preflight",
+                operation="benchmark_preflight",
+                clock=runtime_clock,
             )
             for _ in range(rounds)
         ]
@@ -106,33 +131,64 @@ def run_mootdx_node_benchmark(
             str(row["endpoint"]["id"]),
         ),
     )
-    recommended = eligible[0]["endpoint"] if eligible else None
-    comparison_endpoint = recommended or (
-        finalists[0] if finalists else None
+    recommended = None if diagnostic_only else (
+        eligible[0]["endpoint"] if eligible else None
     )
-    offset_comparison = (
-        _compare_offsets(
+    comparison_endpoint = recommended or (
+        finalists[0] if finalists and not diagnostic_only else None
+    )
+    if compare_offsets and comparison_endpoint is not None:
+        offset_comparison = _compare_offsets(
             comparison_endpoint,
             normalized_codes,
-            observed_at=observed,
+            data_trade_date=data_trade_date,
             deadline_ms=deadline_ms,
             worker_runner=worker_runner,
+            clock=runtime_clock,
         )
-        if compare_offsets and comparison_endpoint is not None
-        else _empty_offset_comparison()
+    else:
+        reason = (
+            "diagnostic_scope"
+            if diagnostic_only
+            else "no_screening_survivor"
+            if not finalists
+            else "comparison_disabled"
+        )
+        offset_comparison = _empty_offset_comparison(reason)
+
+    benchmark_completed_at = _as_cn(runtime_clock())
+    status = (
+        "NO_SCREENING_SURVIVOR"
+        if not finalists
+        else "DIAGNOSTIC_BENCHMARK_COMPLETED"
+        if diagnostic_only
+        else "MOOTDX_NODE_BENCHMARK_COMPLETED"
     )
     result = {
-        "status": "MOOTDX_NODE_BENCHMARK_COMPLETED",
+        "status": status,
         "execution_ok": True,
         "data_ready": False,
         "audit_only": True,
+        "diagnostic_only": bool(diagnostic_only),
+        "benchmark_evidence_schema_version": BENCHMARK_EVIDENCE_SCHEMA_V2,
         "benchmark_version": NODE_BENCHMARK_VERSION,
-        "trade_date": expected_date,
-        "observed_at": observed.isoformat(timespec="milliseconds"),
+        "data_trade_date": data_trade_date,
+        "trade_date": data_trade_date,
+        "benchmark_started_at": benchmark_started_at.isoformat(
+            timespec="milliseconds"
+        ),
+        "benchmark_completed_at": benchmark_completed_at.isoformat(
+            timespec="milliseconds"
+        ),
+        "observed_at": benchmark_started_at.isoformat(
+            timespec="milliseconds"
+        ),
         "tracked_codes": normalized_codes,
+        "formal_validation_codes": formal_codes,
         "request_deadline_ms": REQUEST_DEADLINE_MS,
         "recommendation_max_elapsed_ms": int(recommendation_max_ms),
         "screened_endpoint_count": len(candidates),
+        "screening_survivor_count": len(survivors),
         "screening": screening,
         "qualification_rounds": rounds,
         "qualification": qualification,
@@ -144,8 +200,61 @@ def run_mootdx_node_benchmark(
         "tickets": [],
         "orders": [],
     }
-    result["benchmark_evidence_hash"] = stable_hash(result)
+    result["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(
+        result
+    )
     return result
+
+
+def compute_benchmark_evidence_hash(payload: dict[str, Any]) -> str:
+    material = dict(payload)
+    material.pop("benchmark_evidence_hash", None)
+    return stable_hash(material)
+
+
+def verify_benchmark_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    schema = str(
+        payload.get("benchmark_evidence_schema_version")
+        or BENCHMARK_EVIDENCE_SCHEMA_V1
+    )
+    errors: list[str] = []
+    if schema not in {
+        BENCHMARK_EVIDENCE_SCHEMA_V1,
+        BENCHMARK_EVIDENCE_SCHEMA_V2,
+    }:
+        errors.append(f"benchmark_schema_unsupported:{schema}")
+    expected = str(payload.get("benchmark_evidence_hash") or "")
+    actual = compute_benchmark_evidence_hash(payload)
+    if not expected or expected != actual:
+        errors.append("benchmark_evidence_hash_mismatch")
+    if schema == BENCHMARK_EVIDENCE_SCHEMA_V2:
+        started = parse_cn_datetime(payload.get("benchmark_started_at"))
+        completed = parse_cn_datetime(payload.get("benchmark_completed_at"))
+        observed = parse_cn_datetime(payload.get("observed_at"))
+        if started is None or completed is None or observed is None:
+            errors.append("benchmark_real_time_missing")
+        elif completed < started or observed != started:
+            errors.append("benchmark_real_time_invalid")
+        try:
+            _trade_date_text(payload.get("data_trade_date"))
+        except (TypeError, ValueError):
+            errors.append("benchmark_data_trade_date_invalid")
+    return {
+        "status": (
+            "BENCHMARK_EVIDENCE_VERIFIED"
+            if not errors
+            else "BENCHMARK_EVIDENCE_INVALID"
+        ),
+        "execution_ok": True,
+        "data_ready": False,
+        "benchmark_evidence_schema_version": schema,
+        "benchmark_evidence_hash": expected,
+        "recomputed_benchmark_evidence_hash": actual,
+        "errors": errors,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
 
 
 def write_benchmark_json_atomic(
@@ -181,17 +290,20 @@ def _run_endpoint(
     endpoint: dict[str, Any],
     codes: list[str],
     *,
-    observed_at: datetime,
+    data_trade_date: str,
     deadline_ms: int,
     worker_runner: Callable[[dict[str, Any], int], dict[str, Any]],
     operation: str,
+    clock: Callable[[], datetime],
     minute_offset: int | None = None,
 ) -> dict[str, Any]:
+    parent_started = _as_cn(clock())
     task = {
         "operation": operation,
         "source": "mootdx",
         "codes": list(codes),
-        "observed_at": observed_at.isoformat(),
+        "observed_at": parent_started.isoformat(timespec="milliseconds"),
+        "data_trade_date": data_trade_date,
         "endpoint": endpoint,
         "provider_timeout_seconds": deadline_ms / 1000.0,
     }
@@ -200,16 +312,38 @@ def _run_endpoint(
     wall_started = time.perf_counter()
     worker_result = worker_runner(task, deadline_ms)
     wall_elapsed_ms = round((time.perf_counter() - wall_started) * 1000, 3)
+    parent_completed = _as_cn(clock())
     payload = worker_result.get("payload") or {}
     e2e_ms = float(worker_result.get("elapsed_ms") or wall_elapsed_ms)
     provider_ms = _optional_float(payload.get("worker_request_elapsed_ms"))
-    covered = sorted(str(code).zfill(6) for code in payload.get("covered_codes") or [])
+    requested = sorted(
+        str(code).zfill(6) for code in payload.get("requested_codes") or []
+    )
+    covered = sorted(
+        str(code).zfill(6) for code in payload.get("covered_codes") or []
+    )
     return {
         "endpoint": dict(endpoint),
+        "endpoint_id": str(payload.get("endpoint_id") or ""),
         "operation": operation,
+        "data_trade_date": data_trade_date,
         "minute_offset": minute_offset,
+        "benchmark_request_started_at": parent_started.isoformat(
+            timespec="milliseconds"
+        ),
+        "benchmark_request_completed_at": parent_completed.isoformat(
+            timespec="milliseconds"
+        ),
+        "worker_request_started_at": str(
+            payload.get("worker_request_started_at") or ""
+        ),
+        "worker_request_completed_at": str(
+            payload.get("worker_request_completed_at") or ""
+        ),
         "ok": worker_result.get("ok") is True,
+        "requested_codes": requested,
         "covered_codes": covered,
+        "presence_by_code": dict(payload.get("presence_by_code") or {}),
         "coverage_count": len(covered),
         "coverage_ratio": round(len(covered) / len(codes), 6),
         "returned_record_count": int(payload.get("returned_record_count") or 0),
@@ -224,10 +358,11 @@ def _run_endpoint(
             if provider_ms is not None
             else None
         ),
-        "endpoint_id": str(payload.get("endpoint_id") or ""),
         "source_versions": sorted(payload.get("source_versions") or []),
         "provider_raw_hash": str(payload.get("provider_raw_hash") or ""),
-        "raw_response_hashes": sorted(payload.get("raw_response_hashes") or []),
+        "raw_response_hashes": sorted(
+            payload.get("raw_response_hashes") or []
+        ),
         "signatures": payload.get("signatures") or {},
         "minute_record_count_by_code": (
             payload.get("minute_record_count_by_code") or {}
@@ -252,11 +387,7 @@ def _summarize_endpoint(
         if row.get("process_overhead_ms") is not None
     ]
     complete = [
-        row
-        for row in runs
-        if row["ok"]
-        and row["covered_codes"] == expected_codes
-        and row["endpoint_id"] == str(endpoint.get("id") or "")
+        row for row in runs if _is_screening_survivor(row, expected_codes)
     ]
     timeout_count = sum(row["request_timed_out"] for row in runs)
     error_count = sum(bool(row["error_code"]) for row in runs)
@@ -267,6 +398,7 @@ def _summarize_endpoint(
         and error_count == 0
         and maximum is not None
         and maximum <= float(recommendation_max_ms)
+        and maximum <= RECOMMENDATION_MAX_ELAPSED_MS
     )
     return {
         "endpoint": dict(endpoint),
@@ -294,58 +426,105 @@ def _compare_offsets(
     endpoint: dict[str, Any],
     codes: list[str],
     *,
-    observed_at: datetime,
+    data_trade_date: str,
     deadline_ms: int,
     worker_runner: Callable[[dict[str, Any], int], dict[str, Any]],
+    clock: Callable[[], datetime],
 ) -> dict[str, Any]:
     runs = {
         str(offset): _run_endpoint(
             endpoint,
             codes,
-            observed_at=observed_at,
+            data_trade_date=data_trade_date,
             deadline_ms=deadline_ms,
             worker_runner=worker_runner,
             operation="benchmark_minute",
             minute_offset=offset,
+            clock=clock,
         )
         for offset in (FORMAL_MINUTE_OFFSET, COMPARISON_MINUTE_OFFSET)
     }
+    incomplete_reasons = []
+    for offset, row in runs.items():
+        incomplete_reasons.extend(
+            _offset_run_incomplete_reasons(
+                row,
+                expected_codes=codes,
+                data_trade_date=data_trade_date,
+                offset=offset,
+            )
+        )
+    complete = not incomplete_reasons
     formal = runs[str(FORMAL_MINUTE_OFFSET)]
     comparison = runs[str(COMPARISON_MINUTE_OFFSET)]
-    both_complete = all(
-        row["ok"] and row["covered_codes"] == codes
-        for row in (formal, comparison)
-    )
     return {
         "status": (
             "OFFSET_COMPARISON_COMPLETED"
-            if both_complete
+            if complete
             else "OFFSET_COMPARISON_INCOMPLETE"
         ),
         "audit_only": True,
         "formal_default_unchanged": True,
+        "incomplete_reasons": sorted(set(incomplete_reasons)),
         "runs": runs,
-        "same_record_counts": (
-            both_complete
+        "same_record_counts": bool(
+            complete
             and formal["minute_record_count_by_code"]
             == comparison["minute_record_count_by_code"]
         ),
-        "same_1450_ohlcv_signatures": (
-            both_complete and formal["signatures"] == comparison["signatures"]
+        "same_1450_ohlcv_signatures": bool(
+            complete and formal["signatures"] == comparison["signatures"]
         ),
-        "same_canonical_hashes": (
-            both_complete
+        "same_canonical_hashes": bool(
+            complete
             and formal["canonical_minute_hash_by_code"]
             == comparison["canonical_minute_hash_by_code"]
         ),
     }
 
 
-def _empty_offset_comparison() -> dict[str, Any]:
+def _offset_run_incomplete_reasons(
+    row: dict[str, Any],
+    *,
+    expected_codes: list[str],
+    data_trade_date: str,
+    offset: str,
+) -> list[str]:
+    prefix = f"offset_{offset}"
+    reasons = []
+    if not row.get("ok"):
+        reasons.append(f"{prefix}:worker_failed")
+    if row.get("requested_codes") != expected_codes:
+        reasons.append(f"{prefix}:requested_codes_mismatch")
+    if row.get("covered_codes") != expected_codes:
+        reasons.append(f"{prefix}:coverage_incomplete")
+    presence = row.get("presence_by_code") or {}
+    if sorted(presence) != expected_codes:
+        reasons.append(f"{prefix}:presence_codes_mismatch")
+    for code in expected_codes:
+        if presence.get(code) is not True:
+            reasons.append(f"{prefix}:1450_presence_missing:{code}")
+    signatures = row.get("signatures") or {}
+    if sorted(signatures) != expected_codes:
+        reasons.append(f"{prefix}:signature_codes_mismatch")
+    for code in expected_codes:
+        signature = signatures.get(code) or {}
+        event = parse_cn_datetime(signature.get("event_time"))
+        if (
+            event is None
+            or event.date().isoformat() != data_trade_date
+            or event.time().replace(tzinfo=None) != datetime_time(14, 50)
+        ):
+            reasons.append(f"{prefix}:signature_time_invalid:{code}")
+    return reasons
+
+
+def _empty_offset_comparison(reason: str = "") -> dict[str, Any]:
     return {
-        "status": "OFFSET_COMPARISON_NOT_RUN",
+        "status": "NOT_RUN",
         "audit_only": True,
         "formal_default_unchanged": True,
+        "incomplete_reasons": [reason] if reason else [],
         "runs": {},
         "same_record_counts": False,
         "same_1450_ohlcv_signatures": False,
@@ -353,11 +532,25 @@ def _empty_offset_comparison() -> dict[str, Any]:
     }
 
 
+def _is_screening_survivor(
+    row: dict[str, Any],
+    expected_codes: list[str],
+) -> bool:
+    endpoint_id = str((row.get("endpoint") or {}).get("id") or "")
+    return bool(
+        row.get("ok") is True
+        and row.get("requested_codes") == expected_codes
+        and row.get("covered_codes") == expected_codes
+        and row.get("endpoint_id") == endpoint_id
+        and not row.get("request_timed_out")
+        and not row.get("worker_terminated")
+        and not row.get("error_code")
+        and not row.get("error")
+    )
+
+
 def _screening_rank(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
-        0 if row["ok"] else 1,
-        -int(row["coverage_count"]),
-        1 if row["request_timed_out"] else 0,
         float(row["end_to_end_elapsed_ms"]),
         str((row.get("endpoint") or {}).get("id") or ""),
     )
@@ -380,7 +573,9 @@ def _deduplicate_endpoints(
         name = str(value.get("name") or "").strip()
         result.append(
             {
-                "id": str(value.get("id") or f"{name or 'mootdx'}@{host}:{port}"),
+                "id": str(
+                    value.get("id") or f"{name or 'mootdx'}@{host}:{port}"
+                ),
                 "name": name,
                 "host": host,
                 "port": port,
@@ -404,25 +599,13 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
-def _trade_date_text(value: str | date) -> str:
+def _trade_date_text(value: str | date | None) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return date.fromisoformat(str(value)).isoformat()
 
 
-def _benchmark_observed_at(value: datetime, trade_date: str) -> datetime:
+def _as_cn(value: datetime) -> datetime:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=CN_TZ)
-    else:
-        value = value.astimezone(CN_TZ)
-    expected = date.fromisoformat(trade_date)
-    if value.date() == expected:
-        return value
-    return datetime(
-        expected.year,
-        expected.month,
-        expected.day,
-        15,
-        0,
-        tzinfo=CN_TZ,
-    )
+        return value.replace(tzinfo=CN_TZ)
+    return value.astimezone(CN_TZ)

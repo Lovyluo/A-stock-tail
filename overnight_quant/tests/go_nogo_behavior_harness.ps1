@@ -13,13 +13,32 @@ param(
     [string]$StatePath,
 
     [Parameter(Mandatory = $true)]
-    [string]$Date
+    [string]$Date,
+
+    [ValidateSet(
+        'gate_failure',
+        'existing_result',
+        'invalid_endpoint',
+        'invalid_codes',
+        'preflight_exception',
+        'write_failure',
+        'validate_only'
+    )]
+    [string]$Scenario = 'gate_failure'
 )
 
+$global:GoNoGoHarnessFormalCodes = (
+    '000001,000333,600000,600519,601318'
+)
 $global:GoNoGoHarnessState = [ordered]@{
     state = 'Ready'
     disable_count = 0
     enable_count = 0
+    scenario = $Scenario
+    existing_hash_before = ''
+    existing_hash_after = ''
+    blocking_hash_before = ''
+    blocking_hash_after = ''
 }
 
 function global:Write-GoNoGoHarnessState {
@@ -31,6 +50,20 @@ function global:Write-GoNoGoHarnessState {
     )
 }
 
+function global:Get-GoNoGoHarnessSha256 {
+    param([string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $hasher.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes)).Replace('-', '')
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function global:Get-ScheduledTask {
     param(
         [string]$TaskName,
@@ -38,6 +71,12 @@ function global:Get-ScheduledTask {
     )
     if ($TaskName -ne 'UnitMainTask') {
         return $null
+    }
+    $taskCodes = if ($Scenario -eq 'invalid_codes') {
+        '000001'
+    }
+    else {
+        $global:GoNoGoHarnessFormalCodes
     }
     return [pscustomobject]@{
         TaskName = $TaskName
@@ -50,7 +89,10 @@ function global:Get-ScheduledTask {
         }
         Actions = @(
             [pscustomobject]@{
-                Arguments = "-ProjectRoot `"$ProjectRoot`""
+                Arguments = (
+                    "-ProjectRoot `"$ProjectRoot`" " +
+                    "-Codes `"$taskCodes`""
+                )
             }
         )
     }
@@ -77,6 +119,9 @@ function global:Get-CimInstance {
         [string]$ClassName,
         $ErrorAction
     )
+    if ($Scenario -eq 'preflight_exception') {
+        throw 'unit_preflight_exception'
+    }
     return @()
 }
 
@@ -89,14 +134,80 @@ function global:w32tm {
     $global:LASTEXITCODE = 0
 }
 
+$effectiveOutput = $OutputDirectory
+if ($Scenario -eq 'write_failure') {
+    $effectiveOutput = Join-Path $OutputDirectory 'not-a-directory'
+    [IO.File]::WriteAllText(
+        $effectiveOutput,
+        'blocking file',
+        [Text.UTF8Encoding]::new($false)
+    )
+    $global:GoNoGoHarnessState.blocking_hash_before = (
+        Get-GoNoGoHarnessSha256 $effectiveOutput
+    )
+}
+
+$resultPath = Join-Path `
+    $effectiveOutput `
+    "minute_probe_go_nogo_${Date}.json"
+if ($Scenario -eq 'existing_result') {
+    [IO.Directory]::CreateDirectory($effectiveOutput) | Out-Null
+    [IO.File]::WriteAllText(
+        $resultPath,
+        "{`"status`":`"SAMPLING_NO_GO`",`"immutable`":true}`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $global:GoNoGoHarnessState.existing_hash_before = (
+        Get-GoNoGoHarnessSha256 $resultPath
+    )
+}
+
+$actualHead = ((& git -C $ProjectRoot rev-parse HEAD) | Out-String).Trim()
+$requestedHead = if ($Scenario -eq 'gate_failure') {
+    '0' * 40
+}
+else {
+    $actualHead
+}
+$requestedEndpoint = if ($Scenario -eq 'invalid_endpoint') {
+    'invalid-endpoint'
+}
+else {
+    '127.0.0.1:1'
+}
+$requestedCodes = if ($Scenario -eq 'invalid_codes') {
+    '000001'
+}
+else {
+    $global:GoNoGoHarnessFormalCodes
+}
+
 Write-GoNoGoHarnessState
-& $GoNoGoScript `
-    -Date $Date `
-    -MainRoot $ProjectRoot `
-    -MainHead ('0' * 40) `
-    -MainTaskName 'UnitMainTask' `
-    -Endpoint '127.0.0.1:1' `
-    -DeadlineClock '23:59:59' `
-    -OutputDirectory $OutputDirectory
+$invokeParameters = @{
+    Date = $Date
+    MainRoot = $ProjectRoot
+    MainHead = $requestedHead
+    MainTaskName = 'UnitMainTask'
+    Codes = $requestedCodes
+    Endpoint = $requestedEndpoint
+    DeadlineClock = '23:59:59'
+    OutputDirectory = $effectiveOutput
+}
+if ($Scenario -eq 'validate_only') {
+    $invokeParameters.ValidateOnly = $true
+}
+& $GoNoGoScript @invokeParameters
 $goNoGoExitCode = $LASTEXITCODE
+
+if ($Scenario -eq 'existing_result') {
+    $global:GoNoGoHarnessState.existing_hash_after = (
+        Get-GoNoGoHarnessSha256 $resultPath
+    )
+}
+if ($Scenario -eq 'write_failure') {
+    $global:GoNoGoHarnessState.blocking_hash_after = (
+        Get-GoNoGoHarnessSha256 $effectiveOutput
+    )
+}
+Write-GoNoGoHarnessState
 exit $goNoGoExitCode

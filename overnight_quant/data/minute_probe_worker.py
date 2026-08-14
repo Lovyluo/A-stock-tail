@@ -21,6 +21,7 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
     operation = str(task.get("operation") or "").strip().lower()
     if operation not in {
         "preflight",
+        "benchmark_preflight",
         "minute",
         "transaction",
         "benchmark_minute",
@@ -29,6 +30,10 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
     observed_at = parse_cn_datetime(task.get("observed_at"))
     if observed_at is None:
         raise ValueError("worker_observed_at_invalid")
+    benchmark_operation = operation in {
+        "benchmark_preflight",
+        "benchmark_minute",
+    }
     collector = build_minute_probe_collector(
         source,
         codes,
@@ -38,13 +43,23 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
         ),
         minute_offset=(
             int(task.get("minute_offset") or 800)
-            if operation == "benchmark_minute"
+            if benchmark_operation
             else 800
+        ),
+        benchmark_data_trade_date=(
+            str(task.get("data_trade_date") or "") or None
+            if benchmark_operation
+            else None
         ),
     )
     try:
         request_started = datetime.now(CN_TZ)
-        if operation in {"preflight", "minute", "benchmark_minute"}:
+        if operation in {
+            "preflight",
+            "benchmark_preflight",
+            "minute",
+            "benchmark_minute",
+        }:
             batch = collector.collect_minute_bars(observed_at)
             payload = _summarize_minute_batch(
                 batch,
@@ -52,6 +67,7 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
                 endpoint_id=str(
                     getattr(collector, "endpoint_id", "") or ""
                 ),
+                include_signature_event_time=benchmark_operation,
             )
         elif operation == "transaction":
             collect = getattr(
@@ -85,9 +101,26 @@ def _summarize_minute_batch(
     *,
     codes: list[str],
     endpoint_id: str,
+    include_signature_event_time: bool = False,
 ) -> dict[str, Any]:
     records = list(batch.records or [])
     signatures = minute_1450_signature(records)
+    if include_signature_event_time:
+        signature_times = {
+            str((row.get("payload") or {}).get("code") or "").zfill(6):
+                str(row.get("event_time") or "")
+            for row in records
+            if str(row.get("data_type") or "") == "minute_bar"
+            and str(row.get("event_time") or "")[11:16] == "14:50"
+            and (row.get("payload") or {}).get("code")
+        }
+        signatures = {
+            code: {
+                **signature,
+                "event_time": signature_times.get(code, ""),
+            }
+            for code, signature in signatures.items()
+        }
     covered_codes = sorted(
         {
             str((row.get("payload") or {}).get("code") or "").zfill(6)
