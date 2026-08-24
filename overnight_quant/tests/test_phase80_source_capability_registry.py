@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
 
 import pytest
 
+from overnight_quant.data import source_capability_registry as registry_module
 from overnight_quant.data.source_capability_registry import (
     QUALIFICATION_PROGRESS_MOOTDX,
     REGISTRY_SCHEMA_VERSION,
+    SourceCapability,
     audit_source_capabilities,
     compute_source_capability_registry_hash,
     get_source_capability_registry,
@@ -42,6 +46,18 @@ REQUIRED_FIELDS = {
     "enabled_by_policy",
 }
 
+VALID_ANNOUNCEMENT_RECORD = {
+    "origin_source": "cninfo",
+    "adapter": "direct_http",
+    "source_version": "cninfo_query_v2026-07-30",
+    "event_time": "2026-08-24T14:00:00+08:00",
+    "published_at": "2026-08-24T13:59:00+08:00",
+    "observed_at": "2026-08-24T14:00:01+08:00",
+    "available_at": "2026-08-24T14:00:02+08:00",
+    "request_hash": "a" * 64,
+    "raw_hash": "b" * 64,
+}
+
 
 def test_registry_order_does_not_change_hash():
     registry = get_source_capability_registry()
@@ -53,6 +69,171 @@ def test_registry_order_does_not_change_hash():
     assert reverse == forward
     assert all(REQUIRED_FIELDS <= set(row) for row in registry)
     assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v1"
+    assert forward == (
+        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "time_critical",
+        "requires_secret",
+        "hard_gate_eligible",
+        "qualification_required",
+        "point_in_time_required",
+        "enabled_by_policy",
+        "is_proxy",
+        "is_wrapper",
+    ],
+)
+def test_source_capability_boolean_fields_are_strict(field):
+    row = deepcopy(get_source_capability_registry()[0])
+    row[field] = "false"
+
+    with pytest.raises(ValueError, match=f"source_capability_bool_invalid:{field}"):
+        SourceCapability(**row)
+
+
+def test_public_route_and_provenance_do_not_accept_custom_registry():
+    custom = deepcopy(get_source_capability_registry()[0])
+    custom.update(
+        {
+            "origin_source": "unregistered_vendor",
+            "source_version": "unregistered_vendor_v1",
+        }
+    )
+    record = {
+        **VALID_ANNOUNCEMENT_RECORD,
+        "origin_source": "unregistered_vendor",
+        "source_version": "unregistered_vendor_v1",
+    }
+
+    assert "entries" not in inspect.signature(route_source_capability).parameters
+    assert (
+        "entries"
+        not in inspect.signature(validate_source_provenance_batch).parameters
+    )
+    with pytest.raises(TypeError):
+        route_source_capability(
+            "announcement",
+            origin_source="unregistered_vendor",
+            require_hard_gate=True,
+            entries=[custom],
+        )
+    with pytest.raises(TypeError):
+        validate_source_provenance_batch(
+            "announcement",
+            [record],
+            require_hard_gate=True,
+            entries=[custom],
+        )
+
+    route = route_source_capability(
+        "announcement",
+        origin_source="unregistered_vendor",
+        require_hard_gate=True,
+    )
+    provenance = validate_source_provenance_batch(
+        "announcement",
+        [record],
+        require_hard_gate=True,
+    )
+    assert route["status"] == "UNKNOWN_SOURCE"
+    assert provenance["status"] == "UNKNOWN_SOURCE"
+    assert route["hard_gate_authorized"] is False
+    assert provenance["hard_gate_authorized"] is False
+    _assert_safe(route)
+    _assert_safe(provenance)
+
+
+@pytest.mark.parametrize(
+    ("selector", "changes", "error"),
+    [
+        (
+            {"adapter": "akshare"},
+            {"is_wrapper": False},
+            "akshare_adapter_must_be_wrapper",
+        ),
+        (
+            {"adapter": "akshare"},
+            {"role": "primary"},
+            "source_wrapper_role_invalid",
+        ),
+        (
+            {"origin_source": "sina", "is_proxy": True},
+            {"role": "primary"},
+            "source_proxy_role_invalid",
+        ),
+        (
+            {"role": "retired"},
+            {"enabled_by_policy": True},
+            "retired_source_contract_invalid",
+        ),
+        (
+            {"role": "audit_only", "qualification_required": True},
+            {"hard_gate_eligible": True, "qualification_status": "qualified"},
+            "source_role_cannot_enter_hard_gate",
+        ),
+        (
+            {"qualification_required": True},
+            {"qualification_status": "not_required"},
+            "source_qualification_contract_invalid",
+        ),
+    ],
+)
+def test_source_capability_cross_field_contracts(selector, changes, error):
+    row = next(
+        deepcopy(item)
+        for item in get_source_capability_registry()
+        if all(item.get(key) == value for key, value in selector.items())
+    )
+    row.update(changes)
+
+    with pytest.raises(ValueError, match=error):
+        SourceCapability(**row)
+
+
+def test_private_custom_registry_helpers_never_authorize_hard_gate():
+    custom = next(
+        deepcopy(item)
+        for item in get_source_capability_registry()
+        if item["capability"] == "announcement"
+        and item["origin_source"] == "cninfo"
+        and item["adapter"] == "direct_http"
+    )
+    custom.update(
+        {
+            "origin_source": "unit_custom_source",
+            "source_version": "unit_custom_source_v1",
+        }
+    )
+    record = {
+        **VALID_ANNOUNCEMENT_RECORD,
+        "origin_source": "unit_custom_source",
+        "source_version": "unit_custom_source_v1",
+    }
+
+    route = registry_module._route_source_capability_with_registry(
+        "announcement",
+        entries=[custom],
+        origin_source="unit_custom_source",
+        require_hard_gate=True,
+    )
+    provenance = registry_module._validate_source_provenance_batch_with_registry(
+        "announcement",
+        [record],
+        entries=[custom],
+        require_hard_gate=True,
+    )
+
+    assert route["status"] == "SOURCE_ROUTE_SELECTED"
+    assert route["route_scope"] == "test_only"
+    assert route["hard_gate_authorized"] is False
+    assert provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
+    assert provenance["hard_gate_authorized"] is False
+    _assert_safe(route)
+    _assert_safe(provenance)
 
 
 @pytest.mark.parametrize("origin_source", ["tushare", "ashare"])
@@ -299,17 +480,7 @@ def test_direct_and_wrapper_records_cannot_be_counted_as_two_sources():
 
 
 def test_single_origin_provenance_contract_is_auditable_but_not_data_ready():
-    record = {
-        "origin_source": "cninfo",
-        "adapter": "direct_http",
-        "source_version": "cninfo_query_v2026-07-30",
-        "event_time": "2026-08-24T14:00:00+08:00",
-        "published_at": "2026-08-24T14:00:00+08:00",
-        "observed_at": "2026-08-24T14:00:01+08:00",
-        "available_at": "2026-08-24T14:00:01+08:00",
-        "request_hash": "a" * 64,
-        "raw_hash": "b" * 64,
-    }
+    record = deepcopy(VALID_ANNOUNCEMENT_RECORD)
 
     result = validate_source_provenance_batch(
         "announcement",
@@ -321,7 +492,119 @@ def test_single_origin_provenance_contract_is_auditable_but_not_data_ready():
     assert result["hard_gate_authorized"] is True
     assert result["provenance"]["origin_source"] == "cninfo"
     assert len(result["provenance"]["record_hash"]) == 64
+    _assert_provenance_registry_contract(result)
     _assert_safe(result)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_status"),
+    [
+        ("event_time", "not-a-time", "PROVENANCE_TIME_INVALID"),
+        (
+            "event_time",
+            "2026-08-24T14:00:02+08:00",
+            "PROVENANCE_TIME_ORDER_INVALID",
+        ),
+        (
+            "observed_at",
+            "2026-08-24T14:00:03+08:00",
+            "PROVENANCE_TIME_ORDER_INVALID",
+        ),
+        (
+            "published_at",
+            "2026-08-24T14:00:02+08:00",
+            "PROVENANCE_TIME_ORDER_INVALID",
+        ),
+    ],
+)
+def test_invalid_or_reversed_provenance_times_are_rejected(
+    field,
+    value,
+    expected_status,
+):
+    record = deepcopy(VALID_ANNOUNCEMENT_RECORD)
+    record[field] = value
+
+    result = validate_source_provenance_batch(
+        "announcement",
+        [record],
+        require_hard_gate=True,
+    )
+
+    assert result["status"] == expected_status
+    assert result["hard_gate_authorized"] is False
+    assert result["provenance"] is None
+    _assert_provenance_registry_contract(result)
+    _assert_safe(result)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("request_hash", "a"),
+        ("raw_hash", "b" * 63 + "g"),
+        ("request_hash", int("1" * 64)),
+        ("raw_hash", " " + "b" * 64),
+    ],
+)
+def test_malformed_sha256_provenance_hashes_are_rejected(field, value):
+    record = deepcopy(VALID_ANNOUNCEMENT_RECORD)
+    record[field] = value
+
+    result = validate_source_provenance_batch(
+        "announcement",
+        [record],
+        require_hard_gate=True,
+    )
+
+    assert result["status"] == "PROVENANCE_HASH_INVALID"
+    assert result["invalid_fields"] == [field]
+    assert result["hard_gate_authorized"] is False
+    assert result["provenance"] is None
+    _assert_provenance_registry_contract(result)
+    _assert_safe(result)
+
+
+def test_provenance_record_random_order_does_not_change_hash():
+    first = deepcopy(VALID_ANNOUNCEMENT_RECORD)
+    first["raw_hash"] = "1" * 64
+    first["headline"] = "first"
+    second = deepcopy(VALID_ANNOUNCEMENT_RECORD)
+    second["event_time"] = "2026-08-24T14:00:01+08:00"
+    second["observed_at"] = "2026-08-24T14:00:02+08:00"
+    second["available_at"] = "2026-08-24T14:00:03+08:00"
+    second["raw_hash"] = "2" * 64
+    second["headline"] = "second"
+
+    third = deepcopy(VALID_ANNOUNCEMENT_RECORD)
+    third["event_time"] = "2026-08-24T14:00:02+08:00"
+    third["observed_at"] = "2026-08-24T14:00:03+08:00"
+    third["available_at"] = "2026-08-24T14:00:04+08:00"
+    third["raw_hash"] = "3" * 64
+    third["headline"] = "third"
+    ordered = [first, second, third]
+    shuffled = deepcopy(ordered)
+    random.Random(20260825).shuffle(shuffled)
+
+    forward = validate_source_provenance_batch(
+        "announcement",
+        ordered,
+    )
+    reverse = validate_source_provenance_batch(
+        "announcement",
+        shuffled,
+    )
+
+    assert forward["status"] == "SOURCE_PROVENANCE_ACCEPTED"
+    assert reverse["status"] == "SOURCE_PROVENANCE_ACCEPTED"
+    assert forward["provenance"]["record_hash"] == reverse["provenance"][
+        "record_hash"
+    ]
+    assert forward["registry_hash"] == reverse["registry_hash"]
+    _assert_provenance_registry_contract(forward)
+    _assert_provenance_registry_contract(reverse)
+    _assert_safe(forward)
+    _assert_safe(reverse)
 
 
 def test_announcement_without_published_at_fails_provenance_contract():
@@ -340,6 +623,8 @@ def test_announcement_without_published_at_fails_provenance_contract():
 
     assert result["status"] == "PROVENANCE_CONTRACT_INCOMPLETE"
     assert result["missing_fields"] == ["published_at"]
+    assert result["hard_gate_authorized"] is False
+    _assert_provenance_registry_contract(result)
     _assert_safe(result)
 
 
@@ -409,3 +694,10 @@ def _assert_safe(result):
     assert result["candidates"] == []
     assert result["tickets"] == []
     assert result["orders"] == []
+
+
+def _assert_provenance_registry_contract(result):
+    assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
+    assert result["registry_hash"] == (
+        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+    )

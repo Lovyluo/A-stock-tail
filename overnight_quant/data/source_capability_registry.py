@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import os
+import re
 from typing import Any, Iterable, Mapping
 
-from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
 REGISTRY_SCHEMA_VERSION = "source_capability_registry_v1"
@@ -31,6 +32,17 @@ PUBLISHED_AT_CAPABILITIES = {
     "research_report",
     "stock_news",
 }
+BOOLEAN_FIELDS = (
+    "time_critical",
+    "requires_secret",
+    "hard_gate_eligible",
+    "qualification_required",
+    "point_in_time_required",
+    "enabled_by_policy",
+    "is_proxy",
+    "is_wrapper",
+)
+SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,9 @@ class SourceCapability:
     is_wrapper: bool = False
 
     def __post_init__(self) -> None:
+        for field in BOOLEAN_FIELDS:
+            if type(getattr(self, field)) is not bool:
+                raise ValueError(f"source_capability_bool_invalid:{field}")
         if self.role not in ROLES:
             raise ValueError(f"source_role_invalid:{self.role}")
         if self.qualification_status not in QUALIFICATION_STATUSES:
@@ -69,14 +84,51 @@ class SourceCapability:
         ):
             if not str(getattr(self, field) or "").strip():
                 raise ValueError(f"source_capability_field_missing:{field}")
-        if self.role == "retired" and self.enabled_by_policy:
-            raise ValueError("retired_source_cannot_be_enabled")
+        if self.adapter == "akshare" and not self.is_wrapper:
+            raise ValueError("akshare_adapter_must_be_wrapper")
         if self.is_wrapper and self.adapter not in WRAPPER_ADAPTERS:
             raise ValueError("source_wrapper_adapter_invalid")
+        if self.is_wrapper and self.role != "optional_enrichment":
+            raise ValueError("source_wrapper_role_invalid")
         if self.is_wrapper and self.hard_gate_eligible:
             raise ValueError("source_wrapper_cannot_enter_hard_gate")
+        if self.is_proxy and self.role not in {
+            "audit_only",
+            "optional_enrichment",
+        }:
+            raise ValueError("source_proxy_role_invalid")
         if self.is_proxy and self.hard_gate_eligible:
             raise ValueError("source_proxy_cannot_enter_hard_gate")
+        if self.role in {"audit_only", "optional_enrichment", "retired"}:
+            if self.hard_gate_eligible:
+                raise ValueError("source_role_cannot_enter_hard_gate")
+        if self.qualification_required:
+            if self.qualification_status not in {"qualified", "unqualified"}:
+                raise ValueError("source_qualification_contract_invalid")
+        elif self.qualification_status not in {"not_required", "retired"}:
+            raise ValueError("source_qualification_contract_invalid")
+        if self.qualification_progress and not self.qualification_required:
+            raise ValueError("source_qualification_progress_invalid")
+        if self.qualification_status == "unqualified" and self.hard_gate_eligible:
+            raise ValueError("unqualified_source_cannot_enter_hard_gate")
+        if self.hard_gate_eligible:
+            if not self.enabled_by_policy or self.role not in {"primary", "secondary"}:
+                raise ValueError("source_hard_gate_contract_invalid")
+            if self.qualification_required and self.qualification_status != "qualified":
+                raise ValueError("source_hard_gate_qualification_invalid")
+        if self.role == "retired":
+            if (
+                self.enabled_by_policy
+                or self.hard_gate_eligible
+                or self.qualification_required
+                or self.qualification_status != "retired"
+                or self.origin_source not in RETIRED_SOURCES
+            ):
+                raise ValueError("retired_source_contract_invalid")
+        elif self.qualification_status == "retired":
+            raise ValueError("retired_qualification_role_invalid")
+        if self.origin_source in RETIRED_SOURCES and self.role != "retired":
+            raise ValueError("retired_source_role_invalid")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -570,11 +622,48 @@ def route_source_capability(
     adapter: str = "",
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
-    entries: Iterable[SourceCapability | Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    registry = canonicalize_source_capabilities(
-        SOURCE_CAPABILITIES if entries is None else entries
+    return _route_source_capability_core(
+        capability,
+        origin_source=origin_source,
+        adapter=adapter,
+        require_hard_gate=require_hard_gate,
+        environ=environ,
+        registry=get_source_capability_registry(),
+        allow_hard_gate_authorization=True,
     )
+
+
+def _route_source_capability_with_registry(
+    capability: str,
+    *,
+    entries: Iterable[SourceCapability | Mapping[str, Any]],
+    origin_source: str = "",
+    adapter: str = "",
+    require_hard_gate: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    return _route_source_capability_core(
+        capability,
+        origin_source=origin_source,
+        adapter=adapter,
+        require_hard_gate=require_hard_gate,
+        environ=environ,
+        registry=canonicalize_source_capabilities(entries),
+        allow_hard_gate_authorization=False,
+    )
+
+
+def _route_source_capability_core(
+    capability: str,
+    *,
+    origin_source: str,
+    adapter: str,
+    require_hard_gate: bool,
+    environ: Mapping[str, str] | None,
+    registry: list[dict[str, Any]],
+    allow_hard_gate_authorization: bool,
+) -> dict[str, Any]:
     environment = os.environ if environ is None else environ
     requested_capability = _normalize_identifier(capability)
     requested_source = _normalize_identifier(origin_source)
@@ -647,7 +736,9 @@ def route_source_capability(
             continue
         route_scope = (
             "hard_gate"
-            if require_hard_gate
+            if require_hard_gate and allow_hard_gate_authorization
+            else "test_only"
+            if not allow_hard_gate_authorization
             else "audit_only"
             if row["role"] == "audit_only"
             else "research"
@@ -661,9 +752,12 @@ def route_source_capability(
                 "requested_adapter": requested_adapter,
                 "require_hard_gate": bool(require_hard_gate),
                 "route_scope": route_scope,
-                "hard_gate_authorized": bool(require_hard_gate),
+                "hard_gate_authorized": bool(
+                    require_hard_gate and allow_hard_gate_authorization
+                ),
                 "selected_source": dict(row),
                 "considered_sources": considered,
+                "registry_schema_version": REGISTRY_SCHEMA_VERSION,
                 "registry_hash": compute_source_capability_registry_hash(registry),
                 "source_count": 1,
             }
@@ -701,18 +795,68 @@ def validate_source_provenance_batch(
     *,
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
-    entries: Iterable[SourceCapability | Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    return _validate_source_provenance_batch_core(
+        capability,
+        records,
+        require_hard_gate=require_hard_gate,
+        environ=environ,
+        registry=get_source_capability_registry(),
+        allow_hard_gate_authorization=True,
+    )
+
+
+def _validate_source_provenance_batch_with_registry(
+    capability: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    entries: Iterable[SourceCapability | Mapping[str, Any]],
+    require_hard_gate: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    return _validate_source_provenance_batch_core(
+        capability,
+        records,
+        require_hard_gate=require_hard_gate,
+        environ=environ,
+        registry=canonicalize_source_capabilities(entries),
+        allow_hard_gate_authorization=False,
+    )
+
+
+def _validate_source_provenance_batch_core(
+    capability: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    require_hard_gate: bool,
+    environ: Mapping[str, str] | None,
+    registry: list[dict[str, Any]],
+    allow_hard_gate_authorization: bool,
+) -> dict[str, Any]:
+    requested_capability = _normalize_identifier(capability)
     rows = [dict(row) for row in records]
+    known_capabilities = {row["capability"] for row in registry}
+    if requested_capability not in known_capabilities:
+        return _provenance_output(
+            {
+                "status": "UNKNOWN_CAPABILITY",
+                "execution_ok": True,
+                "capability": requested_capability,
+                "record_count": len(rows),
+                "provenance": None,
+            },
+            registry,
+        )
     if not rows:
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": "PROVENANCE_BATCH_EMPTY",
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": 0,
                 "provenance": None,
-            }
+            },
+            registry,
         )
 
     identity_fields = ("origin_source", "adapter", "source_version")
@@ -725,15 +869,16 @@ def validate_source_provenance_batch(
         }
     )
     if missing:
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": "PROVENANCE_FIELDS_MISSING",
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": len(rows),
                 "missing_fields": missing,
                 "provenance": None,
-            }
+            },
+            registry,
         )
 
     identities = sorted(
@@ -743,53 +888,57 @@ def validate_source_provenance_batch(
         }
     )
     if len(identities) != 1:
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": "MIXED_SOURCE_PROVENANCE_REJECTED",
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": len(rows),
                 "source_identity_count": len(identities),
                 "provenance": None,
-            }
+            },
+            registry,
         )
 
     origin_source, adapter, source_version = identities[0]
-    route = route_source_capability(
-        capability,
+    route = _route_source_capability_core(
+        requested_capability,
         origin_source=origin_source,
         adapter=adapter,
         require_hard_gate=require_hard_gate,
         environ=environ,
-        entries=entries,
+        registry=registry,
+        allow_hard_gate_authorization=allow_hard_gate_authorization,
     )
     selected = route.get("selected_source") or {}
     if route["status"] != "SOURCE_ROUTE_SELECTED":
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": route["status"],
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": len(rows),
                 "route_reasons": route.get("rejection_reasons") or [],
                 "provenance": None,
-            }
+            },
+            registry,
         )
     if selected.get("source_version") != source_version:
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": "SOURCE_VERSION_REJECTED",
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": len(rows),
                 "provenance": None,
-            }
+            },
+            registry,
         )
 
     required_fields = {"request_hash", "raw_hash"}
     if selected.get("point_in_time_required"):
         required_fields.update({"event_time", "observed_at", "available_at"})
-    if _normalize_identifier(capability) in PUBLISHED_AT_CAPABILITIES:
+    if requested_capability in PUBLISHED_AT_CAPABILITIES:
         required_fields.add("published_at")
     missing_contract = sorted(
         {
@@ -800,32 +949,172 @@ def validate_source_provenance_batch(
         }
     )
     if missing_contract:
-        return _safe_output(
+        return _provenance_output(
             {
                 "status": "PROVENANCE_CONTRACT_INCOMPLETE",
                 "execution_ok": True,
-                "capability": _normalize_identifier(capability),
+                "capability": requested_capability,
                 "record_count": len(rows),
                 "missing_fields": missing_contract,
                 "provenance": None,
-            }
+            },
+            registry,
         )
 
-    return _safe_output(
+    invalid_hash_fields = sorted(
+        {
+            field
+            for row in rows
+            for field in ("request_hash", "raw_hash")
+            if not isinstance(row.get(field), str)
+            or SHA256_PATTERN.fullmatch(row[field]) is None
+        }
+    )
+    if invalid_hash_fields:
+        return _provenance_output(
+            {
+                "status": "PROVENANCE_HASH_INVALID",
+                "execution_ok": True,
+                "capability": requested_capability,
+                "record_count": len(rows),
+                "invalid_fields": invalid_hash_fields,
+                "provenance": None,
+            },
+            registry,
+        )
+
+    time_fields = ["event_time", "observed_at", "available_at"]
+    if requested_capability in PUBLISHED_AT_CAPABILITIES:
+        time_fields.append("published_at")
+    parsed_rows: list[dict[str, Any]] = []
+    invalid_time_fields = set()
+    for index, row in enumerate(rows):
+        parsed = {}
+        for field in time_fields:
+            value = parse_cn_datetime(row.get(field))
+            if value is None:
+                invalid_time_fields.add(f"{index}:{field}")
+            else:
+                parsed[field] = value
+        parsed_rows.append(parsed)
+    if invalid_time_fields:
+        return _provenance_output(
+            {
+                "status": "PROVENANCE_TIME_INVALID",
+                "execution_ok": True,
+                "capability": requested_capability,
+                "record_count": len(rows),
+                "invalid_fields": sorted(invalid_time_fields),
+                "provenance": None,
+            },
+            registry,
+        )
+
+    order_errors = []
+    for index, parsed in enumerate(parsed_rows):
+        if parsed["event_time"] > parsed["observed_at"]:
+            order_errors.append(f"{index}:event_time_after_observed_at")
+        if parsed["observed_at"] > parsed["available_at"]:
+            order_errors.append(f"{index}:observed_at_after_available_at")
+        if (
+            requested_capability in PUBLISHED_AT_CAPABILITIES
+            and parsed["published_at"] > parsed["observed_at"]
+        ):
+            order_errors.append(f"{index}:published_at_after_observed_at")
+    if order_errors:
+        return _provenance_output(
+            {
+                "status": "PROVENANCE_TIME_ORDER_INVALID",
+                "execution_ok": True,
+                "capability": requested_capability,
+                "record_count": len(rows),
+                "order_errors": sorted(order_errors),
+                "provenance": None,
+            },
+            registry,
+        )
+
+    registry_hash = compute_source_capability_registry_hash(registry)
+    normalized_rows = _normalize_provenance_records(
+        rows,
+        parsed_rows=parsed_rows,
+        time_fields=time_fields,
+    )
+    record_hash = stable_hash(
+        {
+            "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+            "registry_hash": registry_hash,
+            "capability": requested_capability,
+            "source_identity": {
+                "origin_source": origin_source,
+                "adapter": adapter,
+                "source_version": source_version,
+            },
+            "records": normalized_rows,
+        }
+    )
+    return _provenance_output(
         {
             "status": "SOURCE_PROVENANCE_ACCEPTED",
             "execution_ok": True,
-            "capability": _normalize_identifier(capability),
+            "capability": requested_capability,
             "record_count": len(rows),
-            "hard_gate_authorized": route["hard_gate_authorized"],
+            "hard_gate_authorized": bool(
+                route["hard_gate_authorized"]
+                and allow_hard_gate_authorization
+            ),
             "provenance": {
                 "origin_source": origin_source,
                 "adapter": adapter,
                 "source_version": source_version,
-                "record_hash": stable_hash(rows),
+                "record_hash": record_hash,
             },
-        }
+        },
+        registry,
     )
+
+
+def _normalize_provenance_records(
+    rows: list[dict[str, Any]],
+    *,
+    parsed_rows: list[dict[str, Any]],
+    time_fields: list[str],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for row, parsed in zip(rows, parsed_rows):
+        item = dict(row)
+        for field in ("origin_source", "adapter", "source_version"):
+            item[field] = _normalize_identifier(item.get(field))
+        for field in ("request_hash", "raw_hash"):
+            item[field] = str(item[field]).strip().lower()
+        for field in time_fields:
+            item[field] = parsed[field].isoformat(timespec="seconds")
+        normalized.append(item)
+    return sorted(
+        normalized,
+        key=lambda row: (
+            str(row.get("event_time") or ""),
+            str(row.get("published_at") or ""),
+            str(row.get("observed_at") or ""),
+            str(row.get("available_at") or ""),
+            str(row.get("request_hash") or ""),
+            str(row.get("raw_hash") or ""),
+            stable_hash(row),
+        ),
+    )
+
+
+def _provenance_output(
+    payload: Mapping[str, Any],
+    registry: list[dict[str, Any]],
+) -> dict[str, Any]:
+    result = {
+        "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+        "registry_hash": compute_source_capability_registry_hash(registry),
+        "hard_gate_authorized": False,
+    }
+    result.update(payload)
+    return _safe_output(result)
 
 
 def _source_runtime_status(
@@ -941,6 +1230,7 @@ def _route_rejection_output(
             "selected_source": None,
             "considered_sources": [],
             "rejection_reasons": sorted(set(reasons)),
+            "registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "registry_hash": compute_source_capability_registry_hash(registry),
             "source_count": 0,
         }

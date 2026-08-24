@@ -54,6 +54,12 @@ source_version, enabled_by_policy
 静态政策和规范排序后的条目计算，因此输入顺序不会改变哈希。运行环境中的密钥是否
 存在只影响 `source_statuses`，不会改变静态注册表哈希。
 
+所有布尔字段使用严格 `bool`，字符串 `"false"` 或数字 `0/1` 均不接受。注册表还会
+交叉验证 role、wrapper、proxy、retired、qualification 和 hard-gate 语义：AKShare
+适配器必须声明为 wrapper；wrapper、proxy、audit-only、optional-enrichment、retired
+不得获得 hard gate；退役来源必须 disabled 且资格状态为 retired；未资格来源不得通过
+hard gate。
+
 ## 4. 固定来源矩阵
 
 | 能力 | 原始来源 | 适配器 | 角色 | 当前 hard gate |
@@ -84,6 +90,10 @@ source_version, enabled_by_policy
 5. audit、proxy、wrapper 或未资格来源请求 hard gate 时拒绝；
 6. 只有单一条目通过全部政策检查后，才返回 `SOURCE_ROUTE_SELECTED`。
 
+公开路由固定使用内置 `SOURCE_CAPABILITIES`，调用方不能注入自定义注册表。测试若需
+构造自定义来源，只能调用模块私有辅助函数；该路径即使选择成功也固定返回
+`hard_gate_authorized=false`。
+
 路由成功只表示静态政策允许使用该来源，不表示实际数据已到达或可用于交易决策。
 因此 B1 中 `data_ready` 始终为 `false`。
 
@@ -100,6 +110,16 @@ origin_source, adapter, source_version
 `event_time`、`observed_at` 和 `available_at`；新闻、研报和公告还必须提供
 `published_at`。缺失字段返回 `PROVENANCE_CONTRACT_INCOMPLETE`，来源混合返回
 `MIXED_SOURCE_PROVENANCE_REJECTED`。
+
+两个哈希字段必须为完整 64 位 SHA-256。时间字段使用项目统一的中国时区解析器，并
+至少满足 `event_time <= observed_at <= available_at`；新闻、研报和公告还必须满足
+`published_at <= observed_at <= available_at`。非法时间、倒置时间或非法哈希均以稳定
+状态拒绝，且 `hard_gate_authorized=false`。
+
+追溯记录在计算 `record_hash` 前会规范化身份、哈希和时间文本，并按确定性规则排序。
+哈希材料绑定 registry schema、registry hash、capability、来源身份和全部规范化记录，
+所以同一记录集合换序不会改变结果。所有追溯结果都返回
+`registry_schema_version` 与 `registry_hash`。公开追溯入口同样只使用内置注册表。
 
 ## 7. 只读审计命令
 
@@ -134,6 +154,9 @@ AKShare hard gate：OPTIONAL_ADAPTER_UNAVAILABLE
 空记录批次：PROVENANCE_BATCH_EMPTY
 混合来源批次：MIXED_SOURCE_PROVENANCE_REJECTED
 缺少发布时间：PROVENANCE_CONTRACT_INCOMPLETE
+非法 SHA-256：PROVENANCE_HASH_INVALID
+非法时间：PROVENANCE_TIME_INVALID
+倒置时间：PROVENANCE_TIME_ORDER_INVALID
 ```
 
 这些都是合同状态，不是联网成功、空数据或失败样本。真实成功、合法空数据、网络失败和
