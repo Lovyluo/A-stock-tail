@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, time as datetime_time
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.minute_probe_sources import mootdx_server_candidates
@@ -228,17 +230,7 @@ def verify_benchmark_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     if not expected or expected != actual:
         errors.append("benchmark_evidence_hash_mismatch")
     if schema == BENCHMARK_EVIDENCE_SCHEMA_V2:
-        started = parse_cn_datetime(payload.get("benchmark_started_at"))
-        completed = parse_cn_datetime(payload.get("benchmark_completed_at"))
-        observed = parse_cn_datetime(payload.get("observed_at"))
-        if started is None or completed is None or observed is None:
-            errors.append("benchmark_real_time_missing")
-        elif completed < started or observed != started:
-            errors.append("benchmark_real_time_invalid")
-        try:
-            _trade_date_text(payload.get("data_trade_date"))
-        except (TypeError, ValueError):
-            errors.append("benchmark_data_trade_date_invalid")
+        errors.extend(_validate_v2_benchmark_semantics(payload))
     return {
         "status": (
             "BENCHMARK_EVIDENCE_VERIFIED"
@@ -262,28 +254,318 @@ def write_benchmark_json_atomic(
     payload: dict[str, Any],
 ) -> Path:
     import json
-    import os
-
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise FileExistsError(f"benchmark_output_already_exists:{target}")
-    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    temporary = target.with_name(
+        f"{target.name}.{os.getpid()}.{uuid4().hex}.tmp"
     )
     try:
-        temporary.replace(target)
+        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # A same-directory hard link publishes the fully written file in
+            # one filesystem operation and fails if another process won.
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"benchmark_output_already_exists:{target}"
+            ) from exc
     finally:
         temporary.unlink(missing_ok=True)
     return target
+
+
+def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    formal_codes = sorted(FORMAL_VALIDATION_CODES)
+
+    if payload.get("audit_only") is not True:
+        errors.append("benchmark_audit_only_required")
+    if payload.get("data_ready") is not False:
+        errors.append("benchmark_data_ready_must_be_false")
+    for field in ("candidates", "tickets", "orders"):
+        if payload.get(field) != []:
+            errors.append(f"benchmark_trading_output_not_empty:{field}")
+    if payload.get("automatic_configuration_change") is not False:
+        errors.append("benchmark_automatic_configuration_change_forbidden")
+    if payload.get("request_deadline_ms") != REQUEST_DEADLINE_MS:
+        errors.append("benchmark_request_deadline_invalid")
+    if payload.get("formal_minute_offset") != FORMAL_MINUTE_OFFSET:
+        errors.append("benchmark_formal_minute_offset_invalid")
+
+    recommendation_limit = _optional_float(
+        payload.get("recommendation_max_elapsed_ms")
+    )
+    if (
+        recommendation_limit is None
+        or recommendation_limit <= 0
+        or recommendation_limit > RECOMMENDATION_MAX_ELAPSED_MS
+    ):
+        errors.append("benchmark_recommendation_limit_invalid")
+
+    tracked_codes = payload.get("tracked_codes")
+    diagnostic_only = payload.get("diagnostic_only") is True
+    if payload.get("formal_validation_codes") != formal_codes:
+        errors.append("benchmark_formal_validation_codes_invalid")
+    if not diagnostic_only and tracked_codes != formal_codes:
+        errors.append("benchmark_formal_codes_invalid")
+    if (
+        not isinstance(tracked_codes, list)
+        or not tracked_codes
+        or tracked_codes != sorted(set(tracked_codes))
+    ):
+        errors.append("benchmark_tracked_codes_invalid")
+
+    data_trade_date = None
+    try:
+        data_trade_date = _trade_date_text(payload.get("data_trade_date"))
+    except (TypeError, ValueError):
+        errors.append("benchmark_data_trade_date_invalid")
+    if (
+        data_trade_date is not None
+        and payload.get("trade_date") != data_trade_date
+    ):
+        errors.append("benchmark_trade_date_mismatch")
+
+    started = _parse_audited_datetime(payload.get("benchmark_started_at"))
+    completed = _parse_audited_datetime(payload.get("benchmark_completed_at"))
+    observed = _parse_audited_datetime(payload.get("observed_at"))
+    if started is None or completed is None or observed is None:
+        errors.append("benchmark_real_time_missing")
+    else:
+        if completed < started or observed != started:
+            errors.append("benchmark_real_time_invalid")
+        if (
+            data_trade_date is not None
+            and started.date().isoformat() < data_trade_date
+        ):
+            errors.append("benchmark_collection_precedes_data_trade_date")
+
+    screening = payload.get("screening")
+    qualification = payload.get("qualification")
+    offset_comparison = payload.get("offset_comparison")
+    if not isinstance(screening, list):
+        errors.append("benchmark_screening_invalid")
+        screening = []
+    if not isinstance(qualification, list):
+        errors.append("benchmark_qualification_invalid")
+        qualification = []
+    if not isinstance(offset_comparison, dict):
+        errors.append("benchmark_offset_comparison_invalid")
+        offset_comparison = {}
+
+    if payload.get("screened_endpoint_count") != len(screening):
+        errors.append("benchmark_screened_endpoint_count_mismatch")
+    expected_codes = tracked_codes if isinstance(tracked_codes, list) else []
+    survivor_count = sum(
+        _is_screening_survivor(row, expected_codes)
+        for row in screening
+        if isinstance(row, dict)
+    )
+    if payload.get("screening_survivor_count") != survivor_count:
+        errors.append("benchmark_screening_survivor_count_mismatch")
+    expected_status = (
+        "NO_SCREENING_SURVIVOR"
+        if survivor_count == 0
+        else "DIAGNOSTIC_BENCHMARK_COMPLETED"
+        if diagnostic_only
+        else "MOOTDX_NODE_BENCHMARK_COMPLETED"
+    )
+    if payload.get("status") != expected_status:
+        errors.append("benchmark_status_mismatch")
+
+    for index, row in enumerate(screening):
+        errors.extend(
+            _validate_v2_benchmark_run(
+                row,
+                prefix=f"screening[{index}]",
+                data_trade_date=data_trade_date,
+                benchmark_started_at=started,
+                benchmark_completed_at=completed,
+            )
+        )
+
+    for index, summary in enumerate(qualification):
+        if not isinstance(summary, dict):
+            errors.append(f"benchmark_qualification_summary_invalid:{index}")
+            continue
+        runs = summary.get("runs")
+        if not isinstance(runs, list):
+            errors.append(f"benchmark_qualification_runs_invalid:{index}")
+            runs = []
+        if summary.get("round_count") != len(runs):
+            errors.append(f"benchmark_qualification_round_count_mismatch:{index}")
+        complete_count = sum(
+            _is_screening_survivor(row, expected_codes)
+            for row in runs
+            if isinstance(row, dict)
+        )
+        if summary.get("successful_round_count") != complete_count:
+            errors.append(
+                f"benchmark_qualification_success_count_mismatch:{index}"
+            )
+        if summary.get("complete_coverage_round_count") != complete_count:
+            errors.append(
+                f"benchmark_qualification_coverage_count_mismatch:{index}"
+            )
+        timeout_count = sum(
+            bool(row.get("request_timed_out"))
+            for row in runs
+            if isinstance(row, dict)
+        )
+        error_count = sum(
+            bool(row.get("error_code"))
+            for row in runs
+            if isinstance(row, dict)
+        )
+        if summary.get("timeout_count") != timeout_count:
+            errors.append(
+                f"benchmark_qualification_timeout_count_mismatch:{index}"
+            )
+        if summary.get("error_count") != error_count:
+            errors.append(
+                f"benchmark_qualification_error_count_mismatch:{index}"
+            )
+        for run_index, row in enumerate(runs):
+            errors.extend(
+                _validate_v2_benchmark_run(
+                    row,
+                    prefix=f"qualification[{index}].runs[{run_index}]",
+                    data_trade_date=data_trade_date,
+                    benchmark_started_at=started,
+                    benchmark_completed_at=completed,
+                )
+            )
+
+    offset_runs = offset_comparison.get("runs")
+    if not isinstance(offset_runs, dict):
+        errors.append("benchmark_offset_runs_invalid")
+        offset_runs = {}
+    for offset, row in sorted(offset_runs.items()):
+        errors.extend(
+            _validate_v2_benchmark_run(
+                row,
+                prefix=f"offset[{offset}]",
+                data_trade_date=data_trade_date,
+                benchmark_started_at=started,
+                benchmark_completed_at=completed,
+            )
+        )
+
+    if diagnostic_only:
+        if payload.get("recommended_endpoint") is not None:
+            errors.append("benchmark_diagnostic_recommendation_forbidden")
+        if (
+            offset_comparison.get("status") != "NOT_RUN"
+            or offset_runs != {}
+        ):
+            errors.append("benchmark_diagnostic_offset_forbidden")
+
+    if payload.get("status") == "NO_SCREENING_SURVIVOR":
+        if survivor_count != 0:
+            errors.append("benchmark_no_survivor_status_mismatch")
+        if qualification != []:
+            errors.append("benchmark_no_survivor_qualification_not_empty")
+        if payload.get("recommended_endpoint") is not None:
+            errors.append("benchmark_no_survivor_recommendation_present")
+        if (
+            offset_comparison.get("status") != "NOT_RUN"
+            or offset_runs != {}
+        ):
+            errors.append("benchmark_no_survivor_offset_not_suppressed")
+
+    return errors
+
+
+def _validate_v2_benchmark_run(
+    row: Any,
+    *,
+    prefix: str,
+    data_trade_date: str | None,
+    benchmark_started_at: datetime | None,
+    benchmark_completed_at: datetime | None,
+) -> list[str]:
+    if not isinstance(row, dict):
+        return [f"benchmark_request_invalid:{prefix}"]
+    errors: list[str] = []
+    if (
+        data_trade_date is not None
+        and row.get("data_trade_date") != data_trade_date
+    ):
+        errors.append(f"benchmark_request_trade_date_mismatch:{prefix}")
+
+    parent_started = _parse_audited_datetime(
+        row.get("benchmark_request_started_at")
+    )
+    parent_completed = _parse_audited_datetime(
+        row.get("benchmark_request_completed_at")
+    )
+    if parent_started is None or parent_completed is None:
+        errors.append(f"benchmark_request_time_missing:{prefix}")
+    elif parent_completed < parent_started:
+        errors.append(f"benchmark_request_time_invalid:{prefix}")
+    elif (
+        benchmark_started_at is not None
+        and benchmark_completed_at is not None
+        and (
+            parent_started < benchmark_started_at
+            or parent_completed > benchmark_completed_at
+        )
+    ):
+        errors.append(f"benchmark_request_outside_run_window:{prefix}")
+
+    worker_started_text = row.get("worker_request_started_at")
+    worker_completed_text = row.get("worker_request_completed_at")
+    worker_started = _parse_audited_datetime(worker_started_text)
+    worker_completed = _parse_audited_datetime(worker_completed_text)
+    if bool(worker_started_text) != bool(worker_completed_text):
+        errors.append(f"benchmark_worker_time_incomplete:{prefix}")
+    elif worker_started_text and (
+        worker_started is None or worker_completed is None
+    ):
+        errors.append(f"benchmark_worker_time_invalid:{prefix}")
+    elif (
+        worker_started is not None
+        and worker_completed is not None
+        and worker_completed < worker_started
+    ):
+        errors.append(f"benchmark_worker_time_invalid:{prefix}")
+    elif (
+        worker_started is not None
+        and worker_completed is not None
+        and parent_started is not None
+        and parent_completed is not None
+        and (
+            worker_started < parent_started
+            or worker_completed > parent_completed
+        )
+    ):
+        errors.append(f"benchmark_worker_time_outside_request:{prefix}")
+    return errors
+
+
+def _parse_audited_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(CN_TZ)
 
 
 def _run_endpoint(

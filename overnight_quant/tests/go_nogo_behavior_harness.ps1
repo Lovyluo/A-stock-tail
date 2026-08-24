@@ -154,7 +154,7 @@ if ($Scenario -eq 'existing_result') {
     [IO.Directory]::CreateDirectory($effectiveOutput) | Out-Null
     [IO.File]::WriteAllText(
         $resultPath,
-        "{`"status`":`"SAMPLING_NO_GO`",`"immutable`":true}`n",
+        "{`"status`":`"SAMPLING_GO`",`"immutable`":true}`n",
         [Text.UTF8Encoding]::new($false)
     )
     $global:GoNoGoHarnessState.existing_hash_before = (

@@ -349,6 +349,64 @@ function New-FailureResult {
     }
 }
 
+function New-ExistingResultAudit {
+    param([string]$Path)
+    $originalStatus = 'UNREADABLE'
+    $originalReadError = ''
+    try {
+        $raw = [IO.File]::ReadAllText(
+            $Path,
+            [Text.UTF8Encoding]::new($false)
+        )
+        $original = $raw | ConvertFrom-Json
+        if ($null -ne $original.status -and
+            -not [string]::IsNullOrWhiteSpace([string]$original.status)) {
+            $originalStatus = [string]$original.status
+        }
+        else {
+            $originalStatus = 'STATUS_MISSING'
+        }
+    }
+    catch {
+        $originalReadError = $_.Exception.Message
+    }
+
+    $states = [ordered]@{}
+    foreach ($taskName in @(Get-TargetTaskNames)) {
+        try {
+            $task = Get-ScheduledTask `
+                -TaskName $taskName `
+                -ErrorAction SilentlyContinue
+            $states[$taskName] = if ($null -eq $task) {
+                'MISSING'
+            }
+            else {
+                [string]$task.State
+            }
+        }
+        catch {
+            $states[$taskName] = 'UNKNOWN'
+        }
+    }
+    return [ordered]@{
+        status = 'SAMPLING_NO_GO'
+        reason = 'existing_result'
+        execution_ok = $true
+        data_ready = $false
+        trade_date = $Date
+        evaluated_at = [datetime]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+        original_result_status = $originalStatus
+        original_result_sha256 = Get-Sha256 $Path
+        original_result_read_error = $originalReadError
+        errors = @($script:disableErrors)
+        enabled_tasks = @()
+        final_task_states = $states
+        candidates = @()
+        tickets = @()
+        orders = @()
+    }
+}
+
 function Invoke-Validation {
     $errors = [Collections.Generic.List[string]]::new()
     if ($RecoveryMode -notin @('standard', 'recovery')) {
@@ -822,14 +880,8 @@ Disable-TargetTasks
 try {
     Initialize-Inputs
     if (Test-Path -LiteralPath $script:resultPath -PathType Leaf) {
-        try {
-            Get-Content -LiteralPath $script:resultPath -Raw -Encoding UTF8
-        }
-        catch {
-            (New-FailureResult `
-                "existing_result_unreadable:$($_.Exception.Message)") |
-                ConvertTo-Json -Depth 12
-        }
+        (New-ExistingResultAudit $script:resultPath) |
+            ConvertTo-Json -Depth 12
         exit 3
     }
     $result = Invoke-GoNoGo

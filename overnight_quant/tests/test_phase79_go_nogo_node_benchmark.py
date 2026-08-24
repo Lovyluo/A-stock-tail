@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -387,6 +388,30 @@ def test_benchmark_v1_and_v2_evidence_verify_without_mutating_payload():
     )
 
 
+def test_complete_v2_benchmark_evidence_passes_semantic_validation():
+    current = datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ)
+
+    def clock():
+        nonlocal current
+        value = current
+        current += timedelta(seconds=1)
+        return value
+
+    payload = run_mootdx_node_benchmark(
+        CODES,
+        trade_date="2026-08-14",
+        endpoint_candidates=[_endpoint("fast", "10.0.0.1")],
+        worker_runner=lambda task, deadline: _worker_result(task),
+        compare_offsets=False,
+        clock=clock,
+    )
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_VERIFIED"
+    assert verification["errors"] == []
+
+
 def test_formal_worker_ignores_benchmark_offset(monkeypatch):
     build_contracts = []
 
@@ -458,6 +483,140 @@ def test_benchmark_writer_is_utf8_and_never_overwrites(tmp_path):
     with pytest.raises(FileExistsError):
         write_benchmark_json_atomic(target, {"changed": True})
     assert _sha256(target) == first_hash
+
+
+def test_benchmark_writer_allows_exactly_one_cross_process_winner(tmp_path):
+    target = tmp_path / "benchmark-race.json"
+    release = tmp_path / "release"
+    ready_paths = [tmp_path / "ready-a", tmp_path / "ready-b"]
+    script = """
+import json
+from pathlib import Path
+import sys
+import time
+
+from overnight_quant.data.mootdx_node_benchmark import (
+    write_benchmark_json_atomic,
+)
+
+target, release, ready, writer = map(Path, sys.argv[1:5])
+ready.write_text("ready", encoding="utf-8")
+while not release.exists():
+    time.sleep(0.001)
+try:
+    write_benchmark_json_atomic(target, {"writer": writer.name})
+except FileExistsError:
+    print(json.dumps({"outcome": "exists", "writer": writer.name}))
+else:
+    print(json.dumps({"outcome": "success", "writer": writer.name}))
+"""
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(target),
+                str(release),
+                str(ready_paths[index]),
+                writer,
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        for index, writer in enumerate(("writer-a", "writer-b"))
+    ]
+    deadline = time.monotonic() + 10
+    while not all(path.exists() for path in ready_paths):
+        if time.monotonic() >= deadline:
+            pytest.fail("benchmark race writers did not reach synchronization")
+        time.sleep(0.01)
+    release.write_text("go", encoding="utf-8")
+
+    outcomes = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        outcomes.append(json.loads(stdout))
+
+    assert [row["outcome"] for row in outcomes].count("success") == 1
+    assert [row["outcome"] for row in outcomes].count("exists") == 1
+    winner = next(row["writer"] for row in outcomes if row["outcome"] == "success")
+    assert json.loads(target.read_text(encoding="utf-8"))["writer"] == winner
+    winner_hash = _sha256(target)
+    time.sleep(0.05)
+    assert _sha256(target) == winner_hash
+    assert list(tmp_path.glob(f"{target.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda payload: payload.update(data_ready=True),
+        lambda payload: payload.update(candidates=[{"code": "000001"}]),
+        lambda payload: payload.update(tickets=[{"code": "000001"}]),
+        lambda payload: payload.update(orders=[{"code": "000001"}]),
+        lambda payload: payload.update(screened_endpoint_count=1),
+        lambda payload: payload.update(
+            benchmark_started_at="2026-08-15T09:00:01.000+08:00",
+            benchmark_completed_at="2026-08-15T09:00:00.000+08:00",
+        ),
+    ],
+)
+def test_v2_benchmark_semantic_tampering_fails_after_hash_rebuild(mutator):
+    payload = run_mootdx_node_benchmark(
+        CODES,
+        trade_date="2026-08-14",
+        endpoint_candidates=[],
+        clock=lambda: datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ),
+    )
+    mutator(payload)
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert verification["data_ready"] is False
+    assert verification["candidates"] == []
+    assert verification["tickets"] == []
+    assert verification["orders"] == []
+
+
+def test_v2_benchmark_rejects_inverted_per_request_time_after_hash_rebuild():
+    current = datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ)
+
+    def clock():
+        nonlocal current
+        value = current
+        current += timedelta(seconds=1)
+        return value
+
+    payload = run_mootdx_node_benchmark(
+        CODES,
+        trade_date="2026-08-14",
+        endpoint_candidates=[_endpoint("fast", "10.0.0.1")],
+        worker_runner=lambda task, deadline: _worker_result(task),
+        compare_offsets=False,
+        clock=clock,
+    )
+    payload["screening"][0]["benchmark_request_started_at"] = (
+        "2026-08-15T09:00:01.000+08:00"
+    )
+    payload["screening"][0]["benchmark_request_completed_at"] = (
+        "2026-08-15T09:00:00.000+08:00"
+    )
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert any(
+        "benchmark_request_time_invalid" in error
+        for error in verification["errors"]
+    )
 
 
 @pytest.mark.skipif(
@@ -651,13 +810,27 @@ def test_go_nogo_failure_paths_disable_ready_task_and_preserve_files(
     result_path = tmp_path / (
         f"minute_probe_go_nogo_{date.today().isoformat()}.json"
     )
-    if scenario not in {"write_failure"}:
+    if scenario not in {"write_failure", "existing_result"}:
         result = json.loads(result_path.read_text(encoding="utf-8"))
         assert result["status"] == "SAMPLING_NO_GO"
         assert result.get("enabled_tasks", []) == []
         assert result.get("candidates", []) == []
         assert result.get("tickets", []) == []
         assert result.get("orders", []) == []
+    if scenario == "existing_result":
+        original = json.loads(result_path.read_text(encoding="utf-8"))
+        audit = json.loads(completed.stdout)
+        assert original["status"] == "SAMPLING_GO"
+        assert audit["status"] == "SAMPLING_NO_GO"
+        assert audit["reason"] == "existing_result"
+        assert audit["original_result_status"] == "SAMPLING_GO"
+        assert audit["original_result_sha256"] == state["existing_hash_before"]
+        assert audit["final_task_states"] == {"UnitMainTask": "Disabled"}
+        assert audit["enabled_tasks"] == []
+        assert audit["data_ready"] is False
+        assert audit["candidates"] == []
+        assert audit["tickets"] == []
+        assert audit["orders"] == []
     if scenario in {"invalid_endpoint", "invalid_codes"}:
         failed_checks = {
             row["name"]
@@ -796,6 +969,10 @@ def _worker_result(
     presence = presence_by_code if presence_by_code is not None else {
         code: code in signatures for code in task["codes"]
     }
+    worker_started = datetime.fromisoformat(task["observed_at"])
+    worker_completed = worker_started + timedelta(
+        milliseconds=max(0, elapsed_ms - 50)
+    )
     return {
         "ok": True,
         "payload": {
@@ -808,11 +985,11 @@ def _worker_result(
             "provider_raw_hash": "e" * 64,
             "raw_response_hashes": ["f" * 64],
             "worker_request_elapsed_ms": elapsed_ms - 50,
-            "worker_request_started_at": (
-                "2026-08-15T09:30:00.000+08:00"
+            "worker_request_started_at": worker_started.isoformat(
+                timespec="milliseconds"
             ),
-            "worker_request_completed_at": (
-                "2026-08-15T09:30:00.750+08:00"
+            "worker_request_completed_at": worker_completed.isoformat(
+                timespec="milliseconds"
             ),
             "signatures": signatures,
             "minute_record_count_by_code": {code: 240 for code in codes},
