@@ -386,30 +386,23 @@ def test_benchmark_v1_and_v2_evidence_verify_without_mutating_payload():
     assert current_verification["benchmark_evidence_schema_version"] == (
         BENCHMARK_EVIDENCE_SCHEMA_V2
     )
+    assert current["status"] == "NO_SCREENING_SURVIVOR"
+    assert current["recommended_endpoint"] is None
+    assert current["offset_comparison"]["status"] == "NOT_RUN"
 
 
 def test_complete_v2_benchmark_evidence_passes_semantic_validation():
-    current = datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ)
-
-    def clock():
-        nonlocal current
-        value = current
-        current += timedelta(seconds=1)
-        return value
-
-    payload = run_mootdx_node_benchmark(
-        CODES,
-        trade_date="2026-08-14",
-        endpoint_candidates=[_endpoint("fast", "10.0.0.1")],
-        worker_runner=lambda task, deadline: _worker_result(task),
-        compare_offsets=False,
-        clock=clock,
-    )
+    payload = _complete_v2_benchmark()
 
     verification = verify_benchmark_evidence(payload)
 
     assert verification["status"] == "BENCHMARK_EVIDENCE_VERIFIED"
     assert verification["errors"] == []
+    assert payload["recommended_endpoint"]["id"] == "fast"
+    assert payload["offset_comparison"]["status"] == (
+        "OFFSET_COMPARISON_COMPLETED"
+    )
+    assert sorted(payload["offset_comparison"]["runs"]) == ["320", "800"]
 
 
 def test_formal_worker_ignores_benchmark_offset(monkeypatch):
@@ -617,6 +610,197 @@ def test_v2_benchmark_rejects_inverted_per_request_time_after_hash_rebuild():
         "benchmark_request_time_invalid" in error
         for error in verification["errors"]
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "mutator"),
+    [
+        (
+            "untested_recommendation",
+            lambda payload: payload.update(
+                recommended_endpoint=_endpoint("invented", "10.0.0.99")
+            ),
+        ),
+        (
+            "wrong_tested_recommendation",
+            lambda payload: payload.update(
+                recommended_endpoint=payload["qualification"][1]["endpoint"]
+            ),
+        ),
+        (
+            "forged_qualification_max",
+            lambda payload: payload["qualification"][0]["latency_ms"].update(
+                max=9999
+            ),
+        ),
+        (
+            "forged_process_overhead",
+            lambda payload: payload["qualification"][0][
+                "process_overhead_ms"
+            ].update(p95=9999),
+        ),
+        (
+            "forged_eligibility",
+            lambda payload: payload["qualification"][0].update(
+                recommendation_eligible=False
+            ),
+        ),
+        (
+            "wrong_benchmark_version",
+            lambda payload: payload.update(
+                benchmark_version="mootdx_node_benchmark_v999"
+            ),
+        ),
+        (
+            "execution_not_ok",
+            lambda payload: payload.update(execution_ok=False),
+        ),
+    ],
+)
+def test_v2_recommendation_tampering_fails_after_hash_rebuild(case, mutator):
+    payload = _complete_v2_benchmark()
+    mutator(payload)
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID", case
+    assert verification["recomputed_benchmark_evidence_hash"] == payload[
+        "benchmark_evidence_hash"
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda payload: _replace_qualification_endpoint(
+            payload,
+            index=0,
+            endpoint=_endpoint("invented", "10.0.0.99"),
+        ),
+        lambda payload: _replace_qualification_endpoint(
+            payload,
+            index=1,
+            endpoint=deepcopy(payload["qualification"][0]["endpoint"]),
+        ),
+    ],
+)
+def test_v2_qualification_endpoint_forgery_fails_after_hash_rebuild(mutator):
+    payload = _complete_v2_benchmark()
+    mutator(payload)
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert any(
+        "benchmark_qualification_endpoint_" in error
+        for error in verification["errors"]
+    )
+
+
+@pytest.mark.parametrize("offset", ["800", "320"])
+def test_v2_empty_offset_market_contract_fails_after_hash_rebuild(offset):
+    payload = _complete_v2_benchmark()
+    run = payload["offset_comparison"]["runs"][offset]
+    run["presence_by_code"] = {}
+    run["signatures"] = {}
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert any(
+        f"benchmark_offset_presence_invalid:{offset}" == error
+        for error in verification["errors"]
+    )
+    assert any(
+        f"benchmark_offset_signatures_invalid:{offset}" == error
+        for error in verification["errors"]
+    )
+
+
+@pytest.mark.parametrize("case", ["missing_signature", "wrong_event_time"])
+def test_v2_offset_signature_contract_fails_with_coherent_forged_summary(case):
+    payload = _complete_v2_benchmark()
+    offset = "800"
+    signatures = payload["offset_comparison"]["runs"][offset]["signatures"]
+    code = CODES[-1]
+    if case == "missing_signature":
+        signatures.pop(code)
+        reasons = [
+            "offset_800:signature_codes_mismatch",
+            f"offset_800:signature_time_invalid:{code}",
+        ]
+    else:
+        signatures[code]["event_time"] = "2026-08-14T14:49:00+08:00"
+        reasons = [f"offset_800:signature_time_invalid:{code}"]
+    payload["offset_comparison"].update(
+        status="OFFSET_COMPARISON_INCOMPLETE",
+        incomplete_reasons=reasons,
+        same_record_counts=False,
+        same_1450_ohlcv_signatures=False,
+        same_canonical_hashes=False,
+    )
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    expected_error = (
+        f"benchmark_offset_signatures_invalid:{offset}"
+        if case == "missing_signature"
+        else f"benchmark_offset_signature_time_invalid:{offset}:{code}"
+    )
+    assert expected_error in verification["errors"]
+
+
+@pytest.mark.parametrize(
+    ("case", "mutator"),
+    [
+        (
+            "status",
+            lambda payload: payload["offset_comparison"].update(
+                status="OFFSET_COMPARISON_INCOMPLETE"
+            ),
+        ),
+        (
+            "reasons",
+            lambda payload: payload["offset_comparison"].update(
+                incomplete_reasons=["forged_reason"]
+            ),
+        ),
+        (
+            "same_record_counts",
+            lambda payload: payload["offset_comparison"].update(
+                same_record_counts=False
+            ),
+        ),
+        (
+            "same_signatures",
+            lambda payload: payload["offset_comparison"].update(
+                same_1450_ohlcv_signatures=False
+            ),
+        ),
+        (
+            "same_hashes",
+            lambda payload: payload["offset_comparison"].update(
+                same_canonical_hashes=False
+            ),
+        ),
+    ],
+)
+def test_v2_offset_summary_tampering_fails_after_hash_rebuild(case, mutator):
+    payload = _complete_v2_benchmark()
+    mutator(payload)
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID", case
+    assert verification["recomputed_benchmark_evidence_hash"] == payload[
+        "benchmark_evidence_hash"
+    ]
 
 
 @pytest.mark.skipif(
@@ -900,6 +1084,40 @@ def test_endpoint_preflight_imports_project_from_arbitrary_working_directory(
     assert payload["candidates"] == []
     assert payload["tickets"] == []
     assert payload["orders"] == []
+
+
+def _complete_v2_benchmark():
+    current = datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ)
+
+    def clock():
+        nonlocal current
+        value = current
+        current += timedelta(seconds=1)
+        return value
+
+    def worker(task, deadline_ms):
+        elapsed_ms = 700 if task["endpoint"]["id"] == "fast" else 900
+        return _worker_result(task, elapsed_ms=elapsed_ms)
+
+    return run_mootdx_node_benchmark(
+        CODES,
+        trade_date="2026-08-14",
+        endpoint_candidates=[
+            _endpoint("fast", "10.0.0.1"),
+            _endpoint("second", "10.0.0.2"),
+        ],
+        worker_runner=worker,
+        compare_offsets=True,
+        clock=clock,
+    )
+
+
+def _replace_qualification_endpoint(payload, *, index, endpoint):
+    summary = payload["qualification"][index]
+    summary["endpoint"] = deepcopy(endpoint)
+    for run in summary["runs"]:
+        run["endpoint"] = deepcopy(endpoint)
+        run["endpoint_id"] = endpoint["id"]
 
 
 def _endpoint(identifier, host):

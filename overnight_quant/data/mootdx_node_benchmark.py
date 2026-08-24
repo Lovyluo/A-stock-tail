@@ -291,6 +291,10 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     formal_codes = sorted(FORMAL_VALIDATION_CODES)
 
+    if payload.get("benchmark_version") != NODE_BENCHMARK_VERSION:
+        errors.append("benchmark_version_invalid")
+    if payload.get("execution_ok") is not True:
+        errors.append("benchmark_execution_not_ok")
     if payload.get("audit_only") is not True:
         errors.append("benchmark_audit_only_required")
     if payload.get("data_ready") is not False:
@@ -310,6 +314,7 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
     )
     if (
         recommendation_limit is None
+        or not math.isfinite(recommendation_limit)
         or recommendation_limit <= 0
         or recommendation_limit > RECOMMENDATION_MAX_ELAPSED_MS
     ):
@@ -397,81 +402,60 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
             )
         )
 
-    for index, summary in enumerate(qualification):
-        if not isinstance(summary, dict):
-            errors.append(f"benchmark_qualification_summary_invalid:{index}")
-            continue
-        runs = summary.get("runs")
-        if not isinstance(runs, list):
-            errors.append(f"benchmark_qualification_runs_invalid:{index}")
-            runs = []
-        if summary.get("round_count") != len(runs):
-            errors.append(f"benchmark_qualification_round_count_mismatch:{index}")
-        complete_count = sum(
-            _is_screening_survivor(row, expected_codes)
-            for row in runs
-            if isinstance(row, dict)
+    survivor_endpoints = [
+        row.get("endpoint")
+        for row in screening
+        if isinstance(row, dict)
+        and _is_screening_survivor(row, expected_codes)
+    ]
+    recommendation_limit_value = (
+        recommendation_limit if recommendation_limit is not None else 0.0
+    )
+    qualification_errors, recomputed_qualification = (
+        _validate_v2_qualification_semantics(
+            payload,
+            qualification,
+            survivor_endpoints=survivor_endpoints,
+            expected_codes=expected_codes,
+            data_trade_date=data_trade_date,
+            benchmark_started_at=started,
+            benchmark_completed_at=completed,
+            recommendation_max_ms=recommendation_limit_value,
         )
-        if summary.get("successful_round_count") != complete_count:
-            errors.append(
-                f"benchmark_qualification_success_count_mismatch:{index}"
-            )
-        if summary.get("complete_coverage_round_count") != complete_count:
-            errors.append(
-                f"benchmark_qualification_coverage_count_mismatch:{index}"
-            )
-        timeout_count = sum(
-            bool(row.get("request_timed_out"))
-            for row in runs
-            if isinstance(row, dict)
-        )
-        error_count = sum(
-            bool(row.get("error_code"))
-            for row in runs
-            if isinstance(row, dict)
-        )
-        if summary.get("timeout_count") != timeout_count:
-            errors.append(
-                f"benchmark_qualification_timeout_count_mismatch:{index}"
-            )
-        if summary.get("error_count") != error_count:
-            errors.append(
-                f"benchmark_qualification_error_count_mismatch:{index}"
-            )
-        for run_index, row in enumerate(runs):
-            errors.extend(
-                _validate_v2_benchmark_run(
-                    row,
-                    prefix=f"qualification[{index}].runs[{run_index}]",
-                    data_trade_date=data_trade_date,
-                    benchmark_started_at=started,
-                    benchmark_completed_at=completed,
-                )
-            )
+    )
+    errors.extend(qualification_errors)
 
-    offset_runs = offset_comparison.get("runs")
-    if not isinstance(offset_runs, dict):
-        errors.append("benchmark_offset_runs_invalid")
-        offset_runs = {}
-    for offset, row in sorted(offset_runs.items()):
-        errors.extend(
-            _validate_v2_benchmark_run(
-                row,
-                prefix=f"offset[{offset}]",
-                data_trade_date=data_trade_date,
-                benchmark_started_at=started,
-                benchmark_completed_at=completed,
-            )
-        )
+    eligible = sorted(
+        [
+            row
+            for row in recomputed_qualification
+            if row.get("recommendation_eligible") is True
+        ],
+        key=lambda row: (
+            float(row["latency_ms"]["p95"]),
+            float(row["latency_ms"]["max"]),
+            str(row["endpoint"]["id"]),
+        ),
+    )
+    expected_recommended = None if diagnostic_only else (
+        eligible[0]["endpoint"] if eligible else None
+    )
+    if payload.get("recommended_endpoint") != expected_recommended:
+        errors.append("benchmark_recommended_endpoint_mismatch")
 
-    if diagnostic_only:
-        if payload.get("recommended_endpoint") is not None:
-            errors.append("benchmark_diagnostic_recommendation_forbidden")
-        if (
-            offset_comparison.get("status") != "NOT_RUN"
-            or offset_runs != {}
-        ):
-            errors.append("benchmark_diagnostic_offset_forbidden")
+    errors.extend(
+        _validate_v2_offset_semantics(
+            offset_comparison,
+            diagnostic_only=diagnostic_only,
+            survivor_count=survivor_count,
+            qualification=qualification,
+            expected_recommended=expected_recommended,
+            expected_codes=expected_codes,
+            data_trade_date=data_trade_date,
+            benchmark_started_at=started,
+            benchmark_completed_at=completed,
+        )
+    )
 
     if payload.get("status") == "NO_SCREENING_SURVIVOR":
         if survivor_count != 0:
@@ -480,12 +464,268 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
             errors.append("benchmark_no_survivor_qualification_not_empty")
         if payload.get("recommended_endpoint") is not None:
             errors.append("benchmark_no_survivor_recommendation_present")
-        if (
-            offset_comparison.get("status") != "NOT_RUN"
-            or offset_runs != {}
-        ):
-            errors.append("benchmark_no_survivor_offset_not_suppressed")
 
+    return errors
+
+
+def _validate_v2_qualification_semantics(
+    payload: dict[str, Any],
+    qualification: list[Any],
+    *,
+    survivor_endpoints: list[Any],
+    expected_codes: list[str],
+    data_trade_date: str | None,
+    benchmark_started_at: datetime | None,
+    benchmark_completed_at: datetime | None,
+    recommendation_max_ms: float,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    errors: list[str] = []
+    recomputed: list[dict[str, Any]] = []
+    qualification_rounds = payload.get("qualification_rounds")
+    if (
+        isinstance(qualification_rounds, bool)
+        or not isinstance(qualification_rounds, int)
+        or qualification_rounds < 5
+    ):
+        errors.append("benchmark_qualification_rounds_invalid")
+        qualification_rounds = None
+    if survivor_endpoints and not qualification:
+        errors.append("benchmark_qualification_missing")
+    if not survivor_endpoints and qualification:
+        errors.append("benchmark_qualification_without_survivor")
+    if len(qualification) > min(3, len(survivor_endpoints)):
+        errors.append("benchmark_qualification_endpoint_count_invalid")
+
+    seen_endpoints: set[str] = set()
+    for index, summary in enumerate(qualification):
+        if not isinstance(summary, dict):
+            errors.append(f"benchmark_qualification_summary_invalid:{index}")
+            continue
+        endpoint = summary.get("endpoint")
+        endpoint_key = stable_hash(endpoint)
+        if endpoint not in survivor_endpoints:
+            errors.append(f"benchmark_qualification_endpoint_unknown:{index}")
+        if endpoint_key in seen_endpoints:
+            errors.append(f"benchmark_qualification_endpoint_duplicate:{index}")
+        seen_endpoints.add(endpoint_key)
+
+        runs = summary.get("runs")
+        if not isinstance(runs, list):
+            errors.append(f"benchmark_qualification_runs_invalid:{index}")
+            continue
+        if qualification_rounds is not None and len(runs) != qualification_rounds:
+            errors.append(f"benchmark_qualification_rounds_mismatch:{index}")
+        for run_index, row in enumerate(runs):
+            prefix = f"qualification[{index}].runs[{run_index}]"
+            errors.extend(
+                _validate_v2_benchmark_run(
+                    row,
+                    prefix=prefix,
+                    data_trade_date=data_trade_date,
+                    benchmark_started_at=benchmark_started_at,
+                    benchmark_completed_at=benchmark_completed_at,
+                )
+            )
+            if isinstance(row, dict):
+                if row.get("endpoint") != endpoint:
+                    errors.append(f"benchmark_qualification_run_endpoint:{prefix}")
+                if row.get("operation") != "benchmark_preflight":
+                    errors.append(f"benchmark_qualification_run_operation:{prefix}")
+                if row.get("minute_offset") is not None:
+                    errors.append(f"benchmark_qualification_run_offset:{prefix}")
+        try:
+            expected_summary = _summarize_endpoint(
+                endpoint,
+                runs,
+                expected_codes=expected_codes,
+                recommendation_max_ms=int(recommendation_max_ms),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            errors.append(f"benchmark_qualification_recompute_failed:{index}")
+            continue
+        for field in (
+            "round_count",
+            "successful_round_count",
+            "complete_coverage_round_count",
+            "timeout_count",
+            "error_count",
+            "latency_ms",
+            "process_overhead_ms",
+            "recommendation_eligible",
+        ):
+            if summary.get(field) != expected_summary.get(field):
+                errors.append(
+                    f"benchmark_qualification_summary_mismatch:{index}:{field}"
+                )
+        recomputed.append(expected_summary)
+    return errors, recomputed
+
+
+def _validate_v2_offset_semantics(
+    offset_comparison: dict[str, Any],
+    *,
+    diagnostic_only: bool,
+    survivor_count: int,
+    qualification: list[Any],
+    expected_recommended: dict[str, Any] | None,
+    expected_codes: list[str],
+    data_trade_date: str | None,
+    benchmark_started_at: datetime | None,
+    benchmark_completed_at: datetime | None,
+) -> list[str]:
+    errors: list[str] = []
+    if offset_comparison.get("audit_only") is not True:
+        errors.append("benchmark_offset_audit_only_required")
+    if offset_comparison.get("formal_default_unchanged") is not True:
+        errors.append("benchmark_offset_default_changed")
+
+    runs = offset_comparison.get("runs")
+    if not isinstance(runs, dict):
+        errors.append("benchmark_offset_runs_invalid")
+        runs = {}
+    status = offset_comparison.get("status")
+    if status == "NOT_RUN" or diagnostic_only or survivor_count == 0:
+        expected_reason = (
+            "diagnostic_scope"
+            if diagnostic_only
+            else "no_screening_survivor"
+            if survivor_count == 0
+            else "comparison_disabled"
+        )
+        if status != "NOT_RUN":
+            errors.append("benchmark_offset_not_run_status_mismatch")
+        if runs != {}:
+            errors.append("benchmark_offset_not_run_has_runs")
+        if offset_comparison.get("incomplete_reasons") != [expected_reason]:
+            errors.append("benchmark_offset_not_run_reason_mismatch")
+        for field in (
+            "same_record_counts",
+            "same_1450_ohlcv_signatures",
+            "same_canonical_hashes",
+        ):
+            if offset_comparison.get(field) is not False:
+                errors.append(f"benchmark_offset_not_run_flag_invalid:{field}")
+        return errors
+
+    expected_offsets = {
+        str(FORMAL_MINUTE_OFFSET),
+        str(COMPARISON_MINUTE_OFFSET),
+    }
+    if set(runs) != expected_offsets:
+        errors.append("benchmark_offset_run_keys_invalid")
+
+    expected_endpoint = expected_recommended
+    if expected_endpoint is None and qualification:
+        first_summary = qualification[0]
+        if isinstance(first_summary, dict):
+            expected_endpoint = first_summary.get("endpoint")
+
+    incomplete_reasons: list[str] = []
+    valid_runs: dict[str, dict[str, Any]] = {}
+    for offset in sorted(expected_offsets):
+        row = runs.get(offset)
+        prefix = f"offset[{offset}]"
+        errors.extend(
+            _validate_v2_benchmark_run(
+                row,
+                prefix=prefix,
+                data_trade_date=data_trade_date,
+                benchmark_started_at=benchmark_started_at,
+                benchmark_completed_at=benchmark_completed_at,
+            )
+        )
+        if not isinstance(row, dict):
+            continue
+        valid_runs[offset] = row
+        if row.get("operation") != "benchmark_minute":
+            errors.append(f"benchmark_offset_operation_invalid:{offset}")
+        if row.get("minute_offset") != int(offset):
+            errors.append(f"benchmark_offset_value_invalid:{offset}")
+        if expected_endpoint is None or row.get("endpoint") != expected_endpoint:
+            errors.append(f"benchmark_offset_endpoint_invalid:{offset}")
+        expected_endpoint_id = str(
+            expected_endpoint.get("id") or ""
+            if isinstance(expected_endpoint, dict)
+            else ""
+        )
+        if row.get("endpoint_id") != expected_endpoint_id:
+            errors.append(f"benchmark_offset_endpoint_id_invalid:{offset}")
+        if row.get("requested_codes") != expected_codes:
+            errors.append(f"benchmark_offset_requested_codes_invalid:{offset}")
+        if row.get("covered_codes") != expected_codes:
+            errors.append(f"benchmark_offset_covered_codes_invalid:{offset}")
+        presence = row.get("presence_by_code")
+        if (
+            not isinstance(presence, dict)
+            or sorted(presence) != expected_codes
+            or any(presence.get(code) is not True for code in expected_codes)
+        ):
+            errors.append(f"benchmark_offset_presence_invalid:{offset}")
+        signatures = row.get("signatures")
+        if not isinstance(signatures, dict) or sorted(signatures) != expected_codes:
+            errors.append(f"benchmark_offset_signatures_invalid:{offset}")
+        else:
+            for code in expected_codes:
+                event = parse_cn_datetime(
+                    (signatures.get(code) or {}).get("event_time")
+                )
+                if (
+                    event is None
+                    or data_trade_date is None
+                    or event.date().isoformat() != data_trade_date
+                    or event.time().replace(tzinfo=None)
+                    != datetime_time(14, 50)
+                ):
+                    errors.append(
+                        f"benchmark_offset_signature_time_invalid:{offset}:{code}"
+                    )
+        if sorted(row.get("minute_record_count_by_code") or {}) != expected_codes:
+            errors.append(f"benchmark_offset_record_counts_invalid:{offset}")
+        if sorted(row.get("canonical_minute_hash_by_code") or {}) != expected_codes:
+            errors.append(f"benchmark_offset_canonical_hashes_invalid:{offset}")
+        if data_trade_date is not None:
+            incomplete_reasons.extend(
+                _offset_run_incomplete_reasons(
+                    row,
+                    expected_codes=expected_codes,
+                    data_trade_date=data_trade_date,
+                    offset=offset,
+                )
+            )
+
+    expected_reasons = sorted(set(incomplete_reasons))
+    complete = not expected_reasons and set(valid_runs) == expected_offsets
+    expected_status = (
+        "OFFSET_COMPARISON_COMPLETED"
+        if complete
+        else "OFFSET_COMPARISON_INCOMPLETE"
+    )
+    if status != expected_status:
+        errors.append("benchmark_offset_status_mismatch")
+    if offset_comparison.get("incomplete_reasons") != expected_reasons:
+        errors.append("benchmark_offset_reasons_mismatch")
+
+    formal = valid_runs.get(str(FORMAL_MINUTE_OFFSET), {})
+    comparison = valid_runs.get(str(COMPARISON_MINUTE_OFFSET), {})
+    expected_flags = {
+        "same_record_counts": bool(
+            complete
+            and formal.get("minute_record_count_by_code")
+            == comparison.get("minute_record_count_by_code")
+        ),
+        "same_1450_ohlcv_signatures": bool(
+            complete
+            and formal.get("signatures") == comparison.get("signatures")
+        ),
+        "same_canonical_hashes": bool(
+            complete
+            and formal.get("canonical_minute_hash_by_code")
+            == comparison.get("canonical_minute_hash_by_code")
+        ),
+    }
+    for field, expected_value in expected_flags.items():
+        if offset_comparison.get(field) is not expected_value:
+            errors.append(f"benchmark_offset_flag_mismatch:{field}")
     return errors
 
 
