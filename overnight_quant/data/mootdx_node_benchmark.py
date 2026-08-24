@@ -70,7 +70,8 @@ def run_mootdx_node_benchmark(
         raise ValueError("node_benchmark_formal_codes_mismatch")
 
     rounds = max(5, int(qualification_rounds))
-    limit = max(1, min(3, int(top_count)))
+    requested_limit = max(1, min(3, int(top_count)))
+    limit = requested_limit if diagnostic_only else 3
     runtime_clock = clock or (lambda: datetime.now(CN_TZ))
     benchmark_started_at = _as_cn(runtime_clock())
     data_trade_date = _trade_date_text(
@@ -402,12 +403,41 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
             )
         )
 
+    rankable_survivors = []
+    for index, row in enumerate(screening):
+        if not isinstance(row, dict) or not _is_screening_survivor(
+            row,
+            expected_codes,
+        ):
+            continue
+        try:
+            rank = _screening_rank(row)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            errors.append(f"benchmark_screening_rank_invalid:{index}")
+            continue
+        rankable_survivors.append((rank, row))
+    ranked_survivors = [
+        row
+        for _rank, row in sorted(
+            rankable_survivors,
+            key=lambda item: item[0],
+        )
+    ]
     survivor_endpoints = [
         row.get("endpoint")
-        for row in screening
-        if isinstance(row, dict)
-        and _is_screening_survivor(row, expected_codes)
+        for row in ranked_survivors
     ]
+    expected_finalist_endpoints = survivor_endpoints[
+        : min(3, len(survivor_endpoints))
+    ]
+    actual_qualification_endpoints = [
+        row.get("endpoint") if isinstance(row, dict) else None
+        for row in qualification
+    ]
+    formal_finalist_sequence_valid = bool(
+        diagnostic_only
+        or actual_qualification_endpoints == expected_finalist_endpoints
+    )
     recommendation_limit_value = (
         recommendation_limit if recommendation_limit is not None else 0.0
     )
@@ -416,6 +446,9 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
             payload,
             qualification,
             survivor_endpoints=survivor_endpoints,
+            expected_finalist_endpoints=(
+                None if diagnostic_only else expected_finalist_endpoints
+            ),
             expected_codes=expected_codes,
             data_trade_date=data_trade_date,
             benchmark_started_at=started,
@@ -425,18 +458,20 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
     )
     errors.extend(qualification_errors)
 
-    eligible = sorted(
-        [
-            row
-            for row in recomputed_qualification
-            if row.get("recommendation_eligible") is True
-        ],
-        key=lambda row: (
-            float(row["latency_ms"]["p95"]),
-            float(row["latency_ms"]["max"]),
-            str(row["endpoint"]["id"]),
-        ),
-    )
+    eligible = []
+    if formal_finalist_sequence_valid:
+        eligible = sorted(
+            [
+                row
+                for row in recomputed_qualification
+                if row.get("recommendation_eligible") is True
+            ],
+            key=lambda row: (
+                float(row["latency_ms"]["p95"]),
+                float(row["latency_ms"]["max"]),
+                str(row["endpoint"]["id"]),
+            ),
+        )
     expected_recommended = None if diagnostic_only else (
         eligible[0]["endpoint"] if eligible else None
     )
@@ -448,7 +483,7 @@ def _validate_v2_benchmark_semantics(payload: dict[str, Any]) -> list[str]:
             offset_comparison,
             diagnostic_only=diagnostic_only,
             survivor_count=survivor_count,
-            qualification=qualification,
+            expected_finalist_endpoints=expected_finalist_endpoints,
             expected_recommended=expected_recommended,
             expected_codes=expected_codes,
             data_trade_date=data_trade_date,
@@ -473,6 +508,7 @@ def _validate_v2_qualification_semantics(
     qualification: list[Any],
     *,
     survivor_endpoints: list[Any],
+    expected_finalist_endpoints: list[Any] | None,
     expected_codes: list[str],
     data_trade_date: str | None,
     benchmark_started_at: datetime | None,
@@ -495,6 +531,15 @@ def _validate_v2_qualification_semantics(
         errors.append("benchmark_qualification_without_survivor")
     if len(qualification) > min(3, len(survivor_endpoints)):
         errors.append("benchmark_qualification_endpoint_count_invalid")
+    actual_endpoints = [
+        summary.get("endpoint") if isinstance(summary, dict) else None
+        for summary in qualification
+    ]
+    if (
+        expected_finalist_endpoints is not None
+        and actual_endpoints != expected_finalist_endpoints
+    ):
+        errors.append("benchmark_qualification_finalists_mismatch")
 
     seen_endpoints: set[str] = set()
     for index, summary in enumerate(qualification):
@@ -566,7 +611,7 @@ def _validate_v2_offset_semantics(
     *,
     diagnostic_only: bool,
     survivor_count: int,
-    qualification: list[Any],
+    expected_finalist_endpoints: list[Any],
     expected_recommended: dict[str, Any] | None,
     expected_codes: list[str],
     data_trade_date: str | None,
@@ -615,10 +660,8 @@ def _validate_v2_offset_semantics(
         errors.append("benchmark_offset_run_keys_invalid")
 
     expected_endpoint = expected_recommended
-    if expected_endpoint is None and qualification:
-        first_summary = qualification[0]
-        if isinstance(first_summary, dict):
-            expected_endpoint = first_summary.get("endpoint")
+    if expected_endpoint is None and expected_finalist_endpoints:
+        expected_endpoint = expected_finalist_endpoints[0]
 
     incomplete_reasons: list[str] = []
     valid_runs: dict[str, dict[str, Any]] = {}

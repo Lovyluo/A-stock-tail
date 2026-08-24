@@ -699,6 +699,116 @@ def test_v2_qualification_endpoint_forgery_fails_after_hash_rebuild(mutator):
     )
 
 
+def test_v2_rejects_deleted_faster_finalist_after_hash_rebuild():
+    payload = _complete_v2_benchmark()
+    second = deepcopy(payload["qualification"][1])
+    payload["qualification"] = [second]
+    payload["recommended_endpoint"] = deepcopy(second["endpoint"])
+    for run in payload["offset_comparison"]["runs"].values():
+        run["endpoint"] = deepcopy(second["endpoint"])
+        run["endpoint_id"] = second["endpoint"]["id"]
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert "benchmark_qualification_finalists_mismatch" in verification["errors"]
+    assert verification["data_ready"] is False
+    assert verification["candidates"] == []
+    assert verification["tickets"] == []
+    assert verification["orders"] == []
+
+
+def test_v2_rejects_non_finalist_survivor_replacement_after_hash_rebuild():
+    payload = _complete_v2_benchmark_with_survivors(4)
+    non_finalist = deepcopy(payload["screening"][3]["endpoint"])
+    _replace_qualification_endpoint(
+        payload,
+        index=2,
+        endpoint=non_finalist,
+    )
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert "benchmark_qualification_finalists_mismatch" in verification["errors"]
+
+
+def test_v2_rejects_reordered_finalists_after_hash_rebuild():
+    payload = _complete_v2_benchmark_with_survivors(3)
+    payload["qualification"][0], payload["qualification"][1] = (
+        payload["qualification"][1],
+        payload["qualification"][0],
+    )
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert "benchmark_qualification_finalists_mismatch" in verification["errors"]
+
+
+def test_v2_rejects_duplicate_finalists_after_hash_rebuild():
+    payload = _complete_v2_benchmark_with_survivors(3)
+    _replace_qualification_endpoint(
+        payload,
+        index=1,
+        endpoint=deepcopy(payload["qualification"][0]["endpoint"]),
+    )
+    payload["benchmark_evidence_hash"] = compute_benchmark_evidence_hash(payload)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_INVALID"
+    assert "benchmark_qualification_finalists_mismatch" in verification["errors"]
+    assert any(
+        error.startswith("benchmark_qualification_endpoint_duplicate:")
+        for error in verification["errors"]
+    )
+
+
+@pytest.mark.parametrize("survivor_count", [1, 2, 3])
+def test_v2_accepts_complete_recomputed_finalist_set(survivor_count):
+    payload = _complete_v2_benchmark_with_survivors(survivor_count)
+
+    verification = verify_benchmark_evidence(payload)
+
+    expected_ids = ["fast", "second", "third"][:survivor_count]
+    assert verification["status"] == "BENCHMARK_EVIDENCE_VERIFIED"
+    assert [
+        row["endpoint"]["id"] for row in payload["qualification"]
+    ] == expected_ids
+    assert payload["recommended_endpoint"]["id"] == "fast"
+
+
+def test_formal_v2_finalists_do_not_depend_on_mutable_top_count():
+    payload = _complete_v2_benchmark_with_survivors(3, top_count=1)
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_VERIFIED"
+    assert [
+        row["endpoint"]["id"] for row in payload["qualification"]
+    ] == ["fast", "second", "third"]
+
+
+def test_v2_accepts_no_survivor_failure_evidence():
+    payload = run_mootdx_node_benchmark(
+        CODES,
+        trade_date="2026-08-14",
+        endpoint_candidates=[],
+        clock=lambda: datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ),
+    )
+
+    verification = verify_benchmark_evidence(payload)
+
+    assert verification["status"] == "BENCHMARK_EVIDENCE_VERIFIED"
+    assert payload["status"] == "NO_SCREENING_SURVIVOR"
+    assert payload["qualification"] == []
+    assert payload["recommended_endpoint"] is None
+
+
 @pytest.mark.parametrize("offset", ["800", "320"])
 def test_v2_empty_offset_market_contract_fails_after_hash_rebuild(offset):
     payload = _complete_v2_benchmark()
@@ -1087,6 +1197,16 @@ def test_endpoint_preflight_imports_project_from_arbitrary_working_directory(
 
 
 def _complete_v2_benchmark():
+    return _complete_v2_benchmark_with_survivors(2)
+
+
+def _complete_v2_benchmark_with_survivors(survivor_count, *, top_count=3):
+    endpoint_specs = [
+        ("fast", "10.0.0.1", 700),
+        ("second", "10.0.0.2", 800),
+        ("third", "10.0.0.3", 900),
+        ("fourth", "10.0.0.4", 950),
+    ][:survivor_count]
     current = datetime(2026, 8, 15, 9, 0, tzinfo=CN_TZ)
 
     def clock():
@@ -1096,16 +1216,21 @@ def _complete_v2_benchmark():
         return value
 
     def worker(task, deadline_ms):
-        elapsed_ms = 700 if task["endpoint"]["id"] == "fast" else 900
+        elapsed_by_id = {
+            endpoint_id: elapsed_ms
+            for endpoint_id, _host, elapsed_ms in endpoint_specs
+        }
+        elapsed_ms = elapsed_by_id[task["endpoint"]["id"]]
         return _worker_result(task, elapsed_ms=elapsed_ms)
 
     return run_mootdx_node_benchmark(
         CODES,
         trade_date="2026-08-14",
         endpoint_candidates=[
-            _endpoint("fast", "10.0.0.1"),
-            _endpoint("second", "10.0.0.2"),
+            _endpoint(endpoint_id, host)
+            for endpoint_id, host, _elapsed_ms in endpoint_specs
         ],
+        top_count=top_count,
         worker_runner=worker,
         compare_offsets=True,
         clock=clock,
