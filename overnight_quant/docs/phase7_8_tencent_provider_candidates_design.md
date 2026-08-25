@@ -103,9 +103,11 @@ B2.2a 不修改 `SOURCE_ADAPTER_BINDINGS`。腾讯 quote/valuation 的生产行�
 provider key、`legacy_implementation_present=true` 和
 `implementation_status=contract_incompatible`，所以正式 `bound_count=0`。
 
-测试使用私有 `test_only` 执行核心验证候选 provider key、返回结构和 B1 provenance。
-测试绑定保留 `legacy_implementation_present=true`，它故意不能通过当前生产 schema，不能
-被序列化为正式绑定。B2.2b 必须由 PM 决定以下方案之一：
+测试只使用 `_execute_source_adapter_with_bindings_for_test()`，并构造合法、隔离的
+`SourceAdapterBinding`。该候选选择行使用 `legacy_implementation_present=false`，只表达
+本次测试选择，不会进入生产矩阵。独立断言继续证明生产 quote/valuation 行保持
+`contract_incompatible + legacy_implementation_present=true`。B2.2b 必须由 PM 决定
+以下方案之一：
 
 1. 增加独立 `legacy_provider_key`，同时审计历史实现与新候选实现；
 2. 升级适配注册表 schema，以显式表达 candidate 与 legacy 共存。
@@ -134,3 +136,40 @@ D:\A-stock\.venv\Scripts\python.exe `
 验证记录 quote/valuation 各自覆盖率、耗时、字段数、来源时间、request/raw hash、B1
 provenance 状态和总 evidence hash。失败时输出稳定错误并保持安全状态，不使用 demo、
 mootdx 或其他来源。该命令不进入 CI、不创建计划任务，也不修改正式配置。
+
+## 8. v2 证据与独立重放
+
+网络证据固定使用 schema：
+
+```text
+tencent_provider_network_evidence_v2
+```
+
+每次 quote/valuation 响应的解码前原始字节以 base64 无损嵌入 ignored JSON，并同时记录
+字节数、请求 URL、请求哈希、原始哈希及请求起止时间。旧的无 schema 证据保持原文件
+不变，只能返回 `TENCENT_PROVIDER_EVIDENCE_LEGACY_AUDIT_ONLY`，不能升级为 v2 验证结果。
+
+独立只读 verifier：
+
+```powershell
+D:\A-stock\.venv\Scripts\python.exe `
+  overnight_quant/scripts/run_tencent_provider_evidence_verify.py `
+  overnight_quant/data/cache/tencent_provider_validation_v2_YYYY-MM-DD.json
+```
+
+verifier 不联网，并执行以下重算：
+
+- 重算 evidence hash 与每份原始响应 SHA-256；
+- 严格 GBK 解码并重新解析 88 字段；
+- 核对固定五股覆盖、记录 capability、来源身份及 provider key；
+- 重建 quote/valuation payload，验证时间、request hash 与 B1 provenance；
+- 重算 capability 摘要并核对网络请求数；
+- 强制 `data_ready=false`、hard gate 禁止、交易输出为空。
+
+verifier 可将确定性重放结果写入另一个 ignored cache 文件。对同一原始证据执行两次，
+输出字节与 replay hash 必须完全一致。证据和重放文件均使用跨进程排他、不可覆盖的原子
+写入；并发写同一路径时只允许一个进程成功。
+
+网络活动计数只有 transport 提供可核验计数时才输出整数。已测量的请求不得报告为 0；
+无法独立测量时固定输出 `network_requests_made=null` 与
+`upstream_network_activity=unknown`。

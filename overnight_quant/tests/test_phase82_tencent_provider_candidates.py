@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 from datetime import datetime, timedelta
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import socket
 
@@ -11,8 +13,10 @@ import pytest
 
 from overnight_quant.data import source_capability_adapters as adapters
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_adapters import (
     SOURCE_ADAPTER_BOUND,
+    SourceAdapterBinding,
     SourceProviderEnvelope,
     audit_source_adapters,
 )
@@ -22,6 +26,7 @@ from overnight_quant.data.source_capability_registry import (
 from overnight_quant.data.tencent_direct_http_providers import (
     TENCENT_ADAPTER,
     TENCENT_ORIGIN_SOURCE,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION,
     TENCENT_QUOTE_PROVIDER_KEY,
     TENCENT_SOURCE_VERSION,
     TENCENT_VALUATION_PROVIDER_KEY,
@@ -30,12 +35,37 @@ from overnight_quant.data.tencent_direct_http_providers import (
     TencentProviderContractError,
 )
 from overnight_quant.scripts import run_tencent_provider_validation as validation
+from overnight_quant.scripts import (
+    run_tencent_provider_evidence_verify as evidence_verify,
+)
 
 
 CODES = ("000001", "000333", "600000", "600519", "601318")
 SOURCE_TIME = "20260825143000"
 OBSERVED_AT = datetime(2026, 8, 25, 14, 30, 1, tzinfo=CN_TZ)
 AVAILABLE_AT = datetime(2026, 8, 25, 14, 30, 2, tzinfo=CN_TZ)
+
+
+def _concurrent_validation_writer(
+    target,
+    cache_root,
+    payload,
+    start_event,
+    result_queue,
+):
+    from overnight_quant.scripts import (
+        run_tencent_provider_validation as child_validation,
+    )
+
+    child_validation.CACHE_ROOT = Path(cache_root).resolve()
+    start_event.wait(10)
+    try:
+        child_validation.write_validation_json_atomic(target, payload)
+        result_queue.put(("written", ""))
+    except FileExistsError:
+        result_queue.put(("exists", ""))
+    except Exception as exc:
+        result_queue.put(("error", type(exc).__name__))
 
 
 class FakeTransport:
@@ -170,23 +200,60 @@ def _assert_safe(result):
     assert result["orders"] == []
 
 
+def _generate_success_evidence(monkeypatch, tmp_path, name="success.json"):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    output = tmp_path / name
+    transport = FakeTransport(_response_bytes())
+    result = validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=transport,
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+            AVAILABLE_AT + timedelta(seconds=3),
+        ),
+    )
+    return output, result, transport
+
+
+def _resign_evidence(payload):
+    material = deepcopy(payload)
+    material.pop("evidence_hash", None)
+    payload["evidence_hash"] = stable_hash(material)
+
+
+def _write_json(path, payload):
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _replace_raw_response(payload, capability, raw_response):
+    raw_entry = payload["raw_responses"][capability]
+    raw_entry["content_base64"] = base64.b64encode(raw_response).decode("ascii")
+    raw_entry["byte_count"] = len(raw_response)
+    raw_entry["raw_hash"] = hashlib.sha256(raw_response).hexdigest()
+
+
 def _candidate_test_binding(capability, provider_key):
-    # This mapping is deliberately non-registerable: it preserves the fact
-    # that a legacy provider still exists. B2.2b must model both keys before a
-    # production binding can be represented.
-    return {
-        "capability": capability,
-        "origin_source": TENCENT_ORIGIN_SOURCE,
-        "adapter": TENCENT_ADAPTER,
-        "source_version": TENCENT_SOURCE_VERSION,
-        "provider_key": provider_key,
-        "implementation_status": "bound",
-        "legacy_implementation_present": True,
-    }
+    return SourceAdapterBinding(
+        capability=capability,
+        origin_source=TENCENT_ORIGIN_SOURCE,
+        adapter=TENCENT_ADAPTER,
+        source_version=TENCENT_SOURCE_VERSION,
+        provider_key=provider_key,
+        implementation_status="bound",
+        legacy_implementation_present=False,
+    )
 
 
 def _execute_candidate_test_only(capability, provider_key, provider_callable):
-    return adapters._execute_source_adapter_core(
+    return adapters._execute_source_adapter_with_bindings_for_test(
         capability,
         origin_source=TENCENT_ORIGIN_SOURCE,
         adapter=TENCENT_ADAPTER,
@@ -195,9 +262,8 @@ def _execute_candidate_test_only(capability, provider_key, provider_callable):
             provider_key=provider_key,
             provider_callable=provider_callable,
         ),
+        entries=[_candidate_test_binding(capability, provider_key)],
         environ={},
-        bindings=[_candidate_test_binding(capability, provider_key)],
-        test_only=True,
     )
 
 
@@ -469,6 +535,7 @@ def test_candidates_pass_private_test_only_execution_without_production_binding(
 
     assert result["status"] == SOURCE_ADAPTER_BOUND
     assert result["test_only"] is True
+    assert result["binding"]["legacy_implementation_present"] is False
     assert result["selection_registry_scope"] == "test_only"
     assert (
         result["selection_adapter_registry_hash"]
@@ -563,7 +630,12 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
     )
 
     assert result["status"] == "TENCENT_PROVIDER_NETWORK_VALIDATED"
+    assert (
+        result["evidence_schema_version"]
+        == TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
+    )
     assert result["network_requests_made"] == 2
+    assert result["upstream_network_activity"] == "measured"
     assert result["capability_results"]["quote"]["record_count"] == 5
     assert result["capability_results"]["valuation"]["record_count"] == 5
     assert all(
@@ -574,8 +646,19 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
     assert not raw.startswith((b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf"))
     stored = json.loads(raw.decode("utf-8"))
     assert stored["evidence_hash"] == result["evidence_hash"]
+    assert set(stored["raw_responses"]) == {"quote", "valuation"}
+    for capability, raw_entry in stored["raw_responses"].items():
+        decoded = base64.b64decode(raw_entry["content_base64"], validate=True)
+        assert raw_entry["capability"] == capability
+        assert raw_entry["byte_count"] == len(decoded)
+        assert raw_entry["raw_hash"] == hashlib.sha256(decoded).hexdigest()
+    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["stored_evidence_hash"] == result["evidence_hash"]
+    assert verified["recomputed_evidence_hash"] == result["evidence_hash"]
     _assert_safe(result)
     _assert_safe(stored)
+    _assert_safe(verified)
 
 
 def test_existing_validation_output_rejects_before_network(monkeypatch, tmp_path):
@@ -595,3 +678,181 @@ def test_existing_validation_output_rejects_before_network(monkeypatch, tmp_path
 
     assert transport.request_count == 0
     assert output.read_bytes() == original
+
+
+def test_evidence_verifier_replay_is_deterministic_and_preserves_original(
+    monkeypatch,
+    tmp_path,
+):
+    evidence, generated, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+    )
+    original = evidence.read_bytes()
+    original_hash = hashlib.sha256(original).hexdigest()
+    replay_a = tmp_path / "replay_a.json"
+    replay_b = tmp_path / "replay_b.json"
+
+    first = evidence_verify.verify_tencent_provider_evidence(evidence)
+    second = evidence_verify.verify_tencent_provider_evidence(evidence)
+    assert first == second
+    assert first["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert first["stored_evidence_hash"] == generated["evidence_hash"]
+    assert evidence_verify.main(
+        [str(evidence), "--output", str(replay_a)]
+    ) == 0
+    assert evidence_verify.main(
+        [str(evidence), "--output", str(replay_b)]
+    ) == 0
+
+    assert replay_a.read_bytes() == replay_b.read_bytes()
+    assert hashlib.sha256(evidence.read_bytes()).hexdigest() == original_hash
+    assert evidence.read_bytes() == original
+    _assert_safe(first)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "raw_hash",
+        "field_count",
+        "coverage",
+        "capability",
+        "origin_source",
+        "safety_output",
+        "network_request_count",
+    ],
+)
+def test_evidence_verifier_rejects_resigned_contract_tampering(
+    monkeypatch,
+    tmp_path,
+    tamper,
+):
+    evidence, _generated, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name=f"tamper_{tamper}.json",
+    )
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    if tamper == "raw_hash":
+        payload["raw_responses"]["quote"]["raw_hash"] = "f" * 64
+    elif tamper == "field_count":
+        rows = [
+            _line(code, _values(code)[:-1] if code == CODES[0] else None)
+            for code in CODES
+        ]
+        _replace_raw_response(
+            payload,
+            "quote",
+            _response_bytes(rows=rows),
+        )
+    elif tamper == "coverage":
+        _replace_raw_response(
+            payload,
+            "quote",
+            _response_bytes(codes=CODES[:-1]),
+        )
+    elif tamper == "capability":
+        payload["records_by_capability"]["quote"][0][
+            "capability"
+        ] = "valuation"
+    elif tamper == "origin_source":
+        payload["records_by_capability"]["quote"][0][
+            "origin_source"
+        ] = "eastmoney"
+    elif tamper == "safety_output":
+        payload["data_ready"] = True
+    elif tamper == "network_request_count":
+        payload["network_requests_made"] = 0
+    _resign_evidence(payload)
+    _write_json(evidence, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_INVALID
+    assert verified["execution_ok"] is False
+    _assert_safe(verified)
+
+
+def test_legacy_evidence_is_audit_only_and_not_promoted(monkeypatch, tmp_path):
+    evidence, _generated, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name="legacy.json",
+    )
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    payload.pop("evidence_schema_version")
+    payload.pop("raw_responses")
+    payload.pop("upstream_network_activity")
+    _resign_evidence(payload)
+    _write_json(evidence, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_LEGACY_AUDIT_ONLY
+    assert verified["replay_hash"] == ""
+    _assert_safe(verified)
+
+
+def test_unmeasured_provider_activity_is_unknown_never_zero(monkeypatch, tmp_path):
+    class UnmeasuredTransport:
+        def __init__(self):
+            self.delegate = FakeTransport(_response_bytes())
+
+        def request(self, *args, **kwargs):
+            return self.delegate.request(*args, **kwargs)
+
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    transport = UnmeasuredTransport()
+    result = validation.run_tencent_provider_validation(
+        network=True,
+        output=tmp_path / "unknown_network_count.json",
+        transport=transport,
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+            AVAILABLE_AT + timedelta(seconds=3),
+        ),
+    )
+
+    assert transport.delegate.request_count == 2
+    assert result["network_requests_made"] is None
+    assert result["upstream_network_activity"] == "unknown"
+    _assert_safe(result)
+
+
+def test_validation_writer_allows_exactly_one_cross_process_winner(tmp_path):
+    target = tmp_path / "concurrent.json"
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_validation_writer,
+            args=(
+                str(target),
+                str(tmp_path),
+                {"writer": writer},
+                start_event,
+                result_queue,
+            ),
+        )
+        for writer in (1, 2)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+
+    outcomes = [result_queue.get(timeout=5) for _ in processes]
+    assert [status for status, _detail in outcomes].count("written") == 1
+    assert [status for status, _detail in outcomes].count("exists") == 1
+    assert not [item for item in outcomes if item[0] == "error"]
+    winning_bytes = target.read_bytes()
+    winning_hash = hashlib.sha256(winning_bytes).hexdigest()
+    assert json.loads(winning_bytes.decode("utf-8"))["writer"] in {1, 2}
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == winning_hash
+    assert not list(tmp_path.glob("concurrent.json.*.tmp"))

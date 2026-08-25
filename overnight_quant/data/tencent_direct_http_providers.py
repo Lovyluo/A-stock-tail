@@ -21,6 +21,9 @@ TENCENT_ADAPTER = "direct_http"
 TENCENT_SOURCE_VERSION = "qt.gtimg.cn~88_fields_v2026-07-30"
 TENCENT_RESPONSE_ENCODING = "gbk"
 TENCENT_EXPECTED_FIELD_COUNT = 88
+TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION = (
+    "tencent_provider_network_evidence_v2"
+)
 
 TENCENT_QUOTE_PROVIDER_KEY = (
     "tencent_direct_http_providers.TencentDirectHttpProviders."
@@ -51,6 +54,18 @@ class TencentHttpResponse:
     content: bytes
     status_code: int
     url: str
+
+
+@dataclass(frozen=True)
+class TencentProviderBatch:
+    capability: str
+    records: tuple[dict[str, Any], ...]
+    request_url: str
+    request_hash: str
+    raw_response_bytes: bytes
+    raw_hash: str
+    observed_at: str
+    available_at: str
 
 
 class TencentTransport(Protocol):
@@ -127,8 +142,11 @@ class TencentDirectHttpProviders:
         self.timeout_seconds = timeout
 
     def collect_quote_records(self) -> list[dict[str, Any]]:
+        return list(self.collect_quote_batch().records)
+
+    def collect_quote_batch(self) -> TencentProviderBatch:
         response_rows, context = self._fetch()
-        return [
+        records = [
             _build_record(
                 capability="quote",
                 event_time=event_time,
@@ -137,10 +155,14 @@ class TencentDirectHttpProviders:
             )
             for code, values, event_time in response_rows
         ]
+        return _build_batch("quote", records, context)
 
     def collect_valuation_records(self) -> list[dict[str, Any]]:
+        return list(self.collect_valuation_batch().records)
+
+    def collect_valuation_batch(self) -> TencentProviderBatch:
         response_rows, context = self._fetch()
-        return [
+        records = [
             _build_record(
                 capability="valuation",
                 event_time=event_time,
@@ -149,6 +171,7 @@ class TencentDirectHttpProviders:
             )
             for code, values, event_time in response_rows
         ]
+        return _build_batch("valuation", records, context)
 
     def _fetch(
         self,
@@ -156,15 +179,8 @@ class TencentDirectHttpProviders:
         list[tuple[str, list[str], datetime]],
         dict[str, Any],
     ]:
-        symbols = [_tencent_symbol(code) for code in self.codes]
-        request_material = {
-            "method": "GET",
-            "endpoint": TENCENT_QUOTE_ENDPOINT,
-            "params": {"q": symbols},
-            "response_encoding": TENCENT_RESPONSE_ENCODING,
-        }
-        request_hash = stable_hash(request_material)
-        request_url = TENCENT_QUOTE_ENDPOINT + ",".join(symbols)
+        request_hash = compute_tencent_request_hash(self.codes)
+        request_url = build_tencent_request_url(self.codes)
         observed_at = _clock_now(self.clock)
         try:
             response = self.transport.request(
@@ -191,16 +207,7 @@ class TencentDirectHttpProviders:
         if not isinstance(raw_content, bytes) or not raw_content:
             raise TencentProviderContractError("TENCENT_RESPONSE_EMPTY")
         raw_hash = hashlib.sha256(raw_content).hexdigest()
-        try:
-            text = raw_content.decode(
-                TENCENT_RESPONSE_ENCODING,
-                errors="strict",
-            )
-        except UnicodeDecodeError as exc:
-            raise TencentProviderContractError(
-                "TENCENT_RESPONSE_GBK_INVALID"
-            ) from exc
-        rows = _parse_response_rows(text, self.codes)
+        rows = parse_tencent_response_bytes(raw_content, self.codes)
         for _code, _values, event_time in rows:
             if event_time > observed_at:
                 raise TencentProviderContractError(
@@ -211,8 +218,27 @@ class TencentDirectHttpProviders:
             "available_at": available_at,
             "request_hash": request_hash,
             "raw_hash": raw_hash,
+            "request_url": request_url,
+            "raw_response_bytes": raw_content,
         }
         return rows, context
+
+
+def _build_batch(
+    capability: str,
+    records: list[dict[str, Any]],
+    context: Mapping[str, Any],
+) -> TencentProviderBatch:
+    return TencentProviderBatch(
+        capability=capability,
+        records=tuple(records),
+        request_url=str(context["request_url"]),
+        request_hash=str(context["request_hash"]),
+        raw_response_bytes=bytes(context["raw_response_bytes"]),
+        raw_hash=str(context["raw_hash"]),
+        observed_at=context["observed_at"].isoformat(timespec="microseconds"),
+        available_at=context["available_at"].isoformat(timespec="microseconds"),
+    )
 
 
 def _build_record(
@@ -326,6 +352,57 @@ def _valuation_payload(code: str, values: list[str]) -> dict[str, Any]:
             "amplitude_pct": "percent",
         },
     }
+
+
+def build_tencent_payload(
+    capability: str,
+    code: str,
+    values: list[str],
+) -> dict[str, Any]:
+    if capability == "quote":
+        return _quote_payload(code, values)
+    if capability == "valuation":
+        return _valuation_payload(code, values)
+    raise TencentProviderContractError("TENCENT_CAPABILITY_INVALID")
+
+
+def build_tencent_request_url(codes: Iterable[str]) -> str:
+    normalized = _normalize_request_codes(codes)
+    return TENCENT_QUOTE_ENDPOINT + ",".join(
+        _tencent_symbol(code) for code in normalized
+    )
+
+
+def compute_tencent_request_hash(codes: Iterable[str]) -> str:
+    normalized = _normalize_request_codes(codes)
+    symbols = [_tencent_symbol(code) for code in normalized]
+    return stable_hash(
+        {
+            "method": "GET",
+            "endpoint": TENCENT_QUOTE_ENDPOINT,
+            "params": {"q": symbols},
+            "response_encoding": TENCENT_RESPONSE_ENCODING,
+        }
+    )
+
+
+def parse_tencent_response_bytes(
+    raw_content: bytes,
+    requested_codes: Iterable[str],
+) -> list[tuple[str, list[str], datetime]]:
+    normalized = _normalize_request_codes(requested_codes)
+    if not isinstance(raw_content, bytes) or not raw_content:
+        raise TencentProviderContractError("TENCENT_RESPONSE_EMPTY")
+    try:
+        text = raw_content.decode(
+            TENCENT_RESPONSE_ENCODING,
+            errors="strict",
+        )
+    except UnicodeDecodeError as exc:
+        raise TencentProviderContractError(
+            "TENCENT_RESPONSE_GBK_INVALID"
+        ) from exc
+    return _parse_response_rows(text, normalized)
 
 
 def _parse_response_rows(
@@ -512,10 +589,16 @@ __all__ = [
     "TENCENT_ORIGIN_SOURCE",
     "TENCENT_QUOTE_ENDPOINT",
     "TENCENT_QUOTE_PROVIDER_KEY",
+    "TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION",
     "TENCENT_SOURCE_VERSION",
     "TENCENT_VALUATION_PROVIDER_KEY",
     "TencentDirectHttpProviders",
     "TencentHttpResponse",
+    "TencentProviderBatch",
     "TencentProviderContractError",
     "TencentUrllibTransport",
+    "build_tencent_payload",
+    "build_tencent_request_url",
+    "compute_tencent_request_hash",
+    "parse_tencent_response_bytes",
 ]

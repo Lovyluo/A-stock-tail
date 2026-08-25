@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime
 import json
 import os
@@ -23,6 +24,7 @@ from overnight_quant.data.source_capability_registry import (
 from overnight_quant.data.tencent_direct_http_providers import (
     TENCENT_QUOTE_ENDPOINT,
     TENCENT_QUOTE_PROVIDER_KEY,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION,
     TENCENT_VALUATION_PROVIDER_KEY,
     TencentDirectHttpProviders,
     TencentProviderContractError,
@@ -50,6 +52,9 @@ def run_tencent_provider_validation(
                 "status": "TENCENT_PROVIDER_NETWORK_NOT_REQUESTED",
                 "execution_ok": True,
                 "network_mode": False,
+                "evidence_schema_version": (
+                    TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
+                ),
                 "endpoint": TENCENT_QUOTE_ENDPOINT,
                 "requested_codes": sorted(requested_codes),
                 "provider_keys": {
@@ -57,6 +62,7 @@ def run_tencent_provider_validation(
                     "valuation": TENCENT_VALUATION_PROVIDER_KEY,
                 },
                 "network_requests_made": 0,
+                "upstream_network_activity": "not_requested",
                 "evidence_hash": "",
             }
         )
@@ -66,8 +72,12 @@ def run_tencent_provider_validation(
                 "status": "TENCENT_PROVIDER_NETWORK_REQUEST_INVALID",
                 "execution_ok": False,
                 "network_mode": True,
+                "evidence_schema_version": (
+                    TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
+                ),
                 "reason": "ignored_cache_output_required",
                 "network_requests_made": 0,
+                "upstream_network_activity": "not_started",
                 "evidence_hash": "",
             }
         )
@@ -85,14 +95,16 @@ def run_tencent_provider_validation(
     )
     capability_results: dict[str, dict[str, Any]] = {}
     records_by_capability: dict[str, list[dict[str, Any]]] = {}
+    raw_responses: dict[str, dict[str, Any]] = {}
     methods = {
-        "quote": provider.collect_quote_records,
-        "valuation": provider.collect_valuation_records,
+        "quote": provider.collect_quote_batch,
+        "valuation": provider.collect_valuation_batch,
     }
     for capability, method in methods.items():
         started = perf_counter()
         try:
-            records = method()
+            batch = method()
+            records = list(batch.records)
             provenance = validate_source_provenance_batch(
                 capability,
                 records,
@@ -137,6 +149,19 @@ def run_tencent_provider_validation(
                 "provenance_status": provenance["status"],
             }
             records_by_capability[capability] = records
+            raw_responses[capability] = {
+                "capability": capability,
+                "encoding": "base64",
+                "content_base64": base64.b64encode(
+                    batch.raw_response_bytes
+                ).decode("ascii"),
+                "byte_count": len(batch.raw_response_bytes),
+                "request_url": batch.request_url,
+                "request_hash": batch.request_hash,
+                "raw_hash": batch.raw_hash,
+                "observed_at": batch.observed_at,
+                "available_at": batch.available_at,
+            }
         except TencentProviderContractError as exc:
             capability_results[capability] = {
                 "status": "TENCENT_PROVIDER_CAPABILITY_FAILED",
@@ -153,8 +178,17 @@ def run_tencent_provider_validation(
         for result in capability_results.values()
     )
     request_count = getattr(active_transport, "request_count", None)
+    if isinstance(request_count, int) and request_count >= 0:
+        measured_request_count: int | None = request_count
+        upstream_network_activity = "measured"
+    else:
+        measured_request_count = None
+        upstream_network_activity = "unknown"
     result = _safe_result(
         {
+            "evidence_schema_version": (
+                TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
+            ),
             "status": (
                 "TENCENT_PROVIDER_NETWORK_VALIDATED"
                 if validated
@@ -170,9 +204,9 @@ def run_tencent_provider_validation(
             },
             "capability_results": capability_results,
             "records_by_capability": records_by_capability,
-            "network_requests_made": (
-                int(request_count) if isinstance(request_count, int) else None
-            ),
+            "raw_responses": raw_responses,
+            "network_requests_made": measured_request_count,
+            "upstream_network_activity": upstream_network_activity,
         }
     )
     result["evidence_hash"] = stable_hash(result)
@@ -247,8 +281,10 @@ def _cli_summary(result: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "status",
             "execution_ok",
+            "evidence_schema_version",
             "network_mode",
             "network_requests_made",
+            "upstream_network_activity",
             "requested_codes",
             "provider_keys",
             "capability_results",
@@ -306,9 +342,15 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "status": "TENCENT_PROVIDER_NETWORK_VALIDATION_FAILED",
                 "execution_ok": False,
+                "evidence_schema_version": (
+                    TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
+                ),
                 "network_mode": bool(args.network),
                 "error_code": error_code,
-                "network_requests_made": 0,
+                "network_requests_made": None if args.network else 0,
+                "upstream_network_activity": (
+                    "unknown" if args.network else "not_started"
+                ),
                 "evidence_hash": "",
             }
         )
