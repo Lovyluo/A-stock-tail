@@ -690,6 +690,39 @@ def _execute_source_adapter_core(
             test_only=test_only,
         )
 
+    record_capability_errors = []
+    for index, record in enumerate(records):
+        record_capability = record.get("capability")
+        if record_capability is None or record_capability == "":
+            record_capability_errors.append(
+                {
+                    "index": index,
+                    "reason": "source_adapter_record_capability_missing",
+                }
+            )
+        elif record_capability != capability:
+            record_capability_errors.append(
+                {
+                    "index": index,
+                    "reason": "source_adapter_record_capability_mismatch",
+                    "actual_capability": record_capability,
+                    "expected_capability": capability,
+                }
+            )
+    if record_capability_errors:
+        return output(
+            SOURCE_ADAPTER_PROVENANCE_REJECTED,
+            execution_ok=True,
+            provider_called=True,
+            capability=capability,
+            requested_identity=list(requested),
+            record_count=len(records),
+            binding=binding,
+            rejection_reasons=record_capability_errors,
+            route_status=route["status"],
+            test_only=test_only,
+        )
+
     provenance = validate_source_provenance_batch(
         capability,
         records,
