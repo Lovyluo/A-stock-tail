@@ -623,13 +623,22 @@ def route_source_capability(
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    registry = get_source_capability_registry()
+    if type(require_hard_gate) is not bool:
+        return _route_request_invalid_output(
+            capability,
+            origin_source=origin_source,
+            adapter=adapter,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     return _route_source_capability_core(
         capability,
         origin_source=origin_source,
         adapter=adapter,
         require_hard_gate=require_hard_gate,
         environ=environ,
-        registry=get_source_capability_registry(),
+        registry=registry,
         allow_hard_gate_authorization=True,
     )
 
@@ -643,13 +652,22 @@ def _route_source_capability_with_registry(
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    registry = canonicalize_source_capabilities(entries)
+    if type(require_hard_gate) is not bool:
+        return _route_request_invalid_output(
+            capability,
+            origin_source=origin_source,
+            adapter=adapter,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     return _route_source_capability_core(
         capability,
         origin_source=origin_source,
         adapter=adapter,
         require_hard_gate=require_hard_gate,
         environ=environ,
-        registry=canonicalize_source_capabilities(entries),
+        registry=registry,
         allow_hard_gate_authorization=False,
     )
 
@@ -664,6 +682,14 @@ def _route_source_capability_core(
     registry: list[dict[str, Any]],
     allow_hard_gate_authorization: bool,
 ) -> dict[str, Any]:
+    if type(require_hard_gate) is not bool:
+        return _route_request_invalid_output(
+            capability,
+            origin_source=origin_source,
+            adapter=adapter,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     environment = os.environ if environ is None else environ
     requested_capability = _normalize_identifier(capability)
     requested_source = _normalize_identifier(origin_source)
@@ -796,12 +822,19 @@ def validate_source_provenance_batch(
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    registry = get_source_capability_registry()
+    if type(require_hard_gate) is not bool:
+        return _provenance_request_invalid_output(
+            capability,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     return _validate_source_provenance_batch_core(
         capability,
         records,
         require_hard_gate=require_hard_gate,
         environ=environ,
-        registry=get_source_capability_registry(),
+        registry=registry,
         allow_hard_gate_authorization=True,
     )
 
@@ -814,12 +847,19 @@ def _validate_source_provenance_batch_with_registry(
     require_hard_gate: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    registry = canonicalize_source_capabilities(entries)
+    if type(require_hard_gate) is not bool:
+        return _provenance_request_invalid_output(
+            capability,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     return _validate_source_provenance_batch_core(
         capability,
         records,
         require_hard_gate=require_hard_gate,
         environ=environ,
-        registry=canonicalize_source_capabilities(entries),
+        registry=registry,
         allow_hard_gate_authorization=False,
     )
 
@@ -833,6 +873,12 @@ def _validate_source_provenance_batch_core(
     registry: list[dict[str, Any]],
     allow_hard_gate_authorization: bool,
 ) -> dict[str, Any]:
+    if type(require_hard_gate) is not bool:
+        return _provenance_request_invalid_output(
+            capability,
+            received_value=require_hard_gate,
+            registry=registry,
+        )
     requested_capability = _normalize_identifier(capability)
     rows = [dict(row) for row in records]
     known_capabilities = {row["capability"] for row in registry}
@@ -1117,6 +1163,28 @@ def _provenance_output(
     return _safe_output(result)
 
 
+def _provenance_request_invalid_output(
+    capability: str,
+    *,
+    received_value: Any,
+    registry: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _provenance_output(
+        {
+            "status": "PROVENANCE_REQUEST_INVALID",
+            "execution_ok": False,
+            "capability": _normalize_identifier(capability),
+            "record_count": 0,
+            "records_evaluated": 0,
+            "invalid_fields": ["require_hard_gate"],
+            "received_type": type(received_value).__name__,
+            "selected_source": None,
+            "provenance": None,
+        },
+        registry,
+    )
+
+
 def _source_runtime_status(
     row: Mapping[str, Any],
     environ: Mapping[str, str],
@@ -1230,6 +1298,36 @@ def _route_rejection_output(
             "selected_source": None,
             "considered_sources": [],
             "rejection_reasons": sorted(set(reasons)),
+            "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+            "registry_hash": compute_source_capability_registry_hash(registry),
+            "source_count": 0,
+        }
+    )
+
+
+def _route_request_invalid_output(
+    capability: str,
+    *,
+    origin_source: str,
+    adapter: str,
+    received_value: Any,
+    registry: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _safe_output(
+        {
+            "status": "SOURCE_ROUTE_REQUEST_INVALID",
+            "execution_ok": False,
+            "capability": _normalize_identifier(capability),
+            "requested_origin_source": _normalize_identifier(origin_source),
+            "requested_adapter": _normalize_identifier(adapter),
+            "require_hard_gate": None,
+            "invalid_fields": ["require_hard_gate"],
+            "received_type": type(received_value).__name__,
+            "hard_gate_authorized": False,
+            "selected_source": None,
+            "provenance": None,
+            "considered_sources": [],
+            "rejection_reasons": ["require_hard_gate_must_be_bool"],
             "registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "registry_hash": compute_source_capability_registry_hash(registry),
             "source_count": 0,

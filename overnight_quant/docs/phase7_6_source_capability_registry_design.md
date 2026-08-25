@@ -94,6 +94,12 @@ hard gate。
 构造自定义来源，只能调用模块私有辅助函数；该路径即使选择成功也固定返回
 `hard_gate_authorized=false`。
 
+`require_hard_gate` 是安全控制参数，只接受 Python 严格布尔值，即
+`type(require_hard_gate) is bool`。字符串 `"true"`、`"false"`、整数 `0/1`、`None`
+及容器值不会被隐式转换：路由返回 `SOURCE_ROUTE_REQUEST_INVALID`，追溯返回
+`PROVENANCE_REQUEST_INVALID`，并在进入来源资格判断前保持失效关闭。公开入口、私有
+测试入口和内部 core 均执行同一防御性检查。
+
 路由成功只表示静态政策允许使用该来源，不表示实际数据已到达或可用于交易决策。
 因此 B1 中 `data_ready` 始终为 `false`。
 

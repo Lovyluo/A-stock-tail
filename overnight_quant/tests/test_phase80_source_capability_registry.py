@@ -57,6 +57,15 @@ VALID_ANNOUNCEMENT_RECORD = {
     "request_hash": "a" * 64,
     "raw_hash": "b" * 64,
 }
+INVALID_HARD_GATE_VALUES = (
+    pytest.param("false", id="string-false"),
+    pytest.param("true", id="string-true"),
+    pytest.param(0, id="integer-zero"),
+    pytest.param(1, id="integer-one"),
+    pytest.param(None, id="none"),
+    pytest.param([], id="list"),
+    pytest.param({}, id="mapping"),
+)
 
 
 def test_registry_order_does_not_change_hash():
@@ -232,6 +241,133 @@ def test_private_custom_registry_helpers_never_authorize_hard_gate():
     assert route["hard_gate_authorized"] is False
     assert provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
     assert provenance["hard_gate_authorized"] is False
+    _assert_safe(route)
+    _assert_safe(provenance)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_public_route_rejects_non_boolean_hard_gate_before_routing(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+
+    result = route_source_capability(
+        "quote",
+        require_hard_gate=invalid_value,
+    )
+
+    _assert_invalid_route_request(result)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_public_provenance_rejects_non_boolean_hard_gate_before_routing(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+
+    result = validate_source_provenance_batch(
+        "announcement",
+        [VALID_ANNOUNCEMENT_RECORD],
+        require_hard_gate=invalid_value,
+    )
+
+    _assert_invalid_provenance_request(result)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_private_route_rejects_non_boolean_hard_gate_before_routing(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+
+    result = registry_module._route_source_capability_with_registry(
+        "quote",
+        entries=get_source_capability_registry(),
+        require_hard_gate=invalid_value,
+    )
+
+    _assert_invalid_route_request(result)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_private_provenance_rejects_non_boolean_hard_gate_before_routing(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+
+    result = registry_module._validate_source_provenance_batch_with_registry(
+        "announcement",
+        [VALID_ANNOUNCEMENT_RECORD],
+        entries=get_source_capability_registry(),
+        require_hard_gate=invalid_value,
+    )
+
+    _assert_invalid_provenance_request(result)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_route_core_defensively_rejects_non_boolean_hard_gate(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+    registry = get_source_capability_registry()
+
+    result = registry_module._route_source_capability_core(
+        "quote",
+        origin_source="tencent",
+        adapter="direct_http",
+        require_hard_gate=invalid_value,
+        environ={},
+        registry=registry,
+        allow_hard_gate_authorization=True,
+    )
+
+    _assert_invalid_route_request(result)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_HARD_GATE_VALUES)
+def test_provenance_core_defensively_rejects_non_boolean_hard_gate(
+    monkeypatch,
+    invalid_value,
+):
+    _fail_if_routing_rejection_is_called(monkeypatch)
+    registry = get_source_capability_registry()
+
+    result = registry_module._validate_source_provenance_batch_core(
+        "announcement",
+        [VALID_ANNOUNCEMENT_RECORD],
+        require_hard_gate=invalid_value,
+        environ={},
+        registry=registry,
+        allow_hard_gate_authorization=True,
+    )
+
+    _assert_invalid_provenance_request(result)
+
+
+@pytest.mark.parametrize("require_hard_gate", [False, True])
+def test_valid_boolean_hard_gate_behavior_remains_unchanged(require_hard_gate):
+    route = route_source_capability(
+        "announcement",
+        origin_source="cninfo",
+        adapter="direct_http",
+        require_hard_gate=require_hard_gate,
+    )
+    provenance = validate_source_provenance_batch(
+        "announcement",
+        [VALID_ANNOUNCEMENT_RECORD],
+        require_hard_gate=require_hard_gate,
+    )
+
+    assert route["status"] == "SOURCE_ROUTE_SELECTED"
+    assert provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
+    assert route["hard_gate_authorized"] is require_hard_gate
+    assert provenance["hard_gate_authorized"] is require_hard_gate
     _assert_safe(route)
     _assert_safe(provenance)
 
@@ -701,3 +837,31 @@ def _assert_provenance_registry_contract(result):
     assert result["registry_hash"] == (
         "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
     )
+
+
+def _fail_if_routing_rejection_is_called(monkeypatch):
+    def fail(*args, **kwargs):
+        pytest.fail("invalid require_hard_gate reached _routing_rejection")
+
+    monkeypatch.setattr(registry_module, "_routing_rejection", fail)
+
+
+def _assert_invalid_route_request(result):
+    assert result["status"] == "SOURCE_ROUTE_REQUEST_INVALID"
+    assert result["execution_ok"] is False
+    assert result["hard_gate_authorized"] is False
+    assert result["selected_source"] is None
+    assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
+    assert result["registry_hash"] == (
+        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+    )
+    _assert_safe(result)
+
+
+def _assert_invalid_provenance_request(result):
+    assert result["status"] == "PROVENANCE_REQUEST_INVALID"
+    assert result["execution_ok"] is False
+    assert result["hard_gate_authorized"] is False
+    assert result["provenance"] is None
+    _assert_provenance_registry_contract(result)
+    _assert_safe(result)
