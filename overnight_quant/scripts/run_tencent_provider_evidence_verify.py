@@ -8,6 +8,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
+import subprocess
 import sys
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -19,6 +21,8 @@ if str(ROOT) not in sys.path:
 
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_registry import (
+    REGISTRY_SCHEMA_VERSION,
+    compute_source_capability_registry_hash,
     validate_source_provenance_batch,
 )
 from overnight_quant.data.tencent_direct_http_providers import (
@@ -26,6 +30,7 @@ from overnight_quant.data.tencent_direct_http_providers import (
     TENCENT_ORIGIN_SOURCE,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4,
     TENCENT_QUOTE_ENDPOINT,
     TENCENT_QUOTE_PROVIDER_KEY,
     TENCENT_SOURCE_VERSION,
@@ -34,6 +39,7 @@ from overnight_quant.data.tencent_direct_http_providers import (
     build_tencent_payload,
     build_tencent_request_url,
     compute_tencent_request_hash,
+    compute_tencent_provider_verifier_contract_hash,
     parse_tencent_response_bytes,
 )
 from overnight_quant.scripts.run_tencent_provider_validation import (
@@ -45,6 +51,9 @@ EVIDENCE_VERIFIED = "TENCENT_PROVIDER_EVIDENCE_VERIFIED"
 EVIDENCE_INVALID = "TENCENT_PROVIDER_EVIDENCE_INVALID"
 EVIDENCE_LEGACY_AUDIT_ONLY = (
     "TENCENT_PROVIDER_EVIDENCE_LEGACY_AUDIT_ONLY"
+)
+PROVENANCE_CONTRACT_VERSION_MISMATCH = (
+    "PROVENANCE_CONTRACT_VERSION_MISMATCH"
 )
 EXPECTED_CODES = ("000001", "000333", "600000", "600519", "601318")
 EXPECTED_CAPABILITIES = ("quote", "valuation")
@@ -76,6 +85,12 @@ V3_TOP_LEVEL_KEYS = {
     "status",
     "tickets",
     "upstream_network_activity",
+}
+V4_TOP_LEVEL_KEYS = V3_TOP_LEVEL_KEYS | {
+    "producer_commit_sha",
+    "provider_verifier_contract_hash",
+    "provenance_contract",
+    "provenance_results",
 }
 V1_TOP_LEVEL_KEYS = {
     "automatic_configuration_change",
@@ -191,13 +206,24 @@ class TencentEvidenceVerificationError(ValueError):
         super().__init__(self.code)
 
 
-def verify_tencent_provider_evidence(path: str | Path) -> dict[str, Any]:
+def verify_tencent_provider_evidence(
+    path: str | Path,
+    *,
+    expected_file_sha256: str | None = None,
+) -> dict[str, Any]:
     evidence_path = Path(path).resolve()
     try:
         raw_file = evidence_path.read_bytes()
     except OSError:
         return _invalid("TENCENT_EVIDENCE_FILE_UNREADABLE")
     file_hash = hashlib.sha256(raw_file).hexdigest()
+    if expected_file_sha256 is not None:
+        expected_hash = str(expected_file_sha256).strip().lower()
+        if not _is_sha256(expected_hash) or expected_hash != file_hash:
+            return _invalid(
+                "TENCENT_EVIDENCE_EXTERNAL_ANCHOR_MISMATCH",
+                file_hash,
+            )
     if raw_file.startswith(b"\xef\xbb\xbf"):
         return _invalid("TENCENT_EVIDENCE_UTF8_BOM_FORBIDDEN", file_hash)
     try:
@@ -269,11 +295,60 @@ def verify_tencent_provider_evidence(path: str | Path) -> dict[str, Any]:
                     ),
                 }
             )
+        if schema_version == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4:
+            if expected_file_sha256 is None:
+                return _invalid(
+                    "TENCENT_EVIDENCE_EXTERNAL_ANCHOR_REQUIRED",
+                    file_hash,
+                )
+            provider_passed, replay_material = _verify_v4(payload)
+            return _safe_result(
+                {
+                    "status": EVIDENCE_VERIFIED,
+                    "execution_ok": True,
+                    "evidence_schema_version": (
+                        TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4
+                    ),
+                    "evidence_integrity_verified": True,
+                    "external_anchor_verified": True,
+                    "provider_validation_passed": provider_passed,
+                    "file_sha256": file_hash,
+                    "producer_commit_sha": payload["producer_commit_sha"],
+                    "provider_verifier_contract_hash": payload[
+                        "provider_verifier_contract_hash"
+                    ],
+                    "stored_evidence_hash": payload["evidence_hash"],
+                    "recomputed_evidence_hash": (
+                        _recompute_evidence_hash(payload)
+                    ),
+                    "replay_hash": stable_hash(replay_material),
+                    "verified_capabilities": sorted(
+                        capability
+                        for capability, outcome in replay_material[
+                            "capability_outcomes"
+                        ].items()
+                        if outcome["status"] == "validated"
+                    ),
+                    "evaluated_capabilities": list(EXPECTED_CAPABILITIES),
+                    "covered_codes": replay_material["covered_codes"],
+                    "failure_reason_verification": replay_material[
+                        "failure_reason_verification"
+                    ],
+                    "network_requests_made": payload.get(
+                        "network_requests_made"
+                    ),
+                    "upstream_network_activity": payload.get(
+                        "upstream_network_activity"
+                    ),
+                }
+            )
         raise TencentEvidenceVerificationError(
             "TENCENT_EVIDENCE_SCHEMA_INVALID"
         )
     except (TencentEvidenceVerificationError, TencentProviderContractError) as exc:
         code = getattr(exc, "code", "TENCENT_EVIDENCE_CONTRACT_INVALID")
+        if code == PROVENANCE_CONTRACT_VERSION_MISMATCH:
+            return _provenance_contract_mismatch(file_hash)
         return _invalid(str(code), file_hash)
 
 
@@ -518,6 +593,265 @@ def _verify_v3(
     }
 
 
+def _verify_v4(
+    payload: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    if set(payload) != V4_TOP_LEVEL_KEYS:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_TOP_LEVEL_FIELDS_INVALID"
+        )
+    if (
+        payload.get("evidence_schema_version")
+        != TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4
+    ):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_SCHEMA_INVALID"
+        )
+    if payload.get("execution_ok") is not True:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_EXECUTION_STATUS_INVALID"
+        )
+    if payload.get("network_mode") is not True:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_NETWORK_MODE_INVALID"
+        )
+    if payload.get("evidence_integrity_verified") is not False:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_SELF_VERIFICATION_INVALID"
+        )
+    if type(payload.get("provider_validation_passed")) is not bool:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVIDER_STATUS_INVALID"
+        )
+    _validate_safe_output(payload)
+    if payload.get("endpoint") != TENCENT_QUOTE_ENDPOINT:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_ENDPOINT_INVALID"
+        )
+    if payload.get("provider_keys") != EXPECTED_PROVIDER_KEYS:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVIDER_KEYS_INVALID"
+        )
+    if payload.get("requested_codes") != list(EXPECTED_CODES):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_REQUESTED_CODES_INVALID"
+        )
+    if payload.get("producer_commit_sha") != _current_git_head():
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PRODUCER_COMMIT_MISMATCH"
+        )
+    if payload.get("provider_verifier_contract_hash") != (
+        compute_tencent_provider_verifier_contract_hash()
+    ):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVIDER_CONTRACT_MISMATCH"
+        )
+    expected_provenance_contract = {
+        "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+        "registry_hash": compute_source_capability_registry_hash(),
+    }
+    if payload.get("provenance_contract") != expected_provenance_contract:
+        raise TencentEvidenceVerificationError(
+            PROVENANCE_CONTRACT_VERSION_MISMATCH
+        )
+    if _recompute_evidence_hash(payload) != payload.get("evidence_hash"):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_HASH_MISMATCH"
+        )
+    _verify_network_activity(payload)
+
+    records_by_capability = payload.get("records_by_capability")
+    capability_results = payload.get("capability_results")
+    capability_attempts = payload.get("capability_attempts")
+    for value in (
+        records_by_capability,
+        capability_results,
+        capability_attempts,
+    ):
+        if not isinstance(value, dict) or set(value) != set(
+            EXPECTED_CAPABILITIES
+        ):
+            raise TencentEvidenceVerificationError(
+                "TENCENT_EVIDENCE_CAPABILITY_SET_INVALID"
+            )
+    raw_responses = payload.get("raw_responses")
+    provenance_results = payload.get("provenance_results")
+    if not isinstance(raw_responses, dict) or not set(raw_responses).issubset(
+        EXPECTED_CAPABILITIES
+    ):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_CAPABILITY_SET_INVALID"
+        )
+    if not isinstance(provenance_results, dict) or not set(
+        provenance_results
+    ).issubset(EXPECTED_CAPABILITIES):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVENANCE_SET_INVALID"
+        )
+
+    outcomes: dict[str, dict[str, Any]] = {}
+    failure_verification: dict[str, dict[str, Any]] = {}
+    expected_raw_capabilities = set()
+    expected_provenance_capabilities = set()
+    for capability in EXPECTED_CAPABILITIES:
+        summary = capability_results[capability]
+        records = records_by_capability[capability]
+        attempt = capability_attempts[capability]
+        status = summary.get("status") if isinstance(summary, dict) else None
+        if status in {
+            "TENCENT_PROVIDER_CAPABILITY_VALIDATED",
+            "TENCENT_PROVIDER_PROVENANCE_REJECTED",
+        }:
+            expected_raw_capabilities.add(capability)
+            expected_provenance_capabilities.add(capability)
+            if capability not in raw_responses or capability not in provenance_results:
+                raise TencentEvidenceVerificationError(
+                    f"TENCENT_EVIDENCE_RESPONSE_OR_PROVENANCE_MISSING:{capability}"
+                )
+            _verify_attempt(
+                capability,
+                attempt,
+                expected_outcome="response_received",
+                expected_error_code="",
+                response_captured=True,
+            )
+            expected_provenance_status = (
+                "SOURCE_PROVENANCE_ACCEPTED"
+                if status == "TENCENT_PROVIDER_CAPABILITY_VALIDATED"
+                else str(summary.get("provenance_status") or "")
+            )
+            verified = _verify_capability(
+                capability,
+                raw_responses[capability],
+                records,
+                summary,
+                require_http_identity=True,
+                expected_summary_status=status,
+                expected_provenance_status=expected_provenance_status,
+                include_provenance_result=True,
+            )
+            computed_provenance = verified.pop("provenance_result")
+            if computed_provenance != provenance_results[capability]:
+                if status == "TENCENT_PROVIDER_PROVENANCE_REJECTED":
+                    raise TencentEvidenceVerificationError(
+                        PROVENANCE_CONTRACT_VERSION_MISMATCH
+                    )
+                raise TencentEvidenceVerificationError(
+                    f"TENCENT_EVIDENCE_PROVENANCE_RESULT_MISMATCH:{capability}"
+                )
+            outcome_status = (
+                "validated"
+                if status == "TENCENT_PROVIDER_CAPABILITY_VALIDATED"
+                else "provenance_rejected"
+            )
+            outcomes[capability] = {
+                "status": outcome_status,
+                **verified,
+                "provenance_result": computed_provenance,
+            }
+            continue
+        if status == "TENCENT_PROVIDER_CAPABILITY_FAILED":
+            if capability in provenance_results:
+                raise TencentEvidenceVerificationError(
+                    f"TENCENT_EVIDENCE_FAILED_PROVENANCE_PRESENT:{capability}"
+                )
+            error_code, response_captured = _verify_v4_failure_summary(
+                capability,
+                summary,
+                records,
+                attempt,
+            )
+            if response_captured:
+                expected_raw_capabilities.add(capability)
+                if capability not in raw_responses:
+                    raise TencentEvidenceVerificationError(
+                        f"TENCENT_EVIDENCE_RAW_RESPONSE_MISSING:{capability}"
+                    )
+                replayed = _verify_captured_failure(
+                    capability,
+                    raw_responses[capability],
+                    error_code,
+                )
+                failure_verification[capability] = {
+                    "failure_reason_verified": True,
+                    "status": "REPLAY_VERIFIED",
+                    "error_code": error_code,
+                    "raw_hash": replayed["raw_hash"],
+                }
+            else:
+                if capability in raw_responses:
+                    raise TencentEvidenceVerificationError(
+                        f"TENCENT_EVIDENCE_UNCORROBORATED_RAW_PRESENT:{capability}"
+                    )
+                failure_verification[capability] = {
+                    "failure_reason_verified": False,
+                    "status": "UNCORROBORATED",
+                    "error_code": error_code,
+                    "raw_hash": "",
+                }
+            outcomes[capability] = {
+                "capability": capability,
+                "status": "failed",
+                "error_code": error_code,
+                "response_captured": response_captured,
+                "records": [],
+            }
+            continue
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_CAPABILITY_STATUS_INVALID:{capability}"
+        )
+
+    if set(raw_responses) != expected_raw_capabilities:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_CAPABILITY_SET_MISMATCH"
+        )
+    if set(provenance_results) != expected_provenance_capabilities:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVENANCE_SET_MISMATCH"
+        )
+    provider_passed = all(
+        outcome["status"] == "validated" for outcome in outcomes.values()
+    )
+    if payload.get("provider_validation_passed") is not provider_passed:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_PROVIDER_STATUS_MISMATCH"
+        )
+    expected_status = (
+        "TENCENT_PROVIDER_NETWORK_VALIDATED"
+        if provider_passed
+        else "TENCENT_PROVIDER_NETWORK_VALIDATION_FAILED"
+    )
+    if payload.get("status") != expected_status:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_STATUS_INVALID"
+        )
+    covered_codes = sorted(
+        {
+            record["payload"]["code"]
+            for outcome in outcomes.values()
+            if outcome["status"] in {"validated", "provenance_rejected"}
+            for record in outcome["records"]
+        }
+    )
+    return provider_passed, {
+        "evidence_schema_version": TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4,
+        "producer_commit_sha": payload["producer_commit_sha"],
+        "provider_verifier_contract_hash": payload[
+            "provider_verifier_contract_hash"
+        ],
+        "provenance_contract": payload["provenance_contract"],
+        "requested_codes": list(EXPECTED_CODES),
+        "network_requests_made": payload.get("network_requests_made"),
+        "upstream_network_activity": payload.get(
+            "upstream_network_activity"
+        ),
+        "provider_validation_passed": provider_passed,
+        "covered_codes": covered_codes,
+        "failure_reason_verification": failure_verification,
+        "capability_outcomes": outcomes,
+    }
+
+
 def _verify_capability(
     capability: str,
     raw_entry: object,
@@ -525,6 +859,9 @@ def _verify_capability(
     summary: object,
     *,
     require_http_identity: bool,
+    expected_summary_status: str = "TENCENT_PROVIDER_CAPABILITY_VALIDATED",
+    expected_provenance_status: str = "SOURCE_PROVENANCE_ACCEPTED",
+    include_provenance_result: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(raw_entry, dict):
         raise TencentEvidenceVerificationError(
@@ -629,17 +966,200 @@ def _verify_capability(
         require_hard_gate=False,
         environ={},
     )
-    if provenance.get("status") != "SOURCE_PROVENANCE_ACCEPTED":
+    if provenance.get("status") != expected_provenance_status:
+        if expected_provenance_status != "SOURCE_PROVENANCE_ACCEPTED":
+            raise TencentEvidenceVerificationError(
+                PROVENANCE_CONTRACT_VERSION_MISMATCH
+            )
         raise TencentEvidenceVerificationError(
             "TENCENT_EVIDENCE_PROVENANCE_REJECTED"
         )
-    _verify_summary(capability, summary, expected_records)
-    return {
+    _verify_summary(
+        capability,
+        summary,
+        expected_records,
+        expected_status=expected_summary_status,
+        expected_provenance_status=expected_provenance_status,
+    )
+    result = {
         "capability": capability,
         "request_hash": request_hash,
         "raw_hash": raw_hash,
         "records": expected_records,
     }
+    if include_provenance_result:
+        result["provenance_result"] = provenance
+    return result
+
+
+def _verify_v4_failure_summary(
+    capability: str,
+    summary: object,
+    records: object,
+    attempt: object,
+) -> tuple[str, bool]:
+    if not isinstance(summary, dict) or set(summary) != {
+        "coverage_ratio",
+        "covered_codes",
+        "elapsed_ms",
+        "error_code",
+        "failure_reason_status",
+        "failure_reason_verified",
+        "record_count",
+        "status",
+    }:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_FAILURE_SUMMARY_INVALID:{capability}"
+        )
+    elapsed = summary.get("elapsed_ms")
+    if not _is_finite_number(elapsed) or float(elapsed) < 0:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_ELAPSED_INVALID:{capability}"
+        )
+    error_code = summary.get("error_code")
+    if error_code not in ALLOWED_PROVIDER_FAILURE_CODES:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_FAILURE_CODE_INVALID:{capability}"
+        )
+    if (
+        summary.get("status") != "TENCENT_PROVIDER_CAPABILITY_FAILED"
+        or summary.get("record_count") != 0
+        or summary.get("covered_codes") != []
+        or summary.get("coverage_ratio") != 0.0
+        or summary.get("failure_reason_verified") is not False
+        or records != []
+    ):
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_FAILURE_SUMMARY_MISMATCH:{capability}"
+        )
+    response_captured = bool(
+        isinstance(attempt, dict) and attempt.get("response_captured") is True
+    )
+    expected_reason_status = (
+        "REPLAY_PENDING" if response_captured else "UNCORROBORATED"
+    )
+    if summary.get("failure_reason_status") != expected_reason_status:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_FAILURE_REASON_STATUS_INVALID:{capability}"
+        )
+    _verify_attempt(
+        capability,
+        attempt,
+        expected_outcome=(
+            "response_rejected" if response_captured else "failed"
+        ),
+        expected_error_code=str(error_code),
+        response_captured=response_captured,
+    )
+    return str(error_code), response_captured
+
+
+def _verify_captured_failure(
+    capability: str,
+    raw_entry: object,
+    expected_error_code: str,
+) -> dict[str, Any]:
+    if not isinstance(raw_entry, dict) or set(raw_entry) != {
+        "available_at",
+        "byte_count",
+        "capability",
+        "content_base64",
+        "encoding",
+        "http_status_code",
+        "observed_at",
+        "raw_hash",
+        "request_hash",
+        "request_url",
+        "response_url",
+    }:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_CAPTURED_RESPONSE_INVALID:{capability}"
+        )
+    if raw_entry.get("capability") != capability:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_CAPABILITY_IDENTITY_INVALID"
+        )
+    if raw_entry.get("encoding") != "base64":
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_ENCODING_INVALID"
+        )
+    encoded = raw_entry.get("content_base64")
+    if not isinstance(encoded, str):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_CONTENT_MISSING"
+        )
+    try:
+        raw_response = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_BASE64_INVALID"
+        ) from None
+    raw_hash = hashlib.sha256(raw_response).hexdigest()
+    if raw_entry.get("byte_count") != len(raw_response):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_SIZE_INVALID"
+        )
+    if raw_entry.get("raw_hash") != raw_hash:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_RAW_HASH_MISMATCH"
+        )
+    if raw_entry.get("request_url") != build_tencent_request_url(EXPECTED_CODES):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_REQUEST_URL_INVALID"
+        )
+    if raw_entry.get("request_hash") != compute_tencent_request_hash(
+        EXPECTED_CODES
+    ):
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_REQUEST_HASH_INVALID"
+        )
+    observed_at = _parse_strict_datetime(raw_entry.get("observed_at"))
+    available_at = _parse_strict_datetime(raw_entry.get("available_at"))
+    if observed_at > available_at:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_TIME_ORDER_INVALID"
+        )
+    replayed_error = _replay_response_failure(
+        raw_entry,
+        raw_response,
+        observed_at,
+    )
+    if replayed_error != expected_error_code:
+        raise TencentEvidenceVerificationError(
+            f"TENCENT_EVIDENCE_FAILURE_REPLAY_MISMATCH:{capability}"
+        )
+    return {
+        "capability": capability,
+        "raw_hash": raw_hash,
+        "replayed_error_code": replayed_error,
+    }
+
+
+def _replay_response_failure(
+    raw_entry: Mapping[str, Any],
+    raw_response: bytes,
+    observed_at: datetime,
+) -> str:
+    status_code = raw_entry.get("http_status_code")
+    if type(status_code) is not int or status_code != 200:
+        return "TENCENT_HTTP_STATUS_INVALID"
+    response_url = raw_entry.get("response_url")
+    parsed_url = urlparse(response_url) if isinstance(response_url, str) else None
+    if (
+        parsed_url is None
+        or parsed_url.scheme != "https"
+        or parsed_url.hostname != "qt.gtimg.cn"
+    ):
+        return "TENCENT_RESPONSE_SOURCE_INVALID"
+    try:
+        rows = parse_tencent_response_bytes(raw_response, EXPECTED_CODES)
+        if any(event_time > observed_at for _code, _values, event_time in rows):
+            return "TENCENT_SOURCE_TIME_AFTER_OBSERVED_AT"
+    except TencentProviderContractError as exc:
+        return exc.code
+    raise TencentEvidenceVerificationError(
+        "TENCENT_EVIDENCE_CAPTURED_FAILURE_NOT_REPRODUCED"
+    )
 
 
 def _verify_http_identity(raw_entry: Mapping[str, Any]) -> None:
@@ -763,6 +1283,9 @@ def _verify_summary(
     capability: str,
     summary: object,
     records: list[dict[str, Any]],
+    *,
+    expected_status: str = "TENCENT_PROVIDER_CAPABILITY_VALIDATED",
+    expected_provenance_status: str = "SOURCE_PROVENANCE_ACCEPTED",
 ) -> None:
     if not isinstance(summary, dict):
         raise TencentEvidenceVerificationError(
@@ -795,7 +1318,7 @@ def _verify_summary(
         )
     covered_codes = [row["payload"]["code"] for row in records]
     expected = {
-        "status": "TENCENT_PROVIDER_CAPABILITY_VALIDATED",
+        "status": expected_status,
         "record_count": len(records),
         "covered_codes": covered_codes,
         "coverage_ratio": 1.0,
@@ -807,7 +1330,7 @@ def _verify_summary(
             {row["request_hash"] for row in records}
         ),
         "raw_hashes": sorted({row["raw_hash"] for row in records}),
-        "provenance_status": "SOURCE_PROVENANCE_ACCEPTED",
+        "provenance_status": expected_provenance_status,
     }
     actual = {key: summary.get(key) for key in expected}
     if actual != expected:
@@ -1113,12 +1636,51 @@ def _parse_strict_datetime(value: object) -> datetime:
     return parsed
 
 
+def _current_git_head() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_VERIFIER_COMMIT_UNAVAILABLE"
+        ) from exc
+    commit_sha = completed.stdout.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None:
+        raise TencentEvidenceVerificationError(
+            "TENCENT_EVIDENCE_VERIFIER_COMMIT_INVALID"
+        )
+    return commit_sha
+
+
+def _provenance_contract_mismatch(file_hash: str) -> dict[str, Any]:
+    return _safe_result(
+        {
+            "status": PROVENANCE_CONTRACT_VERSION_MISMATCH,
+            "execution_ok": True,
+            "error_code": PROVENANCE_CONTRACT_VERSION_MISMATCH,
+            "evidence_integrity_verified": False,
+            "external_anchor_verified": True,
+            "provider_validation_passed": False,
+            "file_sha256": file_hash,
+            "replay_hash": "",
+            "network_requests_made": None,
+            "upstream_network_activity": "unknown",
+        }
+    )
+
+
 def _invalid(code: str, file_hash: str = "") -> dict[str, Any]:
     return _safe_result(
         {
             "status": EVIDENCE_INVALID,
             "execution_ok": False,
             "evidence_integrity_verified": False,
+            "external_anchor_verified": False,
             "provider_validation_passed": False,
             "error_code": code,
             "file_sha256": file_hash,
@@ -1146,6 +1708,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("evidence")
     parser.add_argument(
+        "--expected-file-sha256",
+        help="Externally anchored SHA-256 required for strict v4 verification",
+    )
+    parser.add_argument(
         "--output",
         help="Optional ignored cache path for deterministic replay JSON",
     )
@@ -1154,7 +1720,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    result = verify_tencent_provider_evidence(args.evidence)
+    result = verify_tencent_provider_evidence(
+        args.evidence,
+        expected_file_sha256=args.expected_file_sha256,
+    )
     if args.output:
         try:
             write_validation_json_atomic(args.output, result)

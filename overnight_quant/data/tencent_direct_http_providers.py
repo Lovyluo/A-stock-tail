@@ -27,8 +27,14 @@ TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2 = (
 TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3 = (
     "tencent_provider_network_evidence_v3"
 )
+TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4 = (
+    "tencent_provider_network_evidence_v4"
+)
 TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION = (
-    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4
+)
+TENCENT_PROVIDER_VERIFIER_CONTRACT_VERSION = (
+    "tencent_provider_verifier_contract_v4"
 )
 
 TENCENT_QUOTE_PROVIDER_KEY = (
@@ -50,8 +56,16 @@ _TENCENT_TIMESTAMP = re.compile(r"^\d{14}$")
 
 
 class TencentProviderContractError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(
+        self,
+        code: str,
+        *,
+        response_evidence: Mapping[str, Any] | None = None,
+    ):
         self.code = str(code)
+        self.response_evidence = (
+            dict(response_evidence) if response_evidence is not None else None
+        )
         super().__init__(self.code)
 
 
@@ -210,28 +224,91 @@ class TencentDirectHttpProviders:
         available_at = _clock_now(self.clock)
         if observed_at > available_at:
             raise TencentProviderContractError("TENCENT_TIME_ORDER_INVALID")
-        _validate_response_identity(response, request_url)
-        raw_content = response.content
-        if not isinstance(raw_content, bytes) or not raw_content:
-            raise TencentProviderContractError("TENCENT_RESPONSE_EMPTY")
-        raw_hash = hashlib.sha256(raw_content).hexdigest()
-        rows = parse_tencent_response_bytes(raw_content, self.codes)
-        for _code, _values, event_time in rows:
-            if event_time > observed_at:
-                raise TencentProviderContractError(
-                    "TENCENT_SOURCE_TIME_AFTER_OBSERVED_AT"
-                )
-        context = {
-            "observed_at": observed_at,
-            "available_at": available_at,
-            "request_hash": request_hash,
-            "raw_hash": raw_hash,
-            "request_url": request_url,
-            "raw_response_bytes": raw_content,
-            "http_status_code": response.status_code,
-            "response_url": response.url,
-        }
+        response_evidence = _build_response_evidence(
+            response=response,
+            observed_at=observed_at,
+            available_at=available_at,
+            request_hash=request_hash,
+            request_url=request_url,
+        )
+        try:
+            _validate_response_identity(response, request_url)
+            raw_content = response.content
+            if not isinstance(raw_content, bytes) or not raw_content:
+                raise TencentProviderContractError("TENCENT_RESPONSE_EMPTY")
+            rows = parse_tencent_response_bytes(raw_content, self.codes)
+            for _code, _values, event_time in rows:
+                if event_time > observed_at:
+                    raise TencentProviderContractError(
+                        "TENCENT_SOURCE_TIME_AFTER_OBSERVED_AT"
+                    )
+        except TencentProviderContractError as exc:
+            raise TencentProviderContractError(
+                exc.code,
+                response_evidence=response_evidence,
+            ) from exc
+        context = dict(response_evidence)
         return rows, context
+
+
+def _build_response_evidence(
+    *,
+    response: object,
+    observed_at: datetime,
+    available_at: datetime,
+    request_hash: str,
+    request_url: str,
+) -> dict[str, Any]:
+    if not isinstance(response, TencentHttpResponse):
+        raise TencentProviderContractError(
+            "TENCENT_TRANSPORT_RESPONSE_INVALID"
+        )
+    raw_content = response.content
+    raw_hash = (
+        hashlib.sha256(raw_content).hexdigest()
+        if isinstance(raw_content, bytes)
+        else ""
+    )
+    return {
+        "observed_at": observed_at,
+        "available_at": available_at,
+        "request_hash": request_hash,
+        "raw_hash": raw_hash,
+        "request_url": request_url,
+        "raw_response_bytes": raw_content,
+        "http_status_code": response.status_code,
+        "response_url": response.url,
+    }
+
+
+def compute_tencent_provider_verifier_contract_hash() -> str:
+    return stable_hash(
+        {
+            "contract_version": TENCENT_PROVIDER_VERIFIER_CONTRACT_VERSION,
+            "evidence_schema_version": TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4,
+            "endpoint": TENCENT_QUOTE_ENDPOINT,
+            "origin_source": TENCENT_ORIGIN_SOURCE,
+            "adapter": TENCENT_ADAPTER,
+            "source_version": TENCENT_SOURCE_VERSION,
+            "response_encoding": TENCENT_RESPONSE_ENCODING,
+            "expected_field_count": TENCENT_EXPECTED_FIELD_COUNT,
+            "capabilities": ["quote", "valuation"],
+            "provider_keys": {
+                "quote": TENCENT_QUOTE_PROVIDER_KEY,
+                "valuation": TENCENT_VALUATION_PROVIDER_KEY,
+            },
+            "http_contract": {
+                "status_code": 200,
+                "scheme": "https",
+                "hostname": "qt.gtimg.cn",
+            },
+            "failure_evidence": {
+                "response_capture_replay": True,
+                "no_response_reason_corroborated": False,
+                "external_file_sha256_required": True,
+            },
+        }
+    )
 
 
 def _build_batch(
@@ -603,7 +680,9 @@ __all__ = [
     "TENCENT_QUOTE_PROVIDER_KEY",
     "TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2",
     "TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3",
+    "TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4",
     "TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION",
+    "TENCENT_PROVIDER_VERIFIER_CONTRACT_VERSION",
     "TENCENT_SOURCE_VERSION",
     "TENCENT_VALUATION_PROVIDER_KEY",
     "TencentDirectHttpProviders",
@@ -614,5 +693,6 @@ __all__ = [
     "build_tencent_payload",
     "build_tencent_request_url",
     "compute_tencent_request_hash",
+    "compute_tencent_provider_verifier_contract_hash",
     "parse_tencent_response_bytes",
 ]

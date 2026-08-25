@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 from time import perf_counter
 from typing import Any, Callable, Iterable
@@ -19,6 +22,8 @@ if str(ROOT) not in sys.path:
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_registry import (
+    REGISTRY_SCHEMA_VERSION,
+    compute_source_capability_registry_hash,
     validate_source_provenance_batch,
 )
 from overnight_quant.data.tencent_direct_http_providers import (
@@ -29,6 +34,7 @@ from overnight_quant.data.tencent_direct_http_providers import (
     TencentDirectHttpProviders,
     TencentProviderContractError,
     TencentUrllibTransport,
+    compute_tencent_provider_verifier_contract_hash,
 )
 
 
@@ -97,6 +103,7 @@ def run_tencent_provider_validation(
     records_by_capability: dict[str, list[dict[str, Any]]] = {}
     raw_responses: dict[str, dict[str, Any]] = {}
     capability_attempts: dict[str, dict[str, Any]] = {}
+    provenance_results: dict[str, dict[str, Any]] = {}
     methods = {
         "quote": provider.collect_quote_batch,
         "valuation": provider.collect_valuation_batch,
@@ -121,6 +128,7 @@ def run_tencent_provider_validation(
                 provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
                 and coverage == sorted(provider.codes)
             )
+            provenance_results[capability] = provenance
             capability_results[capability] = {
                 "status": (
                     "TENCENT_PROVIDER_CAPABILITY_VALIDATED"
@@ -179,6 +187,13 @@ def run_tencent_provider_validation(
                 "response_captured": True,
             }
         except TencentProviderContractError as exc:
+            captured_response = _serialize_captured_response(
+                capability,
+                exc.response_evidence,
+            )
+            response_captured = captured_response is not None
+            if captured_response is not None:
+                raw_responses[capability] = captured_response
             capability_results[capability] = {
                 "status": "TENCENT_PROVIDER_CAPABILITY_FAILED",
                 "error_code": exc.code,
@@ -186,11 +201,21 @@ def run_tencent_provider_validation(
                 "covered_codes": [],
                 "coverage_ratio": 0.0,
                 "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+                "failure_reason_verified": False,
+                "failure_reason_status": (
+                    "REPLAY_PENDING"
+                    if response_captured
+                    else "UNCORROBORATED"
+                ),
             }
             records_by_capability[capability] = []
             capability_attempts[capability] = {
                 "capability": capability,
-                "outcome": "failed",
+                "outcome": (
+                    "response_rejected"
+                    if response_captured
+                    else "failed"
+                ),
                 "error_code": exc.code,
                 "started_at": attempt_started_at.isoformat(
                     timespec="microseconds"
@@ -198,7 +223,7 @@ def run_tencent_provider_validation(
                 "completed_at": datetime.now(CN_TZ).isoformat(
                     timespec="microseconds"
                 ),
-                "response_captured": False,
+                "response_captured": response_captured,
             }
 
     validated = all(
@@ -230,6 +255,15 @@ def run_tencent_provider_validation(
                 "quote": TENCENT_QUOTE_PROVIDER_KEY,
                 "valuation": TENCENT_VALUATION_PROVIDER_KEY,
             },
+            "producer_commit_sha": _current_git_head(),
+            "provider_verifier_contract_hash": (
+                compute_tencent_provider_verifier_contract_hash()
+            ),
+            "provenance_contract": {
+                "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+                "registry_hash": compute_source_capability_registry_hash(),
+            },
+            "provenance_results": provenance_results,
             "capability_results": capability_results,
             "capability_attempts": capability_attempts,
             "records_by_capability": records_by_capability,
@@ -244,6 +278,61 @@ def run_tencent_provider_validation(
     written = write_validation_json_atomic(target, result)
     result["output_path"] = str(written)
     return result
+
+
+def _serialize_captured_response(
+    capability: str,
+    response_evidence: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(response_evidence, dict):
+        return None
+    raw_response = response_evidence.get("raw_response_bytes")
+    if not isinstance(raw_response, bytes):
+        return None
+    raw_hash = hashlib.sha256(raw_response).hexdigest()
+    if response_evidence.get("raw_hash") != raw_hash:
+        return None
+    observed_at = response_evidence.get("observed_at")
+    available_at = response_evidence.get("available_at")
+    if not isinstance(observed_at, datetime) or not isinstance(
+        available_at,
+        datetime,
+    ):
+        return None
+    return {
+        "capability": capability,
+        "encoding": "base64",
+        "content_base64": base64.b64encode(raw_response).decode("ascii"),
+        "byte_count": len(raw_response),
+        "request_url": response_evidence.get("request_url"),
+        "request_hash": response_evidence.get("request_hash"),
+        "raw_hash": raw_hash,
+        "observed_at": observed_at.isoformat(timespec="microseconds"),
+        "available_at": available_at.isoformat(timespec="microseconds"),
+        "http_status_code": response_evidence.get("http_status_code"),
+        "response_url": response_evidence.get("response_url"),
+    }
+
+
+def _current_git_head() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TencentProviderContractError(
+            "TENCENT_PRODUCER_COMMIT_UNAVAILABLE"
+        ) from exc
+    commit_sha = completed.stdout.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None:
+        raise TencentProviderContractError(
+            "TENCENT_PRODUCER_COMMIT_INVALID"
+        )
+    return commit_sha
 
 
 def write_validation_json_atomic(

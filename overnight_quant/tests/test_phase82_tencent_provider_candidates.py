@@ -28,6 +28,7 @@ from overnight_quant.data.tencent_direct_http_providers import (
     TENCENT_ORIGIN_SOURCE,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION,
     TENCENT_QUOTE_PROVIDER_KEY,
     TENCENT_SOURCE_VERSION,
@@ -35,6 +36,7 @@ from overnight_quant.data.tencent_direct_http_providers import (
     TencentDirectHttpProviders,
     TencentHttpResponse,
     TencentProviderContractError,
+    compute_tencent_provider_verifier_contract_hash,
 )
 from overnight_quant.scripts import run_tencent_provider_validation as validation
 from overnight_quant.scripts import (
@@ -252,6 +254,30 @@ def _resign_evidence(payload):
     payload["evidence_hash"] = stable_hash(material)
 
 
+def _file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _verify_strict_v4(path):
+    return evidence_verify.verify_tencent_provider_evidence(
+        path,
+        expected_file_sha256=_file_sha256(path),
+    )
+
+
+def _rejected_provenance(capability, records, **_kwargs):
+    result = validate_source_provenance_batch(
+        capability,
+        records,
+        require_hard_gate=False,
+        environ={},
+    )
+    result["status"] = "PROVENANCE_CONTRACT_INCOMPLETE"
+    result["provenance"] = None
+    result["missing_fields"] = ["synthetic_contract_field"]
+    return result
+
+
 def _write_json(path, payload):
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -274,9 +300,24 @@ def _convert_v3_to_v2(payload):
     converted.pop("capability_attempts")
     converted.pop("evidence_integrity_verified")
     converted.pop("provider_validation_passed")
+    converted.pop("producer_commit_sha")
+    converted.pop("provider_verifier_contract_hash")
+    converted.pop("provenance_contract")
+    converted.pop("provenance_results")
     for raw_entry in converted["raw_responses"].values():
         raw_entry.pop("http_status_code")
         raw_entry.pop("response_url")
+    _resign_evidence(converted)
+    return converted
+
+
+def _convert_v4_to_v3(payload):
+    converted = deepcopy(payload)
+    converted["evidence_schema_version"] = TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    converted.pop("producer_commit_sha")
+    converted.pop("provider_verifier_contract_hash")
+    converted.pop("provenance_contract")
+    converted.pop("provenance_results")
     _resign_evidence(converted)
     return converted
 
@@ -288,6 +329,10 @@ def _convert_v3_to_strict_v1(payload):
         "evidence_integrity_verified",
         "evidence_schema_version",
         "provider_validation_passed",
+        "producer_commit_sha",
+        "provider_verifier_contract_hash",
+        "provenance_contract",
+        "provenance_results",
         "raw_responses",
         "upstream_network_activity",
     ):
@@ -654,7 +699,7 @@ def test_network_validation_failure_writes_only_ignored_cache_and_stays_safe(
     )
 
     assert result["status"] == "TENCENT_PROVIDER_NETWORK_VALIDATION_FAILED"
-    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4
     assert result["evidence_integrity_verified"] is False
     assert result["provider_validation_passed"] is False
     assert result["network_requests_made"] == 2
@@ -663,12 +708,18 @@ def test_network_validation_failure_writes_only_ignored_cache_and_stays_safe(
     assert stored["status"] == result["status"]
     assert "records_by_capability" in stored
     assert all(not rows for rows in stored["records_by_capability"].values())
-    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    verified = _verify_strict_v4(output)
     assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
     assert verified["evidence_integrity_verified"] is True
     assert verified["provider_validation_passed"] is False
     assert verified["verified_capabilities"] == []
     assert verified["covered_codes"] == []
+    assert verified["failure_reason_verification"]["quote"] == {
+        "failure_reason_verified": False,
+        "status": "UNCORROBORATED",
+        "error_code": "TENCENT_REQUEST_TIMEOUT",
+        "raw_hash": "",
+    }
     _assert_safe(result)
     _assert_safe(stored)
     _assert_safe(verified)
@@ -700,9 +751,12 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
         result["evidence_schema_version"]
         == TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
     )
-    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V4
     assert result["evidence_integrity_verified"] is False
     assert result["provider_validation_passed"] is True
+    assert result["provider_verifier_contract_hash"] == (
+        compute_tencent_provider_verifier_contract_hash()
+    )
     assert result["network_requests_made"] == 2
     assert result["upstream_network_activity"] == "measured"
     assert result["capability_results"]["quote"]["record_count"] == 5
@@ -724,7 +778,7 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
         assert type(raw_entry["http_status_code"]) is int
         assert raw_entry["http_status_code"] == 200
         assert raw_entry["response_url"].startswith("https://qt.gtimg.cn/")
-    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    verified = _verify_strict_v4(output)
     assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
     assert verified["evidence_integrity_verified"] is True
     assert verified["provider_validation_passed"] is True
@@ -767,16 +821,35 @@ def test_evidence_verifier_replay_is_deterministic_and_preserves_original(
     replay_a = tmp_path / "replay_a.json"
     replay_b = tmp_path / "replay_b.json"
 
-    first = evidence_verify.verify_tencent_provider_evidence(evidence)
-    second = evidence_verify.verify_tencent_provider_evidence(evidence)
+    expected_sha = _file_sha256(evidence)
+    first = evidence_verify.verify_tencent_provider_evidence(
+        evidence,
+        expected_file_sha256=expected_sha,
+    )
+    second = evidence_verify.verify_tencent_provider_evidence(
+        evidence,
+        expected_file_sha256=expected_sha,
+    )
     assert first == second
     assert first["status"] == evidence_verify.EVIDENCE_VERIFIED
     assert first["stored_evidence_hash"] == generated["evidence_hash"]
     assert evidence_verify.main(
-        [str(evidence), "--output", str(replay_a)]
+        [
+            str(evidence),
+            "--expected-file-sha256",
+            expected_sha,
+            "--output",
+            str(replay_a),
+        ]
     ) == 0
     assert evidence_verify.main(
-        [str(evidence), "--output", str(replay_b)]
+        [
+            str(evidence),
+            "--expected-file-sha256",
+            expected_sha,
+            "--output",
+            str(replay_b),
+        ]
     ) == 0
 
     assert replay_a.read_bytes() == replay_b.read_bytes()
@@ -852,7 +925,7 @@ def test_evidence_verifier_rejects_resigned_contract_tampering(
     _resign_evidence(payload)
     _write_json(evidence, payload)
 
-    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+    verified = _verify_strict_v4(evidence)
 
     assert verified["status"] == evidence_verify.EVIDENCE_INVALID
     assert verified["execution_ok"] is False
@@ -922,7 +995,32 @@ def test_v2_success_contract_keeps_original_success_only_semantics(
     _assert_safe(verified)
 
 
-def test_v3_single_capability_failure_is_integrity_verified_not_provider_passed(
+def test_v3_success_contract_remains_compatible_without_external_anchor(
+    monkeypatch,
+    tmp_path,
+):
+    evidence, _generated, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name="v3_success.json",
+    )
+    payload = _convert_v4_to_v3(
+        json.loads(evidence.read_text(encoding="utf-8"))
+    )
+    _write_json(evidence, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_schema_version"] == (
+        TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    )
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is True
+    _assert_safe(verified)
+
+
+def test_v4_single_capability_failure_is_integrity_verified_not_provider_passed(
     monkeypatch,
     tmp_path,
 ):
@@ -940,7 +1038,7 @@ def test_v3_single_capability_failure_is_integrity_verified_not_provider_passed(
         ),
     )
 
-    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    verified = _verify_strict_v4(output)
 
     assert result["provider_validation_passed"] is False
     assert result["capability_results"]["quote"]["status"] == (
@@ -953,7 +1051,240 @@ def test_v3_single_capability_failure_is_integrity_verified_not_provider_passed(
     assert verified["evidence_integrity_verified"] is True
     assert verified["provider_validation_passed"] is False
     assert verified["verified_capabilities"] == ["quote"]
+    assert verified["failure_reason_verification"]["valuation"][
+        "failure_reason_verified"
+    ] is False
     _assert_safe(verified)
+
+
+def test_v4_resigned_summary_and_attempt_failure_reason_remains_uncorroborated(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    output = tmp_path / "paired_failure_tamper.json"
+    validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=FakeTransport(_response_bytes(), error=TimeoutError()),
+        clock=_clock(OBSERVED_AT, AVAILABLE_AT),
+    )
+    original_anchor = _file_sha256(output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    payload["capability_results"]["quote"][
+        "error_code"
+    ] = "TENCENT_REQUEST_FAILED"
+    payload["capability_attempts"]["quote"][
+        "error_code"
+    ] = "TENCENT_REQUEST_FAILED"
+    _resign_evidence(payload)
+    _write_json(output, payload)
+
+    anchored_to_original = evidence_verify.verify_tencent_provider_evidence(
+        output,
+        expected_file_sha256=original_anchor,
+    )
+    verified = _verify_strict_v4(output)
+
+    assert anchored_to_original["status"] == evidence_verify.EVIDENCE_INVALID
+    assert anchored_to_original["error_code"] == (
+        "TENCENT_EVIDENCE_EXTERNAL_ANCHOR_MISMATCH"
+    )
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is False
+    assert verified["failure_reason_verification"]["quote"] == {
+        "failure_reason_verified": False,
+        "status": "UNCORROBORATED",
+        "error_code": "TENCENT_REQUEST_FAILED",
+        "raw_hash": "",
+    }
+    _assert_safe(anchored_to_original)
+    _assert_safe(verified)
+
+
+def test_v4_captured_parse_failure_is_replayed_from_raw_response(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    output = tmp_path / "captured_parse_failure.json"
+    invalid_response = _response_bytes(
+        rows=[_line(code, _values(code)[:-1]) for code in CODES],
+    )
+    result = validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=FakeTransport(invalid_response),
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+            AVAILABLE_AT + timedelta(seconds=3),
+        ),
+    )
+
+    verified = _verify_strict_v4(output)
+
+    assert result["provider_validation_passed"] is False
+    assert set(result["raw_responses"]) == {"quote", "valuation"}
+    assert all(
+        attempt["response_captured"] is True
+        for attempt in result["capability_attempts"].values()
+    )
+    assert all(
+        item["error_code"] == "TENCENT_RESPONSE_FIELD_COUNT_INVALID"
+        for item in result["capability_results"].values()
+    )
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["provider_validation_passed"] is False
+    assert all(
+        item["failure_reason_verified"] is True
+        and item["status"] == "REPLAY_VERIFIED"
+        and item["error_code"] == "TENCENT_RESPONSE_FIELD_COUNT_INVALID"
+        for item in verified["failure_reason_verification"].values()
+    )
+    _assert_safe(verified)
+
+
+def test_v4_provenance_rejection_is_integrity_verified_when_reproducible(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(
+        validation,
+        "validate_source_provenance_batch",
+        _rejected_provenance,
+    )
+    monkeypatch.setattr(
+        evidence_verify,
+        "validate_source_provenance_batch",
+        _rejected_provenance,
+    )
+    output = tmp_path / "provenance_rejected.json"
+    result = validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=FakeTransport(_response_bytes()),
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+            AVAILABLE_AT + timedelta(seconds=3),
+        ),
+    )
+
+    verified = _verify_strict_v4(output)
+
+    assert result["provider_validation_passed"] is False
+    assert all(
+        item["status"] == "TENCENT_PROVIDER_PROVENANCE_REJECTED"
+        for item in result["capability_results"].values()
+    )
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is False
+    assert verified["verified_capabilities"] == []
+    _assert_safe(verified)
+
+
+def test_v4_provenance_rejection_contract_drift_has_distinct_status(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(
+        validation,
+        "validate_source_provenance_batch",
+        _rejected_provenance,
+    )
+    output = tmp_path / "provenance_contract_drift.json"
+    validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=FakeTransport(_response_bytes()),
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+            AVAILABLE_AT + timedelta(seconds=3),
+        ),
+    )
+
+    verified = _verify_strict_v4(output)
+
+    assert verified["status"] == (
+        evidence_verify.PROVENANCE_CONTRACT_VERSION_MISMATCH
+    )
+    assert verified["execution_ok"] is True
+    assert verified["external_anchor_verified"] is True
+    assert verified["provider_validation_passed"] is False
+    _assert_safe(verified)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        (
+            "producer_commit_sha",
+            "f" * 40,
+            "TENCENT_EVIDENCE_PRODUCER_COMMIT_MISMATCH",
+        ),
+        (
+            "provider_verifier_contract_hash",
+            "f" * 64,
+            "TENCENT_EVIDENCE_PROVIDER_CONTRACT_MISMATCH",
+        ),
+    ],
+)
+def test_v4_rejects_resigned_wrong_commit_or_contract_hash(
+    monkeypatch,
+    tmp_path,
+    field,
+    value,
+    error_code,
+):
+    output, _result, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name=f"wrong_{field}.json",
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    payload[field] = value
+    _resign_evidence(payload)
+    _write_json(output, payload)
+
+    verified = _verify_strict_v4(output)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_INVALID
+    assert verified["error_code"] == error_code
+    _assert_safe(verified)
+
+
+def test_v4_requires_matching_external_file_sha256(monkeypatch, tmp_path):
+    output, _result, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name="external_anchor.json",
+    )
+
+    missing = evidence_verify.verify_tencent_provider_evidence(output)
+    mismatched = evidence_verify.verify_tencent_provider_evidence(
+        output,
+        expected_file_sha256="f" * 64,
+    )
+
+    assert missing["status"] == evidence_verify.EVIDENCE_INVALID
+    assert missing["error_code"] == (
+        "TENCENT_EVIDENCE_EXTERNAL_ANCHOR_REQUIRED"
+    )
+    assert mismatched["status"] == evidence_verify.EVIDENCE_INVALID
+    assert mismatched["error_code"] == (
+        "TENCENT_EVIDENCE_EXTERNAL_ANCHOR_MISMATCH"
+    )
+    _assert_safe(missing)
+    _assert_safe(mismatched)
 
 
 def test_resigned_failed_evidence_tampering_is_rejected(
@@ -975,7 +1306,7 @@ def test_resigned_failed_evidence_tampering_is_rejected(
     _resign_evidence(payload)
     _write_json(output, payload)
 
-    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    verified = _verify_strict_v4(output)
 
     assert verified["status"] == evidence_verify.EVIDENCE_INVALID
     assert verified["evidence_integrity_verified"] is False
