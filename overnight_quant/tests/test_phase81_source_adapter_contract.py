@@ -512,6 +512,84 @@ def test_called_provider_reports_upstream_network_activity_unknown_not_zero():
     _assert_safe(result, provider_called=True)
 
 
+def test_test_only_execution_reports_actual_selection_registry_hash():
+    binding = _test_bound_binding()
+    selection_rows = adapters._canonicalize_source_adapter_bindings_for_test(
+        [binding]
+    )
+    expected_selection_hash = (
+        adapters._compute_source_adapter_registry_hash_for_test([binding])
+    )
+
+    result = _run_test_quote(lambda: [_quote_record()])
+
+    assert result["selection_registry_scope"] == "test_only"
+    assert result["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert result["selection_adapter_registry_hash"] == expected_selection_hash
+    assert result["adapter_registry_hash"] == expected_selection_hash
+    assert result["selection_adapter_registry_hash"] != ADAPTER_REGISTRY_HASH
+    assert selection_rows[0] not in get_source_adapter_registry()
+    _assert_safe(result, provider_called=True)
+
+
+def test_test_only_selection_hash_changes_with_provider_key():
+    first_key = "tests.contract_compatible_quote_v1"
+    second_key = "tests.contract_compatible_quote_v2"
+
+    first = adapters._execute_source_adapter_with_bindings_for_test(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(
+            lambda: [_quote_record()],
+            first_key,
+        ),
+        entries=[_test_bound_binding(first_key)],
+        environ={},
+    )
+    second = adapters._execute_source_adapter_with_bindings_for_test(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(
+            lambda: [_quote_record()],
+            second_key,
+        ),
+        entries=[_test_bound_binding(second_key)],
+        environ={},
+    )
+
+    assert first["selection_registry_scope"] == "test_only"
+    assert second["selection_registry_scope"] == "test_only"
+    assert (
+        first["selection_adapter_registry_hash"]
+        != second["selection_adapter_registry_hash"]
+    )
+    assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert second["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    _assert_safe(first, provider_called=True)
+    _assert_safe(second, provider_called=True)
+
+
+def test_public_execution_uses_production_registry_hash_and_scope():
+    binding = next(
+        row
+        for row in get_source_adapter_registry()
+        if row["capability"] == "quote" and row["origin_source"] == "tencent"
+    )
+
+    result = execute_source_adapter(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(
+            lambda: [_quote_record()],
+            binding["provider_key"],
+        ),
+        environ={},
+    )
+
+    assert result["selection_registry_scope"] == "production"
+    assert result["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert result["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert result["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    _assert_safe(result, provider_called=False)
+
+
 def test_provider_empty_and_provider_failure_are_distinct_and_network_unknown():
     empty = _run_test_quote(lambda: [])
 
@@ -608,6 +686,9 @@ def test_audit_is_complete_deterministic_and_safe():
     assert first["adapter_entry_count"] == 28
     assert first["bound_count"] == 0
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert first["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert first["selection_registry_scope"] == "production"
     assert first["capability_registry_hash"] == (
         compute_source_capability_registry_hash()
     )

@@ -45,6 +45,13 @@ UPSTREAM_ACTIVITY_NOT_CALLED = "not_called"
 UPSTREAM_ACTIVITY_NOT_APPLICABLE = "not_applicable"
 UPSTREAM_ACTIVITY_UNKNOWN = "unknown"
 
+SELECTION_REGISTRY_SCOPE_PRODUCTION = "production"
+SELECTION_REGISTRY_SCOPE_TEST_ONLY = "test_only"
+SELECTION_REGISTRY_SCOPES = {
+    SELECTION_REGISTRY_SCOPE_PRODUCTION,
+    SELECTION_REGISTRY_SCOPE_TEST_ONLY,
+}
+
 
 def _is_canonical_identifier(value: Any) -> bool:
     return (
@@ -408,6 +415,7 @@ def audit_source_adapters(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     environment = {} if environ is None else dict(environ)
+    production_registry_hash = compute_source_adapter_registry_hash()
     capability_rows = _capability_index()
     matrix = []
     for binding in get_source_adapter_registry():
@@ -443,7 +451,10 @@ def audit_source_adapters(
             "status": SOURCE_ADAPTER_AUDIT_COMPLETE,
             "execution_ok": True,
             "adapter_registry_schema_version": ADAPTER_REGISTRY_SCHEMA_VERSION,
-            "adapter_registry_hash": compute_source_adapter_registry_hash(),
+            "adapter_registry_hash": production_registry_hash,
+            "production_adapter_registry_hash": production_registry_hash,
+            "selection_adapter_registry_hash": production_registry_hash,
+            "selection_registry_scope": SELECTION_REGISTRY_SCOPE_PRODUCTION,
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
             "adapter_entry_count": len(matrix),
@@ -527,9 +538,39 @@ def _execute_source_adapter_core(
     bindings: list[dict[str, Any]],
     test_only: bool,
 ) -> dict[str, Any]:
+    production_registry_hash = compute_source_adapter_registry_hash()
+    selection_registry_hash = _hash_adapter_bindings(bindings)
+    selection_registry_scope = (
+        SELECTION_REGISTRY_SCOPE_TEST_ONLY
+        if test_only
+        else SELECTION_REGISTRY_SCOPE_PRODUCTION
+    )
+    if (
+        selection_registry_scope == SELECTION_REGISTRY_SCOPE_PRODUCTION
+        and selection_registry_hash != production_registry_hash
+    ):
+        raise ValueError("production_adapter_selection_hash_mismatch")
+
+    def output(
+        status: str,
+        *,
+        execution_ok: bool,
+        provider_called: bool,
+        **payload: Any,
+    ) -> dict[str, Any]:
+        return _adapter_output(
+            status,
+            execution_ok=execution_ok,
+            provider_called=provider_called,
+            production_adapter_registry_hash=production_registry_hash,
+            selection_adapter_registry_hash=selection_registry_hash,
+            selection_registry_scope=selection_registry_scope,
+            **payload,
+        )
+
     requested = (capability, origin_source, adapter, source_version)
     if not all(_is_canonical_identifier(value) for value in requested):
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_REQUEST_INVALID,
             execution_ok=False,
             provider_called=False,
@@ -547,7 +588,7 @@ def _execute_source_adapter_core(
         environ={} if environ is None else environ,
     )
     if route["status"] != "SOURCE_ROUTE_SELECTED":
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_ROUTE_REJECTED,
             execution_ok=True,
             provider_called=False,
@@ -562,7 +603,7 @@ def _execute_source_adapter_core(
         None,
     )
     if binding is None:
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_REQUEST_INVALID,
             execution_ok=False,
             provider_called=False,
@@ -573,7 +614,7 @@ def _execute_source_adapter_core(
             test_only=test_only,
         )
     if not isinstance(provider_envelope, SourceProviderEnvelope):
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_REQUEST_INVALID,
             execution_ok=False,
             provider_called=False,
@@ -587,7 +628,7 @@ def _execute_source_adapter_core(
         binding["provider_key"]
         and provider_envelope.provider_key != binding["provider_key"]
     ):
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_REQUEST_INVALID,
             execution_ok=False,
             provider_called=False,
@@ -600,7 +641,7 @@ def _execute_source_adapter_core(
             test_only=test_only,
         )
     if binding["implementation_status"] != IMPLEMENTATION_BOUND:
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_NOT_IMPLEMENTED,
             execution_ok=True,
             provider_called=False,
@@ -624,7 +665,7 @@ def _execute_source_adapter_core(
         if any(not isinstance(row, Mapping) for row in records):
             raise TypeError("provider_record_mapping_required")
     except Exception as exc:
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_PROVIDER_FAILED,
             execution_ok=False,
             provider_called=True,
@@ -637,7 +678,7 @@ def _execute_source_adapter_core(
         )
 
     if not records:
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_PROVIDER_EMPTY,
             execution_ok=True,
             provider_called=True,
@@ -656,7 +697,7 @@ def _execute_source_adapter_core(
         environ={} if environ is None else environ,
     )
     if provenance["status"] != "SOURCE_PROVENANCE_ACCEPTED":
-        return _adapter_output(
+        return output(
             SOURCE_ADAPTER_PROVENANCE_REJECTED,
             execution_ok=True,
             provider_called=True,
@@ -668,7 +709,7 @@ def _execute_source_adapter_core(
             route_status=route["status"],
             test_only=test_only,
         )
-    return _adapter_output(
+    return output(
         SOURCE_ADAPTER_BOUND,
         execution_ok=True,
         provider_called=True,
@@ -687,14 +728,24 @@ def _adapter_output(
     *,
     execution_ok: bool,
     provider_called: bool,
+    production_adapter_registry_hash: str,
+    selection_adapter_registry_hash: str,
+    selection_registry_scope: str,
     **payload: Any,
 ) -> dict[str, Any]:
+    if selection_registry_scope not in SELECTION_REGISTRY_SCOPES:
+        raise ValueError("selection_registry_scope_invalid")
     return _safe_output(
         {
             "status": status,
             "execution_ok": bool(execution_ok),
             "adapter_registry_schema_version": ADAPTER_REGISTRY_SCHEMA_VERSION,
-            "adapter_registry_hash": compute_source_adapter_registry_hash(),
+            "adapter_registry_hash": selection_adapter_registry_hash,
+            "production_adapter_registry_hash": (
+                production_adapter_registry_hash
+            ),
+            "selection_adapter_registry_hash": selection_adapter_registry_hash,
+            "selection_registry_scope": selection_registry_scope,
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
             "provider_called": provider_called,

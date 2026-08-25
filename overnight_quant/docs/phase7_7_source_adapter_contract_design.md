@@ -52,6 +52,21 @@ provider_key + implementation_status + legacy_implementation_present
 子集和换序哈希入口为模块私有函数，不能用于生产授权。输入顺序不影响私有测试哈希，但
 删除一项、增加一项或修改固定绑定即使重新签名，也不能通过生产矩阵校验。
 
+执行结果明确区分固定生产矩阵和本次实际选择矩阵：
+
+| 字段 | 含义 |
+|---|---|
+| `production_adapter_registry_hash` | 固定 28 项生产矩阵的哈希 |
+| `selection_adapter_registry_hash` | 本次执行实际使用、规范化后的绑定矩阵哈希 |
+| `selection_registry_scope` | 只能为 `production` 或 `test_only` |
+| `adapter_registry_hash` | 兼容字段，固定等于本次 `selection_adapter_registry_hash` |
+
+公开 `execute_source_adapter()` 只能使用完整生产矩阵，因此 scope 为 `production`，两个
+哈希必须完全相同。私有测试入口的 scope 为 `test_only`，selection hash 必须根据实际传入
+的测试绑定重新计算；修改测试 provider key 等绑定字段会改变 selection hash，不能用生产
+哈希冒充测试选择矩阵。离线审计命令只审计固定生产矩阵，三个哈希字段均指向生产哈希，
+scope 为 `production`。
+
 ## 3. 覆盖矩阵
 
 B2.1 为 B1 的全部 28 项能力输出一行。当前 13 项只能证明仓库中存在旧实现；它们的
@@ -84,7 +99,7 @@ B2.1 为 B1 的全部 28 项能力输出一行。当前 13 项只能证明仓库
 和可选 wrapper 身份，不是独立来源或正式硬门禁来源。mootdx 盘口、F10 和财务等虽在
 B1 注册表出现，但当前没有相同版本的可执行 provider 合同。
 
-当前适配注册表哈希为：
+当前固定生产适配注册表哈希为：
 
 ```text
 4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be
