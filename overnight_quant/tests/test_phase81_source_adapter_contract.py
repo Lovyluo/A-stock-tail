@@ -22,6 +22,7 @@ from overnight_quant.data.source_capability_adapters import (
     ADAPTER_REGISTRY_SCHEMA_VERSION,
     SOURCE_ADAPTER_AUDIT_COMPLETE,
     SOURCE_ADAPTER_BOUND,
+    SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
     SOURCE_ADAPTER_NOT_IMPLEMENTED,
     SOURCE_ADAPTER_PROVIDER_EMPTY,
     SOURCE_ADAPTER_PROVIDER_FAILED,
@@ -48,7 +49,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be"
+    "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -142,8 +143,9 @@ def _test_bound_binding(provider_key=TEST_PROVIDER_KEY):
     return SourceAdapterBinding(
         **QUOTE_IDENTITY,
         provider_key=provider_key,
+        candidate_provider_key="",
+        legacy_provider_key="",
         implementation_status="bound",
-        legacy_implementation_present=False,
     )
 
 
@@ -167,8 +169,9 @@ def _run_test_valuation(provider):
     binding = SourceAdapterBinding(
         **VALUATION_IDENTITY,
         provider_key=VALUATION_TEST_PROVIDER_KEY,
+        candidate_provider_key="",
+        legacy_provider_key="",
         implementation_status="bound",
-        legacy_implementation_present=False,
     )
     return adapters._execute_source_adapter_with_bindings_for_test(
         **VALUATION_IDENTITY,
@@ -237,13 +240,13 @@ def test_production_adapter_matrix_exactly_covers_b1_28_identities():
             row["provider_key"],
         ),
     )
-    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v2"
+    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v3"
     assert compute_source_capability_registry_hash() == (
         adapters.EXPECTED_CAPABILITY_REGISTRY_HASH
     )
 
 
-def test_production_registry_has_zero_bound_and_13_legacy_incompatible_entries():
+def test_production_registry_has_zero_bound_two_candidates_and_13_legacy_entries():
     audit = audit_source_adapters(environ={})
     legacy = [
         row
@@ -252,10 +255,13 @@ def test_production_registry_has_zero_bound_and_13_legacy_incompatible_entries()
     ]
 
     assert audit["bound_count"] == 0
+    assert audit["candidate_count"] == 2
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 13
+    assert audit["contract_incompatible_count"] == 11
     assert len(legacy) == 13
-    assert all(row["implementation_status"] == "contract_incompatible" for row in legacy)
+    assert {
+        row["implementation_status"] for row in legacy
+    } == {"candidate_not_activated", "contract_incompatible"}
     assert all(row["status"] != SOURCE_ADAPTER_BOUND for row in legacy)
     _assert_safe(audit, audit=True)
 
@@ -269,12 +275,13 @@ def test_real_legacy_provider_signatures_and_return_types_are_not_reported_bound
 
     assert len(legacy_rows) == 13
     for row in legacy_rows:
-        provider, expected_return = LEGACY_PROVIDER_OBJECTS[row["provider_key"]]
+        provider, expected_return = LEGACY_PROVIDER_OBJECTS[
+            row["legacy_provider_key"]
+        ]
         signature = inspect.signature(provider)
         assert signature.return_annotation == expected_return
-        assert row["implementation_status"] == "contract_incompatible"
         assert row["implementation_status"] != "bound"
-        if row["provider_key"] != "news_briefing.fetch_cls_telegraph":
+        if row["legacy_provider_key"] != "news_briefing.fetch_cls_telegraph":
             assert next(iter(signature.parameters)) == "self"
 
 
@@ -317,6 +324,8 @@ def test_production_registry_rejects_downgrade_even_after_private_resign():
     target.update(
         {
             "provider_key": "",
+            "candidate_provider_key": "",
+            "legacy_provider_key": "",
             "implementation_status": "not_implemented",
             "legacy_implementation_present": False,
         }
@@ -399,7 +408,7 @@ def test_noncanonical_execution_identity_is_rejected_before_provider(field, valu
     _assert_safe(result, provider_called=False)
 
 
-def test_bare_or_unrelated_callable_cannot_become_bound():
+def test_bare_callable_cannot_bypass_candidate_not_activated_gate():
     calls = 0
 
     def provider():
@@ -413,13 +422,15 @@ def test_bare_or_unrelated_callable_cannot_become_bound():
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
-    assert result["rejection_reasons"] == ["source_provider_envelope_required"]
+    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+    assert result["rejection_reasons"] == [
+        "source_adapter_candidate_not_activated"
+    ]
     assert calls == 0
     _assert_safe(result, provider_called=False)
 
 
-def test_provider_key_mismatch_prevents_provider_call():
+def test_public_candidate_rejects_unrelated_provider_without_calling_it():
     calls = 0
 
     def provider():
@@ -436,15 +447,15 @@ def test_provider_key_mismatch_prevents_provider_call():
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
+    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
     assert result["rejection_reasons"] == [
-        "source_adapter_provider_key_mismatch"
+        "source_adapter_candidate_not_activated"
     ]
     assert calls == 0
     _assert_safe(result, provider_called=False)
 
 
-def test_matching_legacy_provider_key_remains_contract_incompatible_and_is_not_called():
+def test_matching_candidate_or_legacy_provider_key_is_not_called_in_production():
     row = next(
         item
         for item in get_source_adapter_registry()
@@ -460,12 +471,21 @@ def test_matching_legacy_provider_key_remains_contract_incompatible_and_is_not_c
 
     result = execute_source_adapter(
         **QUOTE_IDENTITY,
-        provider_envelope=_test_envelope(provider, row["provider_key"]),
+        provider_envelope=_test_envelope(
+            provider,
+            row["candidate_provider_key"],
+        ),
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_NOT_IMPLEMENTED
-    assert result["binding"]["implementation_status"] == "contract_incompatible"
+    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+    assert result["binding"]["implementation_status"] == (
+        "candidate_not_activated"
+    )
+    assert result["binding"]["provider_key"] == ""
+    assert result["binding"]["legacy_provider_key"] == (
+        "astock_client.AStockClient._tencent_quotes"
+    )
     assert calls == 0
     _assert_safe(result, provider_called=False)
 
@@ -653,12 +673,13 @@ def test_public_execution_uses_production_registry_hash_and_scope():
         **QUOTE_IDENTITY,
         provider_envelope=_test_envelope(
             lambda: [_quote_record()],
-            binding["provider_key"],
+            binding["candidate_provider_key"],
         ),
         environ={},
     )
 
     assert result["selection_registry_scope"] == "production"
+    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
     assert result["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert result["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert result["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH

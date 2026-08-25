@@ -31,19 +31,23 @@ B1 注册表负责来源政策：
 capability + origin_source + adapter + source_version
 ```
 
-B2.1 适配注册表在完全相同的身份上增加：
+B2.2b 将适配注册表升级为确定性的三槽位生命周期模型：
 
 ```text
-provider_key + implementation_status + legacy_implementation_present
+provider_key + candidate_provider_key + legacy_provider_key
+implementation_status
 ```
 
-`provider_key` 对仓库中已有实现提供符号引用，但“代码存在”不等于“合同兼容”。审计
-命令不会导入该符号，也不会创建真实 provider。每个适配身份必须在 B1 固定注册表中
-唯一匹配；重复、缺失、新增、版本不符、非规范大小写/空格或固定状态被修改都失效关闭。
+`provider_key` 只保存已经启用的正式可执行实现，本阶段全部为空；
+`candidate_provider_key` 保存合同兼容但尚未启用的候选实现；`legacy_provider_key` 保存仅供
+审计的历史实现。`legacy_implementation_present` 如需出现在兼容审计输出中，只能由
+`legacy_provider_key` 是否非空确定性派生，不能由调用方自由声明。审计命令不会导入这些
+符号，也不会创建真实 provider。每个适配身份必须在 B1 固定注册表中唯一匹配；重复、
+缺失、新增、版本不符、非规范大小写/空格或固定状态被修改都失效关闭。
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v2`；
+- `source_capability_adapter_registry_v3`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 28 项适配绑定。
@@ -69,13 +73,14 @@ scope 为 `production`。
 
 ## 3. 覆盖矩阵
 
-B2.1 为 B1 的全部 28 项能力输出一行。当前 13 项只能证明仓库中存在旧实现；它们的
-真实调用签名或返回结构不符合零参数 envelope 和 B1 provenance batch 合同，因此统一为
-`legacy_implementation_present=true`、`implementation_status=contract_incompatible`：
+B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。当前共有 13 项带历史实现，其中腾讯 quote
+和 valuation 同时登记合同兼容的新候选与历史实现，状态为 `candidate_not_activated`；其余
+11 项历史实现仍为 `contract_incompatible`。所有生产 `provider_key` 均为空：
 
-| 能力 | 原始来源 | 适配器 | provider key | 不兼容原因 |
+| 能力 | 原始来源 | 适配器 | candidate/legacy provider key | 状态或不兼容原因 |
 |---|---|---|---|---|
-| quote、valuation | 腾讯 | direct_http | `AStockClient._tencent_quotes` | 需要实例与 codes，返回普通 dict，无 B1 provenance |
+| quote | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_quote_records` / `AStockClient._tencent_quotes` | `candidate_not_activated` |
+| valuation | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_valuation_records` / `AStockClient._tencent_quotes` | `candidate_not_activated` |
 | trading_calendar | 腾讯 | direct_http | `collect_trading_calendar` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | daily_bar_qfq | 腾讯 | direct_http | `collect_qfq_daily_bars` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | industry_snapshot | 东财 | direct_http | `collect_industry` | 需要实例与 observed_at，返回 `ProviderBatch` |
@@ -99,11 +104,20 @@ B2.1 为 B1 的全部 28 项能力输出一行。当前 13 项只能证明仓库
 和可选 wrapper 身份，不是独立来源或正式硬门禁来源。mootdx 盘口、F10 和财务等虽在
 B1 注册表出现，但当前没有相同版本的可执行 provider 合同。
 
-当前固定生产适配注册表哈希为：
+Schema v2 的旧适配注册表哈希为：
 
 ```text
 4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be
 ```
+
+三槽位 Schema v3 的固定生产适配注册表哈希为：
+
+```text
+1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d
+```
+
+哈希变化只来自 schema 版本、三槽位结构与腾讯候选登记；B1 registry hash 保持
+`303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69`。
 
 ## 4. 失效关闭执行链
 
@@ -113,11 +127,13 @@ B1 注册表出现，但当前没有相同版本的可执行 provider 合同。
 2. 使用 B1 `route_source_capability(..., require_hard_gate=False)`；
 3. 路由拒绝时不调用 provider；
 4. 核对 28 项适配矩阵中的完整身份和 provider key；
-5. 拒绝裸 callable、错误 envelope 和不匹配的 provider key；
-6. 只有 `implementation_status=bound` 才调用 envelope 中的 callable；
-7. 区分合法空结果和 provider 异常；
-8. 使用 B1 `validate_source_provenance_batch(..., require_hard_gate=False)`；
-9. 追溯通过后仍固定 `hard_gate_authorized=false` 和 `data_ready=false`。
+5. 遇到 `candidate_not_activated` 立即返回
+   `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED`，不检查或调用候选/历史 provider；
+6. 拒绝裸 callable、错误 envelope 和不匹配的 provider key；
+7. 只有 `implementation_status=bound` 才调用 envelope 中的 callable；
+8. 区分合法空结果和 provider 异常；
+9. 使用 B1 `validate_source_provenance_batch(..., require_hard_gate=False)`；
+10. 追溯通过后仍固定 `hard_gate_authorized=false` 和 `data_ready=false`。
 
 适配层不会补写或修复 provider 返回记录。以下字段必须由 provider 原样提供：
 
@@ -132,7 +148,7 @@ request_hash, raw_hash
 旧 collector 常用的单一 `source` 字段不会被转换成 `origin_source` 和 `adapter`，而是明确
 拒绝。
 
-生产矩阵当前没有 `bound` 条目，因此不会调用这 13 个旧实现。模块私有测试入口可以
+生产矩阵当前没有 `bound` 条目，因此不会调用候选或这 13 个旧实现。模块私有测试入口可以
 注入一条合同兼容的测试绑定，用于验证 envelope、provenance 和安全状态；该入口始终为
 `test_only`，不能改变生产矩阵或 hard gate。
 
@@ -142,6 +158,7 @@ request_hash, raw_hash
 |---|---|
 | `SOURCE_ADAPTER_AUDIT_COMPLETE` | 28 项离线矩阵已生成 |
 | `SOURCE_ADAPTER_BOUND` | 完整 envelope 绑定和注入数据均通过；生产矩阵当前为 0 |
+| `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED` | 合同兼容候选已登记但未启用，provider 未调用 |
 | `SOURCE_ADAPTER_NOT_IMPLEMENTED` | 无实现或已有实现与 B1 合同不兼容 |
 | `SOURCE_ADAPTER_REQUEST_INVALID` | 身份、版本或 provider 参数无效 |
 | `SOURCE_ADAPTER_ROUTE_REJECTED` | B1 政策拒绝，provider 未调用 |
@@ -180,4 +197,4 @@ upstream_network_activity=unknown
 - 不导入或回退到 Tushare、Ashare；
 - 不修改策略、评分、阈值、正式配置、CI 或连续资格计数；
 - 不启动 mootdx 连续三日任务；
-- 不进入 B2.2。
+- 不进入 B2.2c，不启用腾讯正式绑定。

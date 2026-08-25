@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any, Callable, Iterable, Mapping
 
 from overnight_quant.data.point_in_time import stable_hash
@@ -13,7 +14,16 @@ from overnight_quant.data.source_capability_registry import (
 )
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v2"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v3"
+PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
+    "source_capability_adapter_registry_v2"
+)
+PREVIOUS_ADAPTER_REGISTRY_HASH = (
+    "4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be"
+)
+ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
+    "schema_v3_provider_candidate_legacy_slots_and_tencent_candidates"
+)
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
     "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
@@ -21,6 +31,9 @@ EXPECTED_CAPABILITY_REGISTRY_HASH = (
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
 SOURCE_ADAPTER_BOUND = "SOURCE_ADAPTER_BOUND"
+SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED = (
+    "SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED"
+)
 SOURCE_ADAPTER_NOT_IMPLEMENTED = "SOURCE_ADAPTER_NOT_IMPLEMENTED"
 SOURCE_ADAPTER_REQUEST_INVALID = "SOURCE_ADAPTER_REQUEST_INVALID"
 SOURCE_ADAPTER_ROUTE_REJECTED = "SOURCE_ADAPTER_ROUTE_REJECTED"
@@ -29,17 +42,23 @@ SOURCE_ADAPTER_PROVIDER_FAILED = "SOURCE_ADAPTER_PROVIDER_FAILED"
 SOURCE_ADAPTER_PROVENANCE_REJECTED = "SOURCE_ADAPTER_PROVENANCE_REJECTED"
 
 IMPLEMENTATION_BOUND = "bound"
+IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED = "candidate_not_activated"
 IMPLEMENTATION_CONTRACT_INCOMPATIBLE = "contract_incompatible"
 IMPLEMENTATION_NOT_IMPLEMENTED = "not_implemented"
 IMPLEMENTATION_OPTIONAL_UNCONFIGURED = "optional_unconfigured"
 IMPLEMENTATION_RETIRED = "retired"
 IMPLEMENTATION_STATUSES = {
     IMPLEMENTATION_BOUND,
+    IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED,
     IMPLEMENTATION_CONTRACT_INCOMPATIBLE,
     IMPLEMENTATION_NOT_IMPLEMENTED,
     IMPLEMENTATION_OPTIONAL_UNCONFIGURED,
     IMPLEMENTATION_RETIRED,
 }
+
+_PROVIDER_KEY_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
+)
 
 UPSTREAM_ACTIVITY_NOT_CALLED = "not_called"
 UPSTREAM_ACTIVITY_NOT_APPLICABLE = "not_applicable"
@@ -69,8 +88,9 @@ class SourceAdapterBinding:
     adapter: str
     source_version: str
     provider_key: str
+    candidate_provider_key: str
+    legacy_provider_key: str
     implementation_status: str
-    legacy_implementation_present: bool
 
     def __post_init__(self) -> None:
         for field in (
@@ -83,14 +103,25 @@ class SourceAdapterBinding:
             value = getattr(self, field)
             if not _is_canonical_identifier(value):
                 raise ValueError(f"source_adapter_identity_not_canonical:{field}")
-        if not isinstance(self.provider_key, str):
-            raise ValueError("source_adapter_field_invalid:provider_key")
-        if self.provider_key != self.provider_key.strip():
-            raise ValueError("source_adapter_provider_key_not_canonical")
-        if type(self.legacy_implementation_present) is not bool:
-            raise ValueError(
-                "source_adapter_bool_invalid:legacy_implementation_present"
-            )
+        provider_fields = (
+            "provider_key",
+            "candidate_provider_key",
+            "legacy_provider_key",
+        )
+        for field in provider_fields:
+            value = getattr(self, field)
+            if not isinstance(value, str):
+                raise ValueError(f"source_adapter_field_invalid:{field}")
+            if value != value.strip() or (
+                value and _PROVIDER_KEY_PATTERN.fullmatch(value) is None
+            ):
+                raise ValueError(
+                    f"source_adapter_provider_key_not_canonical:{field}"
+                )
+        nonempty_keys = [getattr(self, field) for field in provider_fields]
+        nonempty_keys = [value for value in nonempty_keys if value]
+        if len(nonempty_keys) != len(set(nonempty_keys)):
+            raise ValueError("source_adapter_provider_key_slots_duplicate")
         if self.implementation_status not in IMPLEMENTATION_STATUSES:
             raise ValueError(
                 "source_adapter_implementation_status_invalid:"
@@ -99,16 +130,34 @@ class SourceAdapterBinding:
         if self.implementation_status == IMPLEMENTATION_BOUND:
             if not self.provider_key:
                 raise ValueError("source_adapter_bound_provider_key_missing")
-            if self.legacy_implementation_present:
-                raise ValueError("source_adapter_bound_cannot_be_legacy")
+            if self.candidate_provider_key:
+                raise ValueError("source_adapter_bound_candidate_key_invalid")
+        elif (
+            self.implementation_status
+            == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
+        ):
+            if self.provider_key or not self.candidate_provider_key:
+                raise ValueError("source_adapter_candidate_contract_invalid")
         elif self.implementation_status == IMPLEMENTATION_CONTRACT_INCOMPATIBLE:
-            if not self.provider_key or not self.legacy_implementation_present:
+            if (
+                self.provider_key
+                or self.candidate_provider_key
+                or not self.legacy_provider_key
+            ):
                 raise ValueError("source_adapter_legacy_contract_invalid")
-        elif self.provider_key or self.legacy_implementation_present:
+        elif (
+            self.provider_key
+            or self.candidate_provider_key
+            or self.legacy_provider_key
+        ):
             raise ValueError("source_adapter_unbound_provider_contract_invalid")
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result["legacy_implementation_present"] = bool(
+            self.legacy_provider_key
+        )
+        return result
 
 
 @dataclass(frozen=True)
@@ -248,6 +297,27 @@ _LEGACY_PROVIDER_KEYS = {
     ),
 }
 
+_CANDIDATE_PROVIDER_KEYS = {
+    _identity(
+        "quote",
+        "tencent",
+        "direct_http",
+        "qt.gtimg.cn~88_fields_v2026-07-30",
+    ): (
+        "tencent_direct_http_providers.TencentDirectHttpProviders."
+        "collect_quote_records"
+    ),
+    _identity(
+        "valuation",
+        "tencent",
+        "direct_http",
+        "qt.gtimg.cn~88_fields_v2026-07-30",
+    ): (
+        "tencent_direct_http_providers.TencentDirectHttpProviders."
+        "collect_valuation_records"
+    ),
+}
+
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
     rows = get_source_capability_registry()
@@ -268,28 +338,28 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
             row["adapter"],
             row["source_version"],
         )
-        provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
-        if provider_key:
+        legacy_provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
+        candidate_provider_key = _CANDIDATE_PROVIDER_KEYS.get(identity, "")
+        if candidate_provider_key:
+            implementation_status = IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
+        elif legacy_provider_key:
             implementation_status = IMPLEMENTATION_CONTRACT_INCOMPATIBLE
-            legacy_present = True
         elif row["role"] == "retired":
             implementation_status = IMPLEMENTATION_RETIRED
-            legacy_present = False
         elif row["adapter"] == "iwencai_openapi":
             implementation_status = IMPLEMENTATION_OPTIONAL_UNCONFIGURED
-            legacy_present = False
         else:
             implementation_status = IMPLEMENTATION_NOT_IMPLEMENTED
-            legacy_present = False
         bindings.append(
             SourceAdapterBinding(
                 capability=row["capability"],
                 origin_source=row["origin_source"],
                 adapter=row["adapter"],
                 source_version=row["source_version"],
-                provider_key=provider_key,
+                provider_key="",
+                candidate_provider_key=candidate_provider_key,
+                legacy_provider_key=legacy_provider_key,
                 implementation_status=implementation_status,
-                legacy_implementation_present=legacy_present,
             )
         )
     return tuple(bindings)
@@ -306,12 +376,31 @@ def _canonicalize_source_adapter_bindings_for_test(
     fields = tuple(SourceAdapterBinding.__dataclass_fields__)
     rows = []
     seen = set()
+    derived_flag_not_supplied = object()
     for value in entries:
-        raw = value.as_dict() if isinstance(value, SourceAdapterBinding) else dict(value)
+        if isinstance(value, SourceAdapterBinding):
+            raw = {field: getattr(value, field) for field in fields}
+            supplied_derived_legacy = derived_flag_not_supplied
+        else:
+            raw = dict(value)
+            supplied_derived_legacy = raw.pop(
+                "legacy_implementation_present",
+                derived_flag_not_supplied,
+            )
+            if set(raw) != set(fields):
+                raise ValueError("source_adapter_binding_fields_invalid")
         binding = SourceAdapterBinding(
             **{field: raw.get(field) for field in fields}
         )
         row = binding.as_dict()
+        if (
+            supplied_derived_legacy is not derived_flag_not_supplied
+            and supplied_derived_legacy
+            is not row["legacy_implementation_present"]
+        ):
+            raise ValueError(
+                "source_adapter_derived_legacy_flag_mismatch"
+            )
         identity = _binding_identity(row)
         if identity in seen:
             raise ValueError("source_adapter_binding_duplicate:" + "|".join(identity))
@@ -363,6 +452,16 @@ def _validate_binding_policy(
     capability: Mapping[str, Any],
 ) -> None:
     status = binding["implementation_status"]
+    identity = _binding_identity(binding)
+    candidate_provider_key = binding["candidate_provider_key"]
+    provider_key = binding["provider_key"]
+    expected_candidate_key = _CANDIDATE_PROVIDER_KEYS.get(identity, "")
+    for candidate_identity, reserved_key in _CANDIDATE_PROVIDER_KEYS.items():
+        if (
+            reserved_key in {provider_key, candidate_provider_key}
+            and identity != candidate_identity
+        ):
+            raise ValueError("source_adapter_candidate_identity_mismatch")
     if capability["role"] == "retired":
         if status != IMPLEMENTATION_RETIRED:
             raise ValueError("retired_source_adapter_status_invalid")
@@ -375,9 +474,20 @@ def _validate_binding_policy(
         return
     if status == IMPLEMENTATION_OPTIONAL_UNCONFIGURED:
         raise ValueError("optional_unconfigured_adapter_identity_invalid")
+    if status == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED:
+        if (
+            not expected_candidate_key
+            or candidate_provider_key != expected_candidate_key
+            or binding["legacy_provider_key"]
+            != _LEGACY_PROVIDER_KEYS.get(identity, "")
+        ):
+            raise ValueError("source_adapter_candidate_binding_mismatch")
+        return
     if status == IMPLEMENTATION_CONTRACT_INCOMPATIBLE:
-        identity = _binding_identity(binding)
-        if _LEGACY_PROVIDER_KEYS.get(identity) != binding["provider_key"]:
+        if (
+            _LEGACY_PROVIDER_KEYS.get(identity)
+            != binding["legacy_provider_key"]
+        ):
             raise ValueError("source_adapter_legacy_provider_binding_mismatch")
 
 
@@ -432,6 +542,11 @@ def audit_source_adapters(
             status = SOURCE_ADAPTER_ROUTE_REJECTED
         elif binding["implementation_status"] == IMPLEMENTATION_BOUND:
             status = SOURCE_ADAPTER_BOUND
+        elif (
+            binding["implementation_status"]
+            == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
+        ):
+            status = SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
         else:
             status = SOURCE_ADAPTER_NOT_IMPLEMENTED
         matrix.append(
@@ -455,11 +570,23 @@ def audit_source_adapters(
             "production_adapter_registry_hash": production_registry_hash,
             "selection_adapter_registry_hash": production_registry_hash,
             "selection_registry_scope": SELECTION_REGISTRY_SCOPE_PRODUCTION,
+            "previous_adapter_registry_schema_version": (
+                PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
+            ),
+            "previous_adapter_registry_hash": PREVIOUS_ADAPTER_REGISTRY_HASH,
+            "adapter_registry_hash_change_reason": (
+                ADAPTER_REGISTRY_HASH_CHANGE_REASON
+            ),
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
             "adapter_entry_count": len(matrix),
             "bound_count": sum(
                 row["implementation_status"] == IMPLEMENTATION_BOUND
+                for row in matrix
+            ),
+            "candidate_count": sum(
+                row["implementation_status"]
+                == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
                 for row in matrix
             ),
             "legacy_implementation_present_count": sum(
@@ -613,6 +740,21 @@ def _execute_source_adapter_core(
             route_status=route["status"],
             test_only=test_only,
         )
+    if (
+        binding["implementation_status"]
+        == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
+    ):
+        return output(
+            SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
+            execution_ok=True,
+            provider_called=False,
+            capability=capability,
+            requested_identity=list(requested),
+            binding=binding,
+            rejection_reasons=["source_adapter_candidate_not_activated"],
+            route_status=route["status"],
+            test_only=test_only,
+        )
     if not isinstance(provider_envelope, SourceProviderEnvelope):
         return output(
             SOURCE_ADAPTER_REQUEST_INVALID,
@@ -641,6 +783,16 @@ def _execute_source_adapter_core(
             test_only=test_only,
         )
     if binding["implementation_status"] != IMPLEMENTATION_BOUND:
+        reason_by_status = {
+            IMPLEMENTATION_CONTRACT_INCOMPATIBLE: (
+                "source_adapter_contract_incompatible"
+            ),
+            IMPLEMENTATION_NOT_IMPLEMENTED: "source_adapter_not_implemented",
+            IMPLEMENTATION_OPTIONAL_UNCONFIGURED: (
+                "source_adapter_optional_unconfigured"
+            ),
+            IMPLEMENTATION_RETIRED: "source_adapter_retired",
+        }
         return output(
             SOURCE_ADAPTER_NOT_IMPLEMENTED,
             execution_ok=True,
@@ -649,10 +801,10 @@ def _execute_source_adapter_core(
             requested_identity=list(requested),
             binding=binding,
             rejection_reasons=[
-                "source_adapter_contract_incompatible"
-                if binding["implementation_status"]
-                == IMPLEMENTATION_CONTRACT_INCOMPATIBLE
-                else "source_adapter_not_implemented"
+                reason_by_status.get(
+                    binding["implementation_status"],
+                    "source_adapter_not_implemented",
+                )
             ],
             route_status=route["status"],
             test_only=test_only,
@@ -846,14 +998,21 @@ def _adapter_sort_key(row: Mapping[str, Any]) -> tuple[str, ...]:
         str(row["adapter"]),
         str(row["source_version"]),
         str(row["provider_key"]),
+        str(row["candidate_provider_key"]),
+        str(row["legacy_provider_key"]),
+        str(row["implementation_status"]),
     )
 
 
 __all__ = [
     "ADAPTER_REGISTRY_SCHEMA_VERSION",
+    "ADAPTER_REGISTRY_HASH_CHANGE_REASON",
+    "PREVIOUS_ADAPTER_REGISTRY_HASH",
+    "PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION",
     "SOURCE_ADAPTER_AUDIT_COMPLETE",
     "SOURCE_ADAPTER_BINDINGS",
     "SOURCE_ADAPTER_BOUND",
+    "SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED",
     "SOURCE_ADAPTER_NOT_IMPLEMENTED",
     "SOURCE_ADAPTER_PROVIDER_EMPTY",
     "SOURCE_ADAPTER_PROVIDER_FAILED",
