@@ -57,6 +57,13 @@ QUOTE_IDENTITY = {
     "source_version": "qt.gtimg.cn~88_fields_v2026-07-30",
 }
 TEST_PROVIDER_KEY = "tests.contract_compatible_quote_v1"
+VALUATION_IDENTITY = {
+    "capability": "valuation",
+    "origin_source": "tencent",
+    "adapter": "direct_http",
+    "source_version": "qt.gtimg.cn~88_fields_v2026-07-30",
+}
+VALUATION_TEST_PROVIDER_KEY = "tests.contract_compatible_valuation_v1"
 
 
 LEGACY_PROVIDER_OBJECTS = {
@@ -116,6 +123,7 @@ LEGACY_PROVIDER_OBJECTS = {
 
 def _quote_record(**changes):
     row = {
+        "capability": "quote",
         "origin_source": "tencent",
         "adapter": "direct_http",
         "source_version": "qt.gtimg.cn~88_fields_v2026-07-30",
@@ -151,6 +159,24 @@ def _run_test_quote(provider, *, provider_key=TEST_PROVIDER_KEY):
         **QUOTE_IDENTITY,
         provider_envelope=_test_envelope(provider, provider_key),
         entries=[_test_bound_binding()],
+        environ={},
+    )
+
+
+def _run_test_valuation(provider):
+    binding = SourceAdapterBinding(
+        **VALUATION_IDENTITY,
+        provider_key=VALUATION_TEST_PROVIDER_KEY,
+        implementation_status="bound",
+        legacy_implementation_present=False,
+    )
+    return adapters._execute_source_adapter_with_bindings_for_test(
+        **VALUATION_IDENTITY,
+        provider_envelope=SourceProviderEnvelope(
+            provider_key=VALUATION_TEST_PROVIDER_KEY,
+            provider_callable=provider,
+        ),
+        entries=[binding],
         environ={},
     )
 
@@ -483,6 +509,7 @@ def test_unknown_and_retired_routes_do_not_call_provider(
 def test_existing_source_field_is_rejected_without_identity_repair():
     records = [
         {
+            "capability": "quote",
             "source": "tencent_quote",
             "source_version": QUOTE_IDENTITY["source_version"],
             "event_time": "2026-08-25T14:49:00+08:00",
@@ -509,6 +536,54 @@ def test_called_provider_reports_upstream_network_activity_unknown_not_zero():
     assert result["test_only"] is True
     assert result["network_requests_made"] is None
     assert result["upstream_network_activity"] == "unknown"
+    _assert_safe(result, provider_called=True)
+
+
+def test_quote_request_rejects_valuation_capability_record():
+    result = _run_test_quote(
+        lambda: [_quote_record(capability="valuation")]
+    )
+
+    assert result["status"] == SOURCE_ADAPTER_PROVENANCE_REJECTED
+    assert result["rejection_reasons"] == [
+        {
+            "index": 0,
+            "reason": "source_adapter_record_capability_mismatch",
+            "actual_capability": "valuation",
+            "expected_capability": "quote",
+        }
+    ]
+    _assert_safe(result, provider_called=True)
+
+
+def test_valuation_request_rejects_quote_capability_record():
+    result = _run_test_valuation(lambda: [_quote_record()])
+
+    assert result["status"] == SOURCE_ADAPTER_PROVENANCE_REJECTED
+    assert result["rejection_reasons"] == [
+        {
+            "index": 0,
+            "reason": "source_adapter_record_capability_mismatch",
+            "actual_capability": "quote",
+            "expected_capability": "valuation",
+        }
+    ]
+    _assert_safe(result, provider_called=True)
+
+
+def test_provider_record_without_capability_is_rejected():
+    record = _quote_record()
+    del record["capability"]
+
+    result = _run_test_quote(lambda: [record])
+
+    assert result["status"] == SOURCE_ADAPTER_PROVENANCE_REJECTED
+    assert result["rejection_reasons"] == [
+        {
+            "index": 0,
+            "reason": "source_adapter_record_capability_missing",
+        }
+    ]
     _assert_safe(result, provider_called=True)
 
 
