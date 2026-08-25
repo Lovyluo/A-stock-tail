@@ -348,8 +348,9 @@ def _candidate_test_binding(capability, provider_key):
         adapter=TENCENT_ADAPTER,
         source_version=TENCENT_SOURCE_VERSION,
         provider_key=provider_key,
+        candidate_provider_key="",
+        legacy_provider_key="",
         implementation_status="bound",
-        legacy_implementation_present=False,
     )
 
 
@@ -645,7 +646,7 @@ def test_candidates_pass_private_test_only_execution_without_production_binding(
     _assert_safe(result)
 
 
-def test_production_bindings_remain_legacy_and_bound_count_zero():
+def test_production_bindings_register_candidates_without_activation():
     audit = audit_source_adapters(environ={})
     production = [
         row
@@ -655,12 +656,23 @@ def test_production_bindings_remain_legacy_and_bound_count_zero():
     ]
 
     assert audit["bound_count"] == 0
+    assert audit["candidate_count"] == 2
     assert len(production) == 2
     assert all(row["legacy_implementation_present"] is True for row in production)
     assert all(
-        row["implementation_status"] == "contract_incompatible"
+        row["implementation_status"] == "candidate_not_activated"
         for row in production
     )
+    assert all(row["provider_key"] == "" for row in production)
+    assert {
+        row["candidate_provider_key"] for row in production
+    } == {
+        TENCENT_QUOTE_PROVIDER_KEY,
+        TENCENT_VALUATION_PROVIDER_KEY,
+    }
+    assert {
+        row["legacy_provider_key"] for row in production
+    } == {"astock_client.AStockClient._tencent_quotes"}
     _assert_safe(audit)
 
 

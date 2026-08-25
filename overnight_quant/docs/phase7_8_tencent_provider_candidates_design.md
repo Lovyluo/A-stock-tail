@@ -97,22 +97,24 @@ request_hash, raw_hash, payload
 索引 43 明确是振幅，不得作为 PB。空估值字段输出 `null`，并在
 `valuation_availability` 中标记 `missing`；Provider 不用数字 0 填充空值。
 
-## 6. 生产绑定边界与 B2.2b
+## 6. 生产绑定边界与 Schema v3
 
-B2.2a 不修改 `SOURCE_ADAPTER_BINDINGS`。腾讯 quote/valuation 的生产行继续保留历史
-provider key、`legacy_implementation_present=true` 和
-`implementation_status=contract_incompatible`，所以正式 `bound_count=0`。
+B2.2b 采用三槽位 Schema v3，同时保留候选和历史实现：
 
-测试只使用 `_execute_source_adapter_with_bindings_for_test()`，并构造合法、隔离的
-`SourceAdapterBinding`。该候选选择行使用 `legacy_implementation_present=false`，只表达
-本次测试选择，不会进入生产矩阵。独立断言继续证明生产 quote/valuation 行保持
-`contract_incompatible + legacy_implementation_present=true`。B2.2b 必须由 PM 决定
-以下方案之一：
+```text
+provider_key=""
+candidate_provider_key=<TencentDirectHttpProviders 对应方法>
+legacy_provider_key="astock_client.AStockClient._tencent_quotes"
+implementation_status="candidate_not_activated"
+```
 
-1. 增加独立 `legacy_provider_key`，同时审计历史实现与新候选实现；
-2. 升级适配注册表 schema，以显式表达 candidate 与 legacy 共存。
+因此腾讯 quote/valuation 只是登记到生产完整矩阵中的候选，正式 `bound_count=0`。公开执行
+入口遇到该状态固定返回 `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED`，且
+`provider_called=false`；即使 B1 quote 能力允许 hard gate，也不能调用候选或历史实现。
 
-未经 B2.2b 授权，不得删除历史实现标记、修改生产 provider key 或启用 hard gate。
+测试仍只使用 `_execute_source_adapter_with_bindings_for_test()`，并构造隔离的 `bound`
+测试选择行。该私有路径使用独立 selection hash 和 `test_only` scope，不改变生产矩阵。
+未经 B2.2c 单独授权，不得把 candidate 移入 active `provider_key`，也不得启用 hard gate。
 
 ## 7. 只读真实验证
 
