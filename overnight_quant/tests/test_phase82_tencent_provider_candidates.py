@@ -26,6 +26,8 @@ from overnight_quant.data.source_capability_registry import (
 from overnight_quant.data.tencent_direct_http_providers import (
     TENCENT_ADAPTER,
     TENCENT_ORIGIN_SOURCE,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2,
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3,
     TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION,
     TENCENT_QUOTE_PROVIDER_KEY,
     TENCENT_SOURCE_VERSION,
@@ -100,6 +102,32 @@ class FakeTransport:
             content=self.content,
             status_code=self.status_code,
             url=self.response_url or url,
+        )
+
+
+class SequencedTransport:
+    def __init__(self, outcomes) -> None:
+        self.outcomes = list(outcomes)
+        self.request_count = 0
+        self.calls = []
+
+    def request(self, method, url, *, headers, timeout_seconds):
+        self.request_count += 1
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers),
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        outcome = self.outcomes[self.request_count - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return TencentHttpResponse(
+            content=outcome,
+            status_code=200,
+            url=url,
         )
 
 
@@ -238,6 +266,34 @@ def _replace_raw_response(payload, capability, raw_response):
     raw_entry["content_base64"] = base64.b64encode(raw_response).decode("ascii")
     raw_entry["byte_count"] = len(raw_response)
     raw_entry["raw_hash"] = hashlib.sha256(raw_response).hexdigest()
+
+
+def _convert_v3_to_v2(payload):
+    converted = deepcopy(payload)
+    converted["evidence_schema_version"] = TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2
+    converted.pop("capability_attempts")
+    converted.pop("evidence_integrity_verified")
+    converted.pop("provider_validation_passed")
+    for raw_entry in converted["raw_responses"].values():
+        raw_entry.pop("http_status_code")
+        raw_entry.pop("response_url")
+    _resign_evidence(converted)
+    return converted
+
+
+def _convert_v3_to_strict_v1(payload):
+    converted = deepcopy(payload)
+    for key in (
+        "capability_attempts",
+        "evidence_integrity_verified",
+        "evidence_schema_version",
+        "provider_validation_passed",
+        "raw_responses",
+        "upstream_network_activity",
+    ):
+        converted.pop(key)
+    _resign_evidence(converted)
+    return converted
 
 
 def _candidate_test_binding(capability, provider_key):
@@ -598,14 +654,24 @@ def test_network_validation_failure_writes_only_ignored_cache_and_stays_safe(
     )
 
     assert result["status"] == "TENCENT_PROVIDER_NETWORK_VALIDATION_FAILED"
+    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    assert result["evidence_integrity_verified"] is False
+    assert result["provider_validation_passed"] is False
     assert result["network_requests_made"] == 2
     assert output.exists()
     stored = json.loads(output.read_text(encoding="utf-8"))
     assert stored["status"] == result["status"]
     assert "records_by_capability" in stored
     assert all(not rows for rows in stored["records_by_capability"].values())
+    verified = evidence_verify.verify_tencent_provider_evidence(output)
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is False
+    assert verified["verified_capabilities"] == []
+    assert verified["covered_codes"] == []
     _assert_safe(result)
     _assert_safe(stored)
+    _assert_safe(verified)
 
 
 def test_network_validation_success_uses_injected_transport_and_writes_utf8(
@@ -634,6 +700,9 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
         result["evidence_schema_version"]
         == TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION
     )
+    assert result["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
+    assert result["evidence_integrity_verified"] is False
+    assert result["provider_validation_passed"] is True
     assert result["network_requests_made"] == 2
     assert result["upstream_network_activity"] == "measured"
     assert result["capability_results"]["quote"]["record_count"] == 5
@@ -652,8 +721,13 @@ def test_network_validation_success_uses_injected_transport_and_writes_utf8(
         assert raw_entry["capability"] == capability
         assert raw_entry["byte_count"] == len(decoded)
         assert raw_entry["raw_hash"] == hashlib.sha256(decoded).hexdigest()
+        assert type(raw_entry["http_status_code"]) is int
+        assert raw_entry["http_status_code"] == 200
+        assert raw_entry["response_url"].startswith("https://qt.gtimg.cn/")
     verified = evidence_verify.verify_tencent_provider_evidence(output)
     assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is True
     assert verified["stored_evidence_hash"] == result["evidence_hash"]
     assert verified["recomputed_evidence_hash"] == result["evidence_hash"]
     _assert_safe(result)
@@ -721,6 +795,9 @@ def test_evidence_verifier_replay_is_deterministic_and_preserves_original(
         "origin_source",
         "safety_output",
         "network_request_count",
+        "http_status_code",
+        "response_url",
+        "missing_http_status",
     ],
 )
 def test_evidence_verifier_rejects_resigned_contract_tampering(
@@ -764,6 +841,14 @@ def test_evidence_verifier_rejects_resigned_contract_tampering(
         payload["data_ready"] = True
     elif tamper == "network_request_count":
         payload["network_requests_made"] = 0
+    elif tamper == "http_status_code":
+        payload["raw_responses"]["quote"]["http_status_code"] = 201
+    elif tamper == "response_url":
+        payload["raw_responses"]["quote"][
+            "response_url"
+        ] = "https://push2.eastmoney.com/api/quote"
+    elif tamper == "missing_http_status":
+        payload["raw_responses"]["quote"].pop("http_status_code")
     _resign_evidence(payload)
     _write_json(evidence, payload)
 
@@ -780,17 +865,121 @@ def test_legacy_evidence_is_audit_only_and_not_promoted(monkeypatch, tmp_path):
         tmp_path,
         name="legacy.json",
     )
-    payload = json.loads(evidence.read_text(encoding="utf-8"))
-    payload.pop("evidence_schema_version")
-    payload.pop("raw_responses")
-    payload.pop("upstream_network_activity")
-    _resign_evidence(payload)
+    payload = _convert_v3_to_strict_v1(
+        json.loads(evidence.read_text(encoding="utf-8"))
+    )
     _write_json(evidence, payload)
 
     verified = evidence_verify.verify_tencent_provider_evidence(evidence)
 
     assert verified["status"] == evidence_verify.EVIDENCE_LEGACY_AUDIT_ONLY
     assert verified["replay_hash"] == ""
+    _assert_safe(verified)
+
+
+def test_arbitrary_self_signed_legacy_json_is_rejected(tmp_path):
+    evidence = tmp_path / "arbitrary_legacy.json"
+    payload = {
+        "candidate_provider_validation_only": True,
+        "data_ready": False,
+        "hard_gate_authorized": False,
+        "automatic_configuration_change": False,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    _resign_evidence(payload)
+    _write_json(evidence, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_INVALID
+    assert verified["evidence_integrity_verified"] is False
+    assert verified["provider_validation_passed"] is False
+    _assert_safe(verified)
+
+
+def test_v2_success_contract_keeps_original_success_only_semantics(
+    monkeypatch,
+    tmp_path,
+):
+    evidence, _generated, _transport = _generate_success_evidence(
+        monkeypatch,
+        tmp_path,
+        name="v2_success.json",
+    )
+    payload = _convert_v3_to_v2(
+        json.loads(evidence.read_text(encoding="utf-8"))
+    )
+    _write_json(evidence, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(evidence)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_schema_version"] == TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2
+    assert "provider_validation_passed" not in verified
+    assert "evidence_integrity_verified" not in verified
+    _assert_safe(verified)
+
+
+def test_v3_single_capability_failure_is_integrity_verified_not_provider_passed(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    output = tmp_path / "partial_failure.json"
+    transport = SequencedTransport([_response_bytes(), TimeoutError()])
+    result = validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=transport,
+        clock=_clock(
+            OBSERVED_AT,
+            AVAILABLE_AT,
+            OBSERVED_AT + timedelta(seconds=3),
+        ),
+    )
+
+    verified = evidence_verify.verify_tencent_provider_evidence(output)
+
+    assert result["provider_validation_passed"] is False
+    assert result["capability_results"]["quote"]["status"] == (
+        "TENCENT_PROVIDER_CAPABILITY_VALIDATED"
+    )
+    assert result["capability_results"]["valuation"]["error_code"] == (
+        "TENCENT_REQUEST_TIMEOUT"
+    )
+    assert verified["status"] == evidence_verify.EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is False
+    assert verified["verified_capabilities"] == ["quote"]
+    _assert_safe(verified)
+
+
+def test_resigned_failed_evidence_tampering_is_rejected(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    output = tmp_path / "tampered_failure.json"
+    validation.run_tencent_provider_validation(
+        network=True,
+        output=output,
+        transport=FakeTransport(_response_bytes(), error=TimeoutError()),
+        clock=_clock(OBSERVED_AT, AVAILABLE_AT),
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    payload["capability_results"]["quote"][
+        "error_code"
+    ] = "TENCENT_REQUEST_FAILED"
+    _resign_evidence(payload)
+    _write_json(output, payload)
+
+    verified = evidence_verify.verify_tencent_provider_evidence(output)
+
+    assert verified["status"] == evidence_verify.EVIDENCE_INVALID
+    assert verified["evidence_integrity_verified"] is False
+    assert verified["provider_validation_passed"] is False
     _assert_safe(verified)
 
 

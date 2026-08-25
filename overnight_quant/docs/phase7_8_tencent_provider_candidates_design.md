@@ -137,17 +137,39 @@ D:\A-stock\.venv\Scripts\python.exe `
 provenance 状态和总 evidence hash。失败时输出稳定错误并保持安全状态，不使用 demo、
 mootdx 或其他来源。该命令不进入 CI、不创建计划任务，也不修改正式配置。
 
-## 8. v2 证据与独立重放
+## 8. v3 证据、失败审计与独立重放
 
-网络证据固定使用 schema：
+新生成的网络证据固定使用 schema：
 
 ```text
-tencent_provider_network_evidence_v2
+tencent_provider_network_evidence_v3
 ```
 
 每次 quote/valuation 响应的解码前原始字节以 base64 无损嵌入 ignored JSON，并同时记录
-字节数、请求 URL、请求哈希、原始哈希及请求起止时间。旧的无 schema 证据保持原文件
-不变，只能返回 `TENCENT_PROVIDER_EVIDENCE_LEGACY_AUDIT_ONLY`，不能升级为 v2 验证结果。
+字节数、请求 URL、请求哈希、原始哈希、请求起止时间、HTTP 状态码和最终响应 URL。
+verifier 要求状态码为严格整数 `200`，最终 URL 使用 HTTPS 且 hostname 精确为
+`qt.gtimg.cn`。重签 evidence hash 不能绕过这些来源身份门禁。
+
+v3 明确拆分两个结论：
+
+- `evidence_integrity_verified`：独立 verifier 是否完整重算并接受证据结构、哈希、时点、
+  来源身份和失败审计；
+- `provider_validation_passed`：quote 与 valuation 是否都完成五股覆盖、88 字段解析和 B1
+  provenance 验证。
+
+生产者写盘时不能自证完整性，因此原始文件固定
+`evidence_integrity_verified=false`。合法超时、单能力失败或双能力失败在 verifier 复核后可以
+得到 `evidence_integrity_verified=true`，但必须保持
+`provider_validation_passed=false`。失败证据不含成功响应的原始字节，并通过独立的 capability
+attempt 记录开始时间、完成时间、稳定错误码和是否取得响应。任何被篡改但重新签名的失败
+摘要、HTTP 201、非腾讯最终地址或字段缺失仍返回
+`TENCENT_PROVIDER_EVIDENCE_INVALID`。
+
+旧 v2 继续使用原来的“两个能力全部成功才可验证”语义，不静默升级为失败证据合同。旧的
+无 schema v1 证据保持原文件不变，并执行固定字段集合、来源身份、五股覆盖、时点顺序、
+64 位哈希、字段单位和 B1 provenance 的严格校验；只有完整满足旧合同的文件才返回
+`TENCENT_PROVIDER_EVIDENCE_LEGACY_AUDIT_ONLY`。任意 JSON 即使自行计算 evidence hash 也
+不能进入旧版审计状态。v1 始终是 audit-only，不能升级为 v2/v3 来源验证结果。
 
 独立只读 verifier：
 
@@ -162,8 +184,9 @@ verifier 不联网，并执行以下重算：
 - 重算 evidence hash 与每份原始响应 SHA-256；
 - 严格 GBK 解码并重新解析 88 字段；
 - 核对固定五股覆盖、记录 capability、来源身份及 provider key；
+- 核对 HTTP 200、HTTPS 和最终 hostname `qt.gtimg.cn`；
 - 重建 quote/valuation payload，验证时间、request hash 与 B1 provenance；
-- 重算 capability 摘要并核对网络请求数；
+- 重算 capability 成功或失败摘要，并核对尝试次数和网络请求数；
 - 强制 `data_ready=false`、hard gate 禁止、交易输出为空。
 
 verifier 可将确定性重放结果写入另一个 ignored cache 文件。对同一原始证据执行两次，

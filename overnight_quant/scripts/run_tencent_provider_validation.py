@@ -96,12 +96,14 @@ def run_tencent_provider_validation(
     capability_results: dict[str, dict[str, Any]] = {}
     records_by_capability: dict[str, list[dict[str, Any]]] = {}
     raw_responses: dict[str, dict[str, Any]] = {}
+    capability_attempts: dict[str, dict[str, Any]] = {}
     methods = {
         "quote": provider.collect_quote_batch,
         "valuation": provider.collect_valuation_batch,
     }
     for capability, method in methods.items():
         started = perf_counter()
+        attempt_started_at = datetime.now(CN_TZ)
         try:
             batch = method()
             records = list(batch.records)
@@ -161,6 +163,20 @@ def run_tencent_provider_validation(
                 "raw_hash": batch.raw_hash,
                 "observed_at": batch.observed_at,
                 "available_at": batch.available_at,
+                "http_status_code": batch.http_status_code,
+                "response_url": batch.response_url,
+            }
+            capability_attempts[capability] = {
+                "capability": capability,
+                "outcome": "response_received",
+                "error_code": "",
+                "started_at": attempt_started_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "completed_at": datetime.now(CN_TZ).isoformat(
+                    timespec="microseconds"
+                ),
+                "response_captured": True,
             }
         except TencentProviderContractError as exc:
             capability_results[capability] = {
@@ -172,13 +188,25 @@ def run_tencent_provider_validation(
                 "elapsed_ms": round((perf_counter() - started) * 1000, 3),
             }
             records_by_capability[capability] = []
+            capability_attempts[capability] = {
+                "capability": capability,
+                "outcome": "failed",
+                "error_code": exc.code,
+                "started_at": attempt_started_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "completed_at": datetime.now(CN_TZ).isoformat(
+                    timespec="microseconds"
+                ),
+                "response_captured": False,
+            }
 
     validated = all(
         result.get("status") == "TENCENT_PROVIDER_CAPABILITY_VALIDATED"
         for result in capability_results.values()
     )
     request_count = getattr(active_transport, "request_count", None)
-    if isinstance(request_count, int) and request_count >= 0:
+    if type(request_count) is int and request_count >= 0:
         measured_request_count: int | None = request_count
         upstream_network_activity = "measured"
     else:
@@ -203,8 +231,11 @@ def run_tencent_provider_validation(
                 "valuation": TENCENT_VALUATION_PROVIDER_KEY,
             },
             "capability_results": capability_results,
+            "capability_attempts": capability_attempts,
             "records_by_capability": records_by_capability,
             "raw_responses": raw_responses,
+            "evidence_integrity_verified": False,
+            "provider_validation_passed": validated,
             "network_requests_made": measured_request_count,
             "upstream_network_activity": upstream_network_activity,
         }
@@ -265,6 +296,8 @@ def _resolve_cache_output(output: str | Path) -> Path:
 
 def _safe_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload)
+    result.setdefault("evidence_integrity_verified", False)
+    result.setdefault("provider_validation_passed", False)
     result["candidate_provider_validation_only"] = True
     result["data_ready"] = False
     result["hard_gate_authorized"] = False
@@ -282,6 +315,8 @@ def _cli_summary(result: dict[str, Any]) -> dict[str, Any]:
             "status",
             "execution_ok",
             "evidence_schema_version",
+            "evidence_integrity_verified",
+            "provider_validation_passed",
             "network_mode",
             "network_requests_made",
             "upstream_network_activity",

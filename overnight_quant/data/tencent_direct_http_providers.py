@@ -21,8 +21,14 @@ TENCENT_ADAPTER = "direct_http"
 TENCENT_SOURCE_VERSION = "qt.gtimg.cn~88_fields_v2026-07-30"
 TENCENT_RESPONSE_ENCODING = "gbk"
 TENCENT_EXPECTED_FIELD_COUNT = 88
-TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION = (
+TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2 = (
     "tencent_provider_network_evidence_v2"
+)
+TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3 = (
+    "tencent_provider_network_evidence_v3"
+)
+TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION = (
+    TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3
 )
 
 TENCENT_QUOTE_PROVIDER_KEY = (
@@ -66,6 +72,8 @@ class TencentProviderBatch:
     raw_hash: str
     observed_at: str
     available_at: str
+    http_status_code: int
+    response_url: str
 
 
 class TencentTransport(Protocol):
@@ -220,6 +228,8 @@ class TencentDirectHttpProviders:
             "raw_hash": raw_hash,
             "request_url": request_url,
             "raw_response_bytes": raw_content,
+            "http_status_code": response.status_code,
+            "response_url": response.url,
         }
         return rows, context
 
@@ -238,6 +248,8 @@ def _build_batch(
         raw_hash=str(context["raw_hash"]),
         observed_at=context["observed_at"].isoformat(timespec="microseconds"),
         available_at=context["available_at"].isoformat(timespec="microseconds"),
+        http_status_code=int(context["http_status_code"]),
+        response_url=str(context["response_url"]),
     )
 
 
@@ -485,7 +497,7 @@ def _validate_response_identity(
         raise TencentProviderContractError(
             "TENCENT_TRANSPORT_RESPONSE_INVALID"
         )
-    if response.status_code != 200:
+    if type(response.status_code) is not int or response.status_code != 200:
         raise TencentProviderContractError("TENCENT_HTTP_STATUS_INVALID")
     requested = urlparse(request_url)
     returned = urlparse(response.url)
@@ -589,6 +601,8 @@ __all__ = [
     "TENCENT_ORIGIN_SOURCE",
     "TENCENT_QUOTE_ENDPOINT",
     "TENCENT_QUOTE_PROVIDER_KEY",
+    "TENCENT_PROVIDER_EVIDENCE_SCHEMA_V2",
+    "TENCENT_PROVIDER_EVIDENCE_SCHEMA_V3",
     "TENCENT_PROVIDER_EVIDENCE_SCHEMA_VERSION",
     "TENCENT_SOURCE_VERSION",
     "TENCENT_VALUATION_PROVIDER_KEY",
