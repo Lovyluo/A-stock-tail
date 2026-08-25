@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,12 @@ import sys
 
 import pytest
 
+from overnight_quant.data import source_capability_adapters as adapters
+from overnight_quant.data.astock_client import AStockClient
+from overnight_quant.data.minute_probe_sources import MootdxMinuteProbeCollectors
+from overnight_quant.data.real_point_in_time_collectors import (
+    RealPointInTimeCollectors,
+)
 from overnight_quant.data.source_capability_adapters import (
     ADAPTER_REGISTRY_SCHEMA_VERSION,
     SOURCE_ADAPTER_AUDIT_COMPLETE,
@@ -21,8 +28,9 @@ from overnight_quant.data.source_capability_adapters import (
     SOURCE_ADAPTER_PROVENANCE_REJECTED,
     SOURCE_ADAPTER_REQUEST_INVALID,
     SOURCE_ADAPTER_ROUTE_REJECTED,
+    SourceAdapterBinding,
+    SourceProviderEnvelope,
     audit_source_adapters,
-    canonicalize_source_adapter_bindings,
     compute_source_adapter_registry_hash,
     execute_source_adapter,
     get_source_adapter_registry,
@@ -34,15 +42,75 @@ from overnight_quant.data.source_capability_registry import (
 from overnight_quant.scripts.run_source_adapter_audit import (
     run_source_adapter_audit,
 )
+from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
+ADAPTER_REGISTRY_HASH = (
+    "4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be"
+)
 QUOTE_IDENTITY = {
     "capability": "quote",
     "origin_source": "tencent",
     "adapter": "direct_http",
     "source_version": "qt.gtimg.cn~88_fields_v2026-07-30",
+}
+TEST_PROVIDER_KEY = "tests.contract_compatible_quote_v1"
+
+
+LEGACY_PROVIDER_OBJECTS = {
+    "astock_client.AStockClient._tencent_quotes": (
+        AStockClient._tencent_quotes,
+        "dict[str, dict]",
+    ),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_trading_calendar"
+    ): (RealPointInTimeCollectors.collect_trading_calendar, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_qfq_daily_bars"
+    ): (RealPointInTimeCollectors.collect_qfq_daily_bars, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_industry"
+    ): (RealPointInTimeCollectors.collect_industry, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_eastmoney_fund_flow"
+    ): (RealPointInTimeCollectors.collect_eastmoney_fund_flow, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_sina_fund_flow"
+    ): (RealPointInTimeCollectors.collect_sina_fund_flow, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_global_news"
+    ): (RealPointInTimeCollectors.collect_global_news, "ProviderBatch"),
+    "news_briefing.fetch_cls_telegraph": (
+        fetch_cls_telegraph,
+        "list[dict]",
+    ),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_stock_news"
+    ): (RealPointInTimeCollectors.collect_stock_news, "ProviderBatch"),
+    (
+        "real_point_in_time_collectors.RealPointInTimeCollectors."
+        "collect_announcements"
+    ): (RealPointInTimeCollectors.collect_announcements, "ProviderBatch"),
+    (
+        "minute_probe_sources.MootdxMinuteProbeCollectors."
+        "collect_minute_bars"
+    ): (MootdxMinuteProbeCollectors.collect_minute_bars, "ProviderBatch"),
+    (
+        "minute_probe_sources.MootdxMinuteProbeCollectors."
+        "collect_transaction_evidence"
+    ): (
+        MootdxMinuteProbeCollectors.collect_transaction_evidence,
+        "dict[str, Any]",
+    ),
 }
 
 
@@ -62,31 +130,59 @@ def _quote_record(**changes):
     return row
 
 
-def _run_quote(provider):
-    return execute_source_adapter(
+def _test_bound_binding(provider_key=TEST_PROVIDER_KEY):
+    return SourceAdapterBinding(
         **QUOTE_IDENTITY,
-        provider=provider,
+        provider_key=provider_key,
+        implementation_status="bound",
+        legacy_implementation_present=False,
+    )
+
+
+def _test_envelope(provider, provider_key=TEST_PROVIDER_KEY):
+    return SourceProviderEnvelope(
+        provider_key=provider_key,
+        provider_callable=provider,
+    )
+
+
+def _run_test_quote(provider, *, provider_key=TEST_PROVIDER_KEY):
+    return adapters._execute_source_adapter_with_bindings_for_test(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(provider, provider_key),
+        entries=[_test_bound_binding()],
         environ={},
     )
 
 
-def _assert_safe(result):
+def _assert_safe(result, *, provider_called=None, audit=False):
     assert result["data_ready"] is False
     assert result["hard_gate_authorized"] is False
     assert result["require_hard_gate"] is False
     assert result["automatic_configuration_change"] is False
-    assert result["network_requests_made"] == 0
+    assert result["adapter_network_requests_made"] == 0
     assert result["candidates"] == []
     assert result["tickets"] == []
     assert result["orders"] == []
+    if audit:
+        assert result["network_requests_made"] == 0
+        assert result["upstream_network_activity"] == "not_applicable"
+    elif provider_called is True:
+        assert result["provider_called"] is True
+        assert result["network_requests_made"] is None
+        assert result["upstream_network_activity"] == "unknown"
+    elif provider_called is False:
+        assert result["provider_called"] is False
+        assert result["network_requests_made"] == 0
+        assert result["upstream_network_activity"] == "not_called"
 
 
-def test_adapter_matrix_covers_all_28_capability_entries_deterministically():
+def test_production_adapter_matrix_exactly_covers_b1_28_identities():
     capability_registry = get_source_capability_registry()
     adapter_registry = get_source_adapter_registry()
 
     assert len(capability_registry) == len(adapter_registry) == 28
-    expected_identities = {
+    expected = {
         (
             row["capability"],
             row["origin_source"],
@@ -95,7 +191,7 @@ def test_adapter_matrix_covers_all_28_capability_entries_deterministically():
         )
         for row in capability_registry
     }
-    actual_identities = {
+    actual = {
         (
             row["capability"],
             row["origin_source"],
@@ -104,7 +200,7 @@ def test_adapter_matrix_covers_all_28_capability_entries_deterministically():
         )
         for row in adapter_registry
     }
-    assert actual_identities == expected_identities
+    assert actual == expected
     assert adapter_registry == sorted(
         adapter_registry,
         key=lambda row: (
@@ -115,47 +211,237 @@ def test_adapter_matrix_covers_all_28_capability_entries_deterministically():
             row["provider_key"],
         ),
     )
-    assert sum(row["implementation_status"] == "bound" for row in adapter_registry) == 13
-    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v1"
+    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v2"
+    assert compute_source_capability_registry_hash() == (
+        adapters.EXPECTED_CAPABILITY_REGISTRY_HASH
+    )
 
 
-def test_adapter_registry_order_does_not_change_hash():
+def test_production_registry_has_zero_bound_and_13_legacy_incompatible_entries():
+    audit = audit_source_adapters(environ={})
+    legacy = [
+        row
+        for row in audit["adapter_matrix"]
+        if row["legacy_implementation_present"]
+    ]
+
+    assert audit["bound_count"] == 0
+    assert audit["legacy_implementation_present_count"] == 13
+    assert audit["contract_incompatible_count"] == 13
+    assert len(legacy) == 13
+    assert all(row["implementation_status"] == "contract_incompatible" for row in legacy)
+    assert all(row["status"] != SOURCE_ADAPTER_BOUND for row in legacy)
+    _assert_safe(audit, audit=True)
+
+
+def test_real_legacy_provider_signatures_and_return_types_are_not_reported_bound():
+    legacy_rows = [
+        row
+        for row in get_source_adapter_registry()
+        if row["legacy_implementation_present"]
+    ]
+
+    assert len(legacy_rows) == 13
+    for row in legacy_rows:
+        provider, expected_return = LEGACY_PROVIDER_OBJECTS[row["provider_key"]]
+        signature = inspect.signature(provider)
+        assert signature.return_annotation == expected_return
+        assert row["implementation_status"] == "contract_incompatible"
+        assert row["implementation_status"] != "bound"
+        if row["provider_key"] != "news_briefing.fetch_cls_telegraph":
+            assert next(iter(signature.parameters)) == "self"
+
+
+def test_public_registry_hash_is_fixed_and_custom_hash_entry_is_private():
     rows = get_source_adapter_registry()
     shuffled = deepcopy(rows)
     random.Random(81).shuffle(shuffled)
 
-    expected = "308cf19cbec50153d9de3b4f6f23cb4f1a79d19135004127933d470c73dfecd9"
-    assert compute_source_adapter_registry_hash(rows) == expected
-    assert compute_source_adapter_registry_hash(shuffled) == expected
-    assert compute_source_adapter_registry_hash() == expected
+    assert compute_source_adapter_registry_hash() == ADAPTER_REGISTRY_HASH
+    assert (
+        adapters._compute_source_adapter_registry_hash_for_test(shuffled)
+        == ADAPTER_REGISTRY_HASH
+    )
+    assert "entries" not in inspect.signature(
+        compute_source_adapter_registry_hash
+    ).parameters
+    assert not hasattr(adapters, "canonicalize_source_adapter_bindings")
 
 
-def test_unknown_duplicate_and_version_mismatched_bindings_fail_closed():
+def test_production_registry_rejects_deleted_duplicate_and_added_entries():
     rows = get_source_adapter_registry()
-    duplicate = [rows[0], rows[0]]
-    unknown = deepcopy(rows[0])
-    unknown["origin_source"] = "unknown_vendor"
-    mismatched = deepcopy(rows[0])
-    mismatched["source_version"] = "unknown_version"
 
+    with pytest.raises(
+        ValueError,
+        match="production_source_adapter_binding_missing",
+    ):
+        adapters._validate_production_source_adapter_bindings(rows[:-1])
     with pytest.raises(ValueError, match="source_adapter_binding_duplicate"):
-        canonicalize_source_adapter_bindings(duplicate)
+        adapters._validate_production_source_adapter_bindings(rows + [rows[0]])
+    added = deepcopy(rows[0])
+    added["origin_source"] = "unknown_vendor"
     with pytest.raises(ValueError, match="source_adapter_identity_unknown"):
-        canonicalize_source_adapter_bindings([unknown])
-    with pytest.raises(ValueError, match="source_adapter_identity_unknown"):
-        canonicalize_source_adapter_bindings([mismatched])
+        adapters._validate_production_source_adapter_bindings(rows + [added])
 
+
+def test_production_registry_rejects_downgrade_even_after_private_resign():
+    rows = get_source_adapter_registry()
+    changed = deepcopy(rows)
+    target = next(row for row in changed if row["legacy_implementation_present"])
+    target.update(
+        {
+            "provider_key": "",
+            "implementation_status": "not_implemented",
+            "legacy_implementation_present": False,
+        }
+    )
+
+    resigned_hash = adapters._compute_source_adapter_registry_hash_for_test(changed)
+    assert len(resigned_hash) == 64
+    assert resigned_hash != ADAPTER_REGISTRY_HASH
+    with pytest.raises(
+        ValueError,
+        match="production_source_adapter_binding_modified",
+    ):
+        adapters._validate_production_source_adapter_bindings(changed)
+
+
+def test_public_registry_and_hash_fail_closed_when_fixed_matrix_is_removed(
+    monkeypatch,
+):
+    rows = tuple(adapters.SOURCE_ADAPTER_BINDINGS[:-1])
+    monkeypatch.setattr(adapters, "SOURCE_ADAPTER_BINDINGS", rows)
+
+    with pytest.raises(
+        ValueError,
+        match="production_source_adapter_binding_missing",
+    ):
+        get_source_adapter_registry()
+    with pytest.raises(
+        ValueError,
+        match="production_source_adapter_binding_missing",
+    ):
+        compute_source_adapter_registry_hash()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("capability", "Quote"),
+        ("capability", " quote"),
+        ("origin_source", "Tencent"),
+        ("adapter", "direct_http "),
+        ("source_version", "QT.GTIMG.CN~88_FIELDS_V2026-07-30"),
+    ],
+)
+def test_noncanonical_production_identity_variants_are_rejected(field, value):
+    row = deepcopy(get_source_adapter_registry()[0])
+    row[field] = value
+
+    with pytest.raises(ValueError, match="source_adapter_identity_not_canonical"):
+        adapters._validate_production_source_adapter_bindings([row])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("capability", "Quote"),
+        ("capability", "quote "),
+        ("origin_source", "Tencent"),
+        ("adapter", " direct_http"),
+        ("source_version", "QT.GTIMG.CN~88_FIELDS_V2026-07-30"),
+    ],
+)
+def test_noncanonical_execution_identity_is_rejected_before_provider(field, value):
+    calls = 0
+
+    def provider():
+        nonlocal calls
+        calls += 1
+        return [_quote_record()]
+
+    request = dict(QUOTE_IDENTITY)
+    request[field] = value
     result = execute_source_adapter(
-        "quote",
-        origin_source="tencent",
-        adapter="direct_http",
-        source_version="unknown_version",
-        provider=lambda: [_quote_record()],
+        **request,
+        provider_envelope=_test_envelope(provider),
         environ={},
     )
+
     assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
-    assert result["provider_called"] is False
-    _assert_safe(result)
+    assert calls == 0
+    _assert_safe(result, provider_called=False)
+
+
+def test_bare_or_unrelated_callable_cannot_become_bound():
+    calls = 0
+
+    def provider():
+        nonlocal calls
+        calls += 1
+        return [_quote_record()]
+
+    result = execute_source_adapter(
+        **QUOTE_IDENTITY,
+        provider_envelope=provider,
+        environ={},
+    )
+
+    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
+    assert result["rejection_reasons"] == ["source_provider_envelope_required"]
+    assert calls == 0
+    _assert_safe(result, provider_called=False)
+
+
+def test_provider_key_mismatch_prevents_provider_call():
+    calls = 0
+
+    def provider():
+        nonlocal calls
+        calls += 1
+        return [_quote_record()]
+
+    result = execute_source_adapter(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(
+            provider,
+            provider_key="tests.unrelated_provider_v1",
+        ),
+        environ={},
+    )
+
+    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
+    assert result["rejection_reasons"] == [
+        "source_adapter_provider_key_mismatch"
+    ]
+    assert calls == 0
+    _assert_safe(result, provider_called=False)
+
+
+def test_matching_legacy_provider_key_remains_contract_incompatible_and_is_not_called():
+    row = next(
+        item
+        for item in get_source_adapter_registry()
+        if item["capability"] == "quote"
+        and item["origin_source"] == "tencent"
+    )
+    calls = 0
+
+    def provider():
+        nonlocal calls
+        calls += 1
+        return [_quote_record()]
+
+    result = execute_source_adapter(
+        **QUOTE_IDENTITY,
+        provider_envelope=_test_envelope(provider, row["provider_key"]),
+        environ={},
+    )
+
+    assert result["status"] == SOURCE_ADAPTER_NOT_IMPLEMENTED
+    assert result["binding"]["implementation_status"] == "contract_incompatible"
+    assert calls == 0
+    _assert_safe(result, provider_called=False)
 
 
 @pytest.mark.parametrize(
@@ -185,85 +471,54 @@ def test_unknown_and_retired_routes_do_not_call_provider(
         origin_source=origin_source,
         adapter=adapter,
         source_version=source_version,
-        provider=provider,
+        provider_envelope=_test_envelope(provider),
         environ={},
     )
 
     assert result["status"] == SOURCE_ADAPTER_ROUTE_REJECTED
     assert calls == 0
-    assert result["provider_called"] is False
-    _assert_safe(result)
+    _assert_safe(result, provider_called=False)
 
 
-def test_not_implemented_binding_does_not_call_provider():
-    calls = 0
-
-    def provider():
-        nonlocal calls
-        calls += 1
-        return []
-
-    result = execute_source_adapter(
-        "research_report",
-        origin_source="eastmoney",
-        adapter="direct_http",
-        source_version="eastmoney_reportapi_v2026-08-24",
-        provider=provider,
-        environ={},
-    )
-
-    assert result["status"] == SOURCE_ADAPTER_NOT_IMPLEMENTED
-    assert result["provider_called"] is False
-    assert calls == 0
-    _assert_safe(result)
-
-
-def test_mootdx_binding_remains_audit_only_and_never_authorizes_hard_gate():
-    row = next(
-        item
-        for item in audit_source_adapters(environ={})["adapter_matrix"]
-        if item["capability"] == "minute_bar"
-        and item["origin_source"] == "tongdaxin"
-    )
-
-    assert row["status"] == SOURCE_ADAPTER_BOUND
-    assert row["role"] == "audit_only"
-    assert row["qualification_status"] == "unqualified"
-    assert row["qualification_progress"] == "0/3"
-    assert row["hard_gate_authorized"] is False
-
-
-def test_akshare_and_iwencai_are_reported_without_loading_dependencies_or_secrets():
-    secret = "do-not-serialize-this-secret"
-    audit = audit_source_adapters(
-        environ={
-            "IWENCAI_API_KEY": secret,
-            "IWENCAI_BASE_URL": "https://example.invalid",
+def test_existing_source_field_is_rejected_without_identity_repair():
+    records = [
+        {
+            "source": "tencent_quote",
+            "source_version": QUOTE_IDENTITY["source_version"],
+            "event_time": "2026-08-25T14:49:00+08:00",
+            "observed_at": "2026-08-25T14:49:01+08:00",
+            "available_at": "2026-08-25T14:49:02+08:00",
+            "request_hash": "a" * 64,
+            "raw_hash": "b" * 64,
         }
-    )
-    serialized = json.dumps(audit, ensure_ascii=False, sort_keys=True)
-    wrappers = [row for row in audit["adapter_matrix"] if row["adapter"] == "akshare"]
-    iwencai = next(
-        row for row in audit["adapter_matrix"] if row["adapter"] == "iwencai_openapi"
-    )
+    ]
+    original = deepcopy(records)
 
-    assert wrappers
-    assert all(row["provider_key"] == "" for row in wrappers)
-    assert all(row["hard_gate_authorized"] is False for row in wrappers)
-    assert iwencai["provider_key"] == ""
-    assert iwencai["hard_gate_authorized"] is False
-    assert secret not in serialized
-    assert "IWENCAI_API_KEY" not in serialized
-    _assert_safe(audit)
+    result = _run_test_quote(lambda: records)
+
+    assert result["status"] == SOURCE_ADAPTER_PROVENANCE_REJECTED
+    assert result["provenance_validation"]["status"] == "PROVENANCE_FIELDS_MISSING"
+    assert records == original
+    _assert_safe(result, provider_called=True)
 
 
-def test_provider_empty_and_provider_failure_are_distinct_and_sanitized():
-    empty = _run_quote(lambda: [])
+def test_called_provider_reports_upstream_network_activity_unknown_not_zero():
+    result = _run_test_quote(lambda: [_quote_record()])
+
+    assert result["status"] == SOURCE_ADAPTER_BOUND
+    assert result["test_only"] is True
+    assert result["network_requests_made"] is None
+    assert result["upstream_network_activity"] == "unknown"
+    _assert_safe(result, provider_called=True)
+
+
+def test_provider_empty_and_provider_failure_are_distinct_and_network_unknown():
+    empty = _run_test_quote(lambda: [])
 
     def failing_provider():
         raise RuntimeError("IWENCAI_API_KEY=secret-value")
 
-    failed = _run_quote(failing_provider)
+    failed = _run_test_quote(failing_provider)
 
     assert empty["status"] == SOURCE_ADAPTER_PROVIDER_EMPTY
     assert empty["execution_ok"] is True
@@ -271,8 +526,8 @@ def test_provider_empty_and_provider_failure_are_distinct_and_sanitized():
     assert failed["execution_ok"] is False
     assert failed["provider_error_type"] == "RuntimeError"
     assert "secret-value" not in json.dumps(failed, sort_keys=True)
-    _assert_safe(empty)
-    _assert_safe(failed)
+    _assert_safe(empty, provider_called=True)
+    _assert_safe(failed, provider_called=True)
 
 
 @pytest.mark.parametrize(
@@ -292,24 +547,56 @@ def test_provider_empty_and_provider_failure_are_distinct_and_sanitized():
     ids=["mixed-source", "missing-field", "time-reversed", "hash-invalid"],
 )
 def test_provider_provenance_contract_failures_are_rejected(records):
-    result = _run_quote(lambda: records)
+    result = _run_test_quote(lambda: records)
 
     assert result["status"] == SOURCE_ADAPTER_PROVENANCE_REJECTED
-    assert result["provenance"]["status"] != "SOURCE_PROVENANCE_ACCEPTED"
-    _assert_safe(result)
+    assert (
+        result["provenance_validation"]["status"]
+        != "SOURCE_PROVENANCE_ACCEPTED"
+    )
+    _assert_safe(result, provider_called=True)
 
 
 def test_provider_records_are_not_silently_repaired_or_mutated():
     records = [_quote_record()]
     original = deepcopy(records)
 
-    result = _run_quote(lambda: records)
+    result = _run_test_quote(lambda: records)
 
     assert result["status"] == SOURCE_ADAPTER_BOUND
-    assert result["hard_gate_authorized"] is False
-    assert result["provenance"]["hard_gate_authorized"] is False
+    assert result["provenance_validation"]["hard_gate_authorized"] is False
     assert records == original
-    _assert_safe(result)
+    _assert_safe(result, provider_called=True)
+
+
+def test_akshare_iwencai_and_mootdx_never_become_hard_gate_sources():
+    secret = "do-not-serialize-this-secret"
+    audit = audit_source_adapters(
+        environ={
+            "IWENCAI_API_KEY": secret,
+            "IWENCAI_BASE_URL": "https://example.invalid",
+        }
+    )
+    serialized = json.dumps(audit, ensure_ascii=False, sort_keys=True)
+    wrappers = [
+        row for row in audit["adapter_matrix"] if row["adapter"] == "akshare"
+    ]
+    iwencai = next(
+        row
+        for row in audit["adapter_matrix"]
+        if row["adapter"] == "iwencai_openapi"
+    )
+    mootdx = [
+        row for row in audit["adapter_matrix"] if row["adapter"] == "mootdx"
+    ]
+
+    assert wrappers and mootdx
+    assert all(row["status"] != SOURCE_ADAPTER_BOUND for row in wrappers)
+    assert all(row["hard_gate_authorized"] is False for row in wrappers + mootdx)
+    assert iwencai["hard_gate_authorized"] is False
+    assert secret not in serialized
+    assert "IWENCAI_API_KEY" not in serialized
+    _assert_safe(audit, audit=True)
 
 
 def test_audit_is_complete_deterministic_and_safe():
@@ -319,9 +606,12 @@ def test_audit_is_complete_deterministic_and_safe():
     assert first == second
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
     assert first["adapter_entry_count"] == 28
-    assert first["adapter_registry_hash"] == compute_source_adapter_registry_hash()
-    assert first["capability_registry_hash"] == compute_source_capability_registry_hash()
-    _assert_safe(first)
+    assert first["bound_count"] == 0
+    assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
+    assert first["capability_registry_hash"] == (
+        compute_source_capability_registry_hash()
+    )
+    _assert_safe(first, audit=True)
 
 
 def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environment():
@@ -349,7 +639,8 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     assert b"must-not-appear" not in first
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
-    _assert_safe(payload)
+    assert payload["bound_count"] == 0
+    _assert_safe(payload, audit=True)
 
 
 def test_audit_never_opens_http_or_tcp(monkeypatch):
@@ -368,4 +659,4 @@ def test_audit_never_opens_http_or_tcp(monkeypatch):
 
     assert result["network_requests_made"] == 0
     assert result["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
-    _assert_safe(result)
+    _assert_safe(result, audit=True)
