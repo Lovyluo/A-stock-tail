@@ -21,7 +21,9 @@ automatic_configuration_change=false
 
 因此 `SOURCE_ADAPTER_BOUND` 只表示“provider key、调用签名、返回结构、来源身份和 B1
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
-生产矩阵没有任何一项满足这一条件，`bound_count=0`。
+生产矩阵只有腾讯 quote/valuation 两项满足这一条件，`bound_count=2`。这里的 `bound`
+只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
+已取得正式资格或数据可参与策略评分。
 
 ## 2. 两层注册表
 
@@ -38,7 +40,7 @@ provider_key + candidate_provider_key + legacy_provider_key
 implementation_status
 ```
 
-`provider_key` 只保存已经启用的正式可执行实现，本阶段全部为空；
+`provider_key` 只保存已经选择的显式只读 Provider，当前仅腾讯 quote/valuation 两项非空；
 `candidate_provider_key` 保存合同兼容但尚未启用的候选实现；`legacy_provider_key` 保存仅供
 审计的历史实现。`legacy_implementation_present` 如需出现在兼容审计输出中，只能由
 `legacy_provider_key` 是否非空确定性派生，不能由调用方自由声明。审计命令不会导入这些
@@ -73,14 +75,14 @@ scope 为 `production`。
 
 ## 3. 覆盖矩阵
 
-B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。当前共有 13 项带历史实现，其中腾讯 quote
-和 valuation 同时登记合同兼容的新候选与历史实现，状态为 `candidate_not_activated`；其余
-11 项历史实现仍为 `contract_incompatible`。所有生产 `provider_key` 均为空：
+B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。B2.2c 只将腾讯 quote 和 valuation 的候选
+key 移入 `provider_key`，状态改为 `bound`，并保留历史实现；其余 11 项历史实现仍为
+`contract_incompatible`：
 
 | 能力 | 原始来源 | 适配器 | candidate/legacy provider key | 状态或不兼容原因 |
 |---|---|---|---|---|
-| quote | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_quote_records` / `AStockClient._tencent_quotes` | `candidate_not_activated` |
-| valuation | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_valuation_records` / `AStockClient._tencent_quotes` | `candidate_not_activated` |
+| quote | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_quote_records` / `AStockClient._tencent_quotes` | `bound`，只接受显式 envelope |
+| valuation | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_valuation_records` / `AStockClient._tencent_quotes` | `bound`，只接受显式 envelope |
 | trading_calendar | 腾讯 | direct_http | `collect_trading_calendar` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | daily_bar_qfq | 腾讯 | direct_http | `collect_qfq_daily_bars` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | industry_snapshot | 东财 | direct_http | `collect_industry` | 需要实例与 observed_at，返回 `ProviderBatch` |
@@ -116,7 +118,13 @@ Schema v2 的旧适配注册表哈希为：
 1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d
 ```
 
-哈希变化只来自 schema 版本、三槽位结构与腾讯候选登记；B1 registry hash 保持
+B2.2c 腾讯只读影子绑定后的 Schema v3 哈希为：
+
+```text
+61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39
+```
+
+本次哈希变化仅来自两个候选进入显式只读 `provider_key`；B1 registry hash 保持
 `303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69`。
 
 ## 4. 失效关闭执行链
@@ -197,4 +205,4 @@ upstream_network_activity=unknown
 - 不导入或回退到 Tushare、Ashare；
 - 不修改策略、评分、阈值、正式配置、CI 或连续资格计数；
 - 不启动 mootdx 连续三日任务；
-- 不进入 B2.2c，不启用腾讯正式绑定。
+- 腾讯仅为显式只读影子绑定，不接入 collector、策略、默认网络或正式 hard gate。

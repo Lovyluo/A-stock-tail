@@ -14,7 +14,7 @@ valuation | tencent | direct_http | qt.gtimg.cn~88_fields_v2026-07-30
 `AStockClient` 的 mootdx fallback。每次调用只构造一个 `https://qt.gtimg.cn/q=` 请求；
 响应最终主机不是 `qt.gtimg.cn` 时失效关闭。
 
-本阶段继续固定：
+B2.2a 证据阶段固定：
 
 ```text
 bound_count=0
@@ -25,6 +25,9 @@ tickets=[]
 orders=[]
 automatic_configuration_change=false
 ```
+
+B2.2c 只读影子绑定完成后，当前注册表为 `bound_count=2`、`candidate_count=0`；其余安全
+字段保持不变。`bound` 只表示精确 envelope 可以执行只读 Provider，不代表正式来源资格。
 
 ## 2. 注入合同
 
@@ -99,22 +102,25 @@ request_hash, raw_hash, payload
 
 ## 6. 生产绑定边界与 Schema v3
 
-B2.2b 采用三槽位 Schema v3，同时保留候选和历史实现：
+B2.2b 采用三槽位 Schema v3，同时保留候选和历史实现。B2.2c 将两个已审核候选移动到
+active 槽位：
 
 ```text
-provider_key=""
-candidate_provider_key=<TencentDirectHttpProviders 对应方法>
+provider_key=<TencentDirectHttpProviders 对应方法>
+candidate_provider_key=""
 legacy_provider_key="astock_client.AStockClient._tencent_quotes"
-implementation_status="candidate_not_activated"
+implementation_status="bound"
 ```
 
-因此腾讯 quote/valuation 只是登记到生产完整矩阵中的候选，正式 `bound_count=0`。公开执行
-入口遇到该状态固定返回 `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED`，且
-`provider_called=false`；即使 B1 quote 能力允许 hard gate，也不能调用候选或历史实现。
+公开执行入口只有收到精确匹配 `provider_key` 的显式 `SourceProviderEnvelope` 才会调用；
+裸 callable、空 envelope、错误 key 或 legacy key 均在调用前拒绝。模块仍不提供默认
+transport、默认股票池、自动 fallback 或自动配置；即使 B1 quote 能力允许 hard gate，
+输出也固定 `hard_gate_authorized=false` 和 `data_ready=false`。
 
 测试仍只使用 `_execute_source_adapter_with_bindings_for_test()`，并构造隔离的 `bound`
 测试选择行。该私有路径使用独立 selection hash 和 `test_only` scope，不改变生产矩阵。
-未经 B2.2c 单独授权，不得把 candidate 移入 active `provider_key`，也不得启用 hard gate。
+本次只读影子绑定不接入 collector 或策略。正式来源资格、hard gate 与默认联网仍需后续
+独立 PM 授权。
 
 ## 7. 只读真实验证
 
