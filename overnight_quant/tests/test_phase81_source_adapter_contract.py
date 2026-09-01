@@ -22,7 +22,6 @@ from overnight_quant.data.source_capability_adapters import (
     ADAPTER_REGISTRY_SCHEMA_VERSION,
     SOURCE_ADAPTER_AUDIT_COMPLETE,
     SOURCE_ADAPTER_BOUND,
-    SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
     SOURCE_ADAPTER_NOT_IMPLEMENTED,
     SOURCE_ADAPTER_PROVIDER_EMPTY,
     SOURCE_ADAPTER_PROVIDER_FAILED,
@@ -49,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
+    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -246,7 +245,7 @@ def test_production_adapter_matrix_exactly_covers_b1_28_identities():
     )
 
 
-def test_production_registry_has_zero_bound_two_candidates_and_13_legacy_entries():
+def test_production_registry_has_two_shadow_bindings_and_13_legacy_entries():
     audit = audit_source_adapters(environ={})
     legacy = [
         row
@@ -254,15 +253,15 @@ def test_production_registry_has_zero_bound_two_candidates_and_13_legacy_entries
         if row["legacy_implementation_present"]
     ]
 
-    assert audit["bound_count"] == 0
-    assert audit["candidate_count"] == 2
+    assert audit["bound_count"] == 2
+    assert audit["candidate_count"] == 0
     assert audit["legacy_implementation_present_count"] == 13
     assert audit["contract_incompatible_count"] == 11
     assert len(legacy) == 13
     assert {
         row["implementation_status"] for row in legacy
-    } == {"candidate_not_activated", "contract_incompatible"}
-    assert all(row["status"] != SOURCE_ADAPTER_BOUND for row in legacy)
+    } == {"bound", "contract_incompatible"}
+    assert sum(row["status"] == SOURCE_ADAPTER_BOUND for row in legacy) == 2
     _assert_safe(audit, audit=True)
 
 
@@ -280,7 +279,8 @@ def test_real_legacy_provider_signatures_and_return_types_are_not_reported_bound
         ]
         signature = inspect.signature(provider)
         assert signature.return_annotation == expected_return
-        assert row["implementation_status"] != "bound"
+        if row["implementation_status"] == "bound":
+            assert row["provider_key"] != row["legacy_provider_key"]
         if row["legacy_provider_key"] != "news_briefing.fetch_cls_telegraph":
             assert next(iter(signature.parameters)) == "self"
 
@@ -408,7 +408,7 @@ def test_noncanonical_execution_identity_is_rejected_before_provider(field, valu
     _assert_safe(result, provider_called=False)
 
 
-def test_bare_callable_cannot_bypass_candidate_not_activated_gate():
+def test_public_shadow_binding_requires_explicit_provider_envelope():
     calls = 0
 
     def provider():
@@ -422,15 +422,13 @@ def test_bare_callable_cannot_bypass_candidate_not_activated_gate():
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
-    assert result["rejection_reasons"] == [
-        "source_adapter_candidate_not_activated"
-    ]
+    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
+    assert result["rejection_reasons"] == ["source_provider_envelope_required"]
     assert calls == 0
     _assert_safe(result, provider_called=False)
 
 
-def test_public_candidate_rejects_unrelated_provider_without_calling_it():
+def test_public_shadow_binding_rejects_unrelated_provider_without_calling_it():
     calls = 0
 
     def provider():
@@ -447,15 +445,15 @@ def test_public_candidate_rejects_unrelated_provider_without_calling_it():
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+    assert result["status"] == SOURCE_ADAPTER_REQUEST_INVALID
     assert result["rejection_reasons"] == [
-        "source_adapter_candidate_not_activated"
+        "source_adapter_provider_key_mismatch"
     ]
     assert calls == 0
     _assert_safe(result, provider_called=False)
 
 
-def test_matching_candidate_or_legacy_provider_key_is_not_called_in_production():
+def test_matching_shadow_provider_key_is_called_only_through_explicit_envelope():
     row = next(
         item
         for item in get_source_adapter_registry()
@@ -473,21 +471,19 @@ def test_matching_candidate_or_legacy_provider_key_is_not_called_in_production()
         **QUOTE_IDENTITY,
         provider_envelope=_test_envelope(
             provider,
-            row["candidate_provider_key"],
+            row["provider_key"],
         ),
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
-    assert result["binding"]["implementation_status"] == (
-        "candidate_not_activated"
-    )
-    assert result["binding"]["provider_key"] == ""
+    assert result["status"] == SOURCE_ADAPTER_BOUND
+    assert result["binding"]["implementation_status"] == "bound"
+    assert result["binding"]["candidate_provider_key"] == ""
     assert result["binding"]["legacy_provider_key"] == (
         "astock_client.AStockClient._tencent_quotes"
     )
-    assert calls == 0
-    _assert_safe(result, provider_called=False)
+    assert calls == 1
+    _assert_safe(result, provider_called=True)
 
 
 @pytest.mark.parametrize(
@@ -673,17 +669,17 @@ def test_public_execution_uses_production_registry_hash_and_scope():
         **QUOTE_IDENTITY,
         provider_envelope=_test_envelope(
             lambda: [_quote_record()],
-            binding["candidate_provider_key"],
+            binding["provider_key"],
         ),
         environ={},
     )
 
     assert result["selection_registry_scope"] == "production"
-    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+    assert result["status"] == SOURCE_ADAPTER_BOUND
     assert result["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert result["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert result["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
-    _assert_safe(result, provider_called=False)
+    _assert_safe(result, provider_called=True)
 
 
 def test_provider_empty_and_provider_failure_are_distinct_and_network_unknown():
@@ -780,7 +776,8 @@ def test_audit_is_complete_deterministic_and_safe():
     assert first == second
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
     assert first["adapter_entry_count"] == 28
-    assert first["bound_count"] == 0
+    assert first["bound_count"] == 2
+    assert first["candidate_count"] == 0
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
@@ -816,7 +813,8 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     assert b"must-not-appear" not in first
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
-    assert payload["bound_count"] == 0
+    assert payload["bound_count"] == 2
+    assert payload["candidate_count"] == 0
     _assert_safe(payload, audit=True)
 
 

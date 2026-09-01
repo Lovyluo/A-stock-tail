@@ -646,7 +646,7 @@ def test_candidates_pass_private_test_only_execution_without_production_binding(
     _assert_safe(result)
 
 
-def test_production_bindings_register_candidates_without_activation():
+def test_production_bindings_activate_two_read_only_shadow_providers():
     audit = audit_source_adapters(environ={})
     production = [
         row
@@ -655,17 +655,17 @@ def test_production_bindings_register_candidates_without_activation():
         and row["capability"] in {"quote", "valuation"}
     ]
 
-    assert audit["bound_count"] == 0
-    assert audit["candidate_count"] == 2
+    assert audit["bound_count"] == 2
+    assert audit["candidate_count"] == 0
     assert len(production) == 2
     assert all(row["legacy_implementation_present"] is True for row in production)
     assert all(
-        row["implementation_status"] == "candidate_not_activated"
+        row["implementation_status"] == "bound"
         for row in production
     )
-    assert all(row["provider_key"] == "" for row in production)
+    assert all(row["candidate_provider_key"] == "" for row in production)
     assert {
-        row["candidate_provider_key"] for row in production
+        row["provider_key"] for row in production
     } == {
         TENCENT_QUOTE_PROVIDER_KEY,
         TENCENT_VALUATION_PROVIDER_KEY,

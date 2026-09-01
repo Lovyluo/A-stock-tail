@@ -16,13 +16,13 @@ from overnight_quant.data.source_capability_registry import (
 
 ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v3"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v2"
+    "source_capability_adapter_registry_v3"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be"
+    "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "schema_v3_provider_candidate_legacy_slots_and_tencent_candidates"
+    "schema_v3_activate_tencent_quote_valuation_shadow_bindings"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
@@ -297,7 +297,7 @@ _LEGACY_PROVIDER_KEYS = {
     ),
 }
 
-_CANDIDATE_PROVIDER_KEYS = {
+_TENCENT_SHADOW_PROVIDER_KEYS = {
     _identity(
         "quote",
         "tencent",
@@ -339,9 +339,9 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
             row["source_version"],
         )
         legacy_provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
-        candidate_provider_key = _CANDIDATE_PROVIDER_KEYS.get(identity, "")
-        if candidate_provider_key:
-            implementation_status = IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
+        shadow_provider_key = _TENCENT_SHADOW_PROVIDER_KEYS.get(identity, "")
+        if shadow_provider_key:
+            implementation_status = IMPLEMENTATION_BOUND
         elif legacy_provider_key:
             implementation_status = IMPLEMENTATION_CONTRACT_INCOMPATIBLE
         elif row["role"] == "retired":
@@ -356,8 +356,8 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
                 origin_source=row["origin_source"],
                 adapter=row["adapter"],
                 source_version=row["source_version"],
-                provider_key="",
-                candidate_provider_key=candidate_provider_key,
+                provider_key=shadow_provider_key,
+                candidate_provider_key="",
                 legacy_provider_key=legacy_provider_key,
                 implementation_status=implementation_status,
             )
@@ -455,11 +455,11 @@ def _validate_binding_policy(
     identity = _binding_identity(binding)
     candidate_provider_key = binding["candidate_provider_key"]
     provider_key = binding["provider_key"]
-    expected_candidate_key = _CANDIDATE_PROVIDER_KEYS.get(identity, "")
-    for candidate_identity, reserved_key in _CANDIDATE_PROVIDER_KEYS.items():
+    expected_shadow_key = _TENCENT_SHADOW_PROVIDER_KEYS.get(identity, "")
+    for shadow_identity, reserved_key in _TENCENT_SHADOW_PROVIDER_KEYS.items():
         if (
             reserved_key in {provider_key, candidate_provider_key}
-            and identity != candidate_identity
+            and identity != shadow_identity
         ):
             raise ValueError("source_adapter_candidate_identity_mismatch")
     if capability["role"] == "retired":
@@ -476,8 +476,8 @@ def _validate_binding_policy(
         raise ValueError("optional_unconfigured_adapter_identity_invalid")
     if status == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED:
         if (
-            not expected_candidate_key
-            or candidate_provider_key != expected_candidate_key
+            not expected_shadow_key
+            or candidate_provider_key != expected_shadow_key
             or binding["legacy_provider_key"]
             != _LEGACY_PROVIDER_KEYS.get(identity, "")
         ):

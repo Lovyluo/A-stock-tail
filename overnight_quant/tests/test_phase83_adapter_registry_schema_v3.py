@@ -12,7 +12,6 @@ from overnight_quant.data.source_capability_adapters import (
     PREVIOUS_ADAPTER_REGISTRY_HASH,
     PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION,
     SOURCE_ADAPTER_BOUND,
-    SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
     SourceAdapterBinding,
     SourceProviderEnvelope,
     audit_source_adapters,
@@ -28,11 +27,11 @@ from overnight_quant.data.source_capability_registry import (
 EXPECTED_B1_HASH = (
     "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
 )
-EXPECTED_V2_HASH = (
-    "4f274abcce88fedb425b9544e901d92da69a5cafa951fcda864a0c5fc06dd6be"
-)
-EXPECTED_V3_HASH = (
+EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
+)
+EXPECTED_SHADOW_V3_HASH = (
+    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -76,11 +75,11 @@ def _quote_record() -> dict:
     }
 
 
-def _candidate_rows() -> list[dict]:
+def _shadow_rows() -> list[dict]:
     return [
         row
         for row in get_source_adapter_registry()
-        if row["implementation_status"] == "candidate_not_activated"
+        if row["implementation_status"] == "bound"
     ]
 
 
@@ -92,23 +91,26 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
         "source_capability_adapter_registry_v3"
     )
     assert audit["adapter_entry_count"] == len(rows) == 28
-    assert audit["bound_count"] == 0
-    assert audit["candidate_count"] == 2
+    assert audit["bound_count"] == 2
+    assert audit["candidate_count"] == 0
     assert audit["legacy_implementation_present_count"] == 13
     assert audit["contract_incompatible_count"] == 11
     assert audit["previous_adapter_registry_schema_version"] == (
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
-    assert PREVIOUS_ADAPTER_REGISTRY_HASH == EXPECTED_V2_HASH
-    assert audit["previous_adapter_registry_hash"] == EXPECTED_V2_HASH
+    assert PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION == (
+        "source_capability_adapter_registry_v3"
+    )
+    assert PREVIOUS_ADAPTER_REGISTRY_HASH == EXPECTED_CANDIDATE_V3_HASH
+    assert audit["previous_adapter_registry_hash"] == EXPECTED_CANDIDATE_V3_HASH
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON
     )
-    assert audit["production_adapter_registry_hash"] == EXPECTED_V3_HASH
-    assert audit["selection_adapter_registry_hash"] == EXPECTED_V3_HASH
+    assert audit["production_adapter_registry_hash"] == EXPECTED_SHADOW_V3_HASH
+    assert audit["selection_adapter_registry_hash"] == EXPECTED_SHADOW_V3_HASH
     assert audit["capability_registry_hash"] == EXPECTED_B1_HASH
     assert compute_source_capability_registry_hash() == EXPECTED_B1_HASH
-    assert all(row["provider_key"] == "" for row in rows)
+    assert sum(bool(row["provider_key"]) for row in rows) == 2
     assert all(
         row["legacy_implementation_present"]
         is bool(row["legacy_provider_key"])
@@ -122,24 +124,21 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     assert audit["orders"] == []
 
 
-def test_tencent_quote_and_valuation_candidates_have_exact_slot_identity():
-    rows = _candidate_rows()
+def test_tencent_quote_and_valuation_shadow_bindings_have_exact_slot_identity():
+    rows = _shadow_rows()
 
     assert [row["capability"] for row in rows] == ["quote", "valuation"]
-    assert {row["candidate_provider_key"] for row in rows} == {
+    assert {row["provider_key"] for row in rows} == {
         QUOTE_CANDIDATE_KEY,
         VALUATION_CANDIDATE_KEY,
     }
     assert {row["legacy_provider_key"] for row in rows} == {
         LEGACY_TENCENT_KEY
     }
-    assert all(row["provider_key"] == "" for row in rows)
+    assert all(row["candidate_provider_key"] == "" for row in rows)
+    assert all(row["implementation_status"] == "bound" for row in rows)
     assert all(
-        row["implementation_status"] == "candidate_not_activated"
-        for row in rows
-    )
-    assert all(
-        row["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+        row["status"] == SOURCE_ADAPTER_BOUND
         for row in audit_source_adapters(environ={})["adapter_matrix"]
         if row["capability"] in {"quote", "valuation"}
         and row["origin_source"] == "tencent"
@@ -153,13 +152,18 @@ def test_tencent_quote_and_valuation_candidates_have_exact_slot_identity():
         ("valuation", VALUATION_CANDIDATE_KEY),
     ],
 )
-def test_public_candidate_is_never_called(capability, candidate_key):
+def test_public_shadow_binding_calls_only_the_explicit_matching_provider(
+    capability,
+    candidate_key,
+):
     calls = 0
 
     def provider():
         nonlocal calls
         calls += 1
-        return [_quote_record()]
+        record = _quote_record()
+        record["capability"] = capability
+        return [record]
 
     result = execute_source_adapter(
         capability,
@@ -173,26 +177,26 @@ def test_public_candidate_is_never_called(capability, candidate_key):
         environ={},
     )
 
-    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
-    assert result["binding"]["provider_key"] == ""
-    assert result["binding"]["candidate_provider_key"] == candidate_key
-    assert calls == 0
-    _assert_safe(result, provider_called=False)
+    assert result["status"] == SOURCE_ADAPTER_BOUND
+    assert result["binding"]["provider_key"] == candidate_key
+    assert result["binding"]["candidate_provider_key"] == ""
+    assert calls == 1
+    _assert_safe(result, provider_called=True)
 
 
-def test_candidate_cannot_be_promoted_by_private_rehash_or_production_patch(
+def test_shadow_binding_cannot_be_downgraded_by_private_rehash_or_patch(
     monkeypatch,
 ):
     rows = deepcopy(get_source_adapter_registry())
     quote = next(row for row in rows if row["capability"] == "quote")
-    quote["provider_key"] = quote["candidate_provider_key"]
-    quote["candidate_provider_key"] = ""
-    quote["implementation_status"] = "bound"
-    promoted_hash = adapters._compute_source_adapter_registry_hash_for_test(
+    quote["candidate_provider_key"] = quote["provider_key"]
+    quote["provider_key"] = ""
+    quote["implementation_status"] = "candidate_not_activated"
+    downgraded_hash = adapters._compute_source_adapter_registry_hash_for_test(
         rows
     )
 
-    assert promoted_hash != EXPECTED_V3_HASH
+    assert downgraded_hash != EXPECTED_SHADOW_V3_HASH
     with pytest.raises(
         ValueError,
         match="production_source_adapter_binding_modified",
@@ -233,10 +237,10 @@ def test_candidate_and_legacy_slots_cannot_share_the_same_key():
 def test_noncanonical_provider_slot_keys_are_rejected(field, value):
     values = {
         **QUOTE_IDENTITY,
-        "provider_key": "",
-        "candidate_provider_key": QUOTE_CANDIDATE_KEY,
+        "provider_key": QUOTE_CANDIDATE_KEY,
+        "candidate_provider_key": "",
         "legacy_provider_key": LEGACY_TENCENT_KEY,
-        "implementation_status": "candidate_not_activated",
+        "implementation_status": "bound",
     }
     values[field] = value
 
@@ -250,10 +254,10 @@ def test_noncanonical_provider_slot_keys_are_rejected(field, value):
 def test_legacy_presence_is_derived_and_cannot_be_supplied_as_a_fact():
     values = {
         **QUOTE_IDENTITY,
-        "provider_key": "",
-        "candidate_provider_key": QUOTE_CANDIDATE_KEY,
+        "provider_key": QUOTE_CANDIDATE_KEY,
+        "candidate_provider_key": "",
         "legacy_provider_key": LEGACY_TENCENT_KEY,
-        "implementation_status": "candidate_not_activated",
+        "implementation_status": "bound",
     }
     binding = SourceAdapterBinding(**values)
     assert binding.as_dict()["legacy_implementation_present"] is True
@@ -272,14 +276,14 @@ def test_legacy_presence_is_derived_and_cannot_be_supplied_as_a_fact():
         adapters._canonicalize_source_adapter_bindings_for_test([row])
 
 
-def test_non_tencent_identity_cannot_inject_tencent_candidate_provider():
+def test_non_tencent_identity_cannot_inject_tencent_shadow_provider():
     row = next(
         deepcopy(item)
         for item in get_source_adapter_registry()
         if item["capability"] == "daily_bar_qfq"
     )
-    row["candidate_provider_key"] = QUOTE_CANDIDATE_KEY
-    row["implementation_status"] = "candidate_not_activated"
+    row["provider_key"] = QUOTE_CANDIDATE_KEY
+    row["implementation_status"] = "bound"
 
     with pytest.raises(
         ValueError,
@@ -309,19 +313,21 @@ def test_registry_order_is_hash_invariant_but_slot_changes_are_not():
     random.Random(83).shuffle(shuffled)
     assert (
         adapters._compute_source_adapter_registry_hash_for_test(shuffled)
-        == EXPECTED_V3_HASH
+        == EXPECTED_SHADOW_V3_HASH
     )
 
     changed = deepcopy(rows)
     quote = next(row for row in changed if row["capability"] == "quote")
-    quote["candidate_provider_key"] = (
+    quote["provider_key"] = (
         "tests.AlternateTencentProvider.collect_quote_records"
     )
+    changed_hash = adapters._compute_source_adapter_registry_hash_for_test(changed)
+    assert changed_hash != EXPECTED_SHADOW_V3_HASH
     with pytest.raises(
         ValueError,
-        match="source_adapter_candidate_binding_mismatch",
+        match="production_source_adapter_binding_modified",
     ):
-        adapters._compute_source_adapter_registry_hash_for_test(changed)
+        adapters._validate_production_source_adapter_bindings(changed)
 
 
 def test_test_only_bound_selection_hash_is_isolated_from_production():
@@ -344,6 +350,6 @@ def test_test_only_bound_selection_hash_is_isolated_from_production():
 
     assert result["status"] == SOURCE_ADAPTER_BOUND
     assert result["selection_registry_scope"] == "test_only"
-    assert result["production_adapter_registry_hash"] == EXPECTED_V3_HASH
-    assert result["selection_adapter_registry_hash"] != EXPECTED_V3_HASH
+    assert result["production_adapter_registry_hash"] == EXPECTED_SHADOW_V3_HASH
+    assert result["selection_adapter_registry_hash"] != EXPECTED_SHADOW_V3_HASH
     _assert_safe(result, provider_called=True)
