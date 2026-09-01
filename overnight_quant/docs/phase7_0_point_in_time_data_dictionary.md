@@ -184,6 +184,42 @@ feature_event_cutoff <= collection_deadline
                      <= execution_not_before
 ```
 
+来源资格阶段还要求每个样本包含 `probe_source`。同一 evidence hash 只能覆盖一个来源；
+样本中出现多个来源，或命令指定来源与样本来源不一致时，必须返回
+`MINUTE_LABEL_INCONCLUSIVE`。东财和 mootdx 的不同成功时点不得拼接。原始结果由
+Python 使用临时文件和 `os.replace` 原子写入无 BOM UTF-8 JSON。
+
+### 7.1.1 同源逐笔归因与 provisional 合同
+
+mootdx 资格采样在最后一个分钟采样点之后，使用同一来源的逐笔接口分别聚合
+`14:49:00-14:49:59` 和 `14:50:00-14:50:59`。只有其中一个区间与最终稳定的
+14:50 分钟行在 open、high、low、close、volume 上精确匹配，且成交记录完整、秒级
+时间与原生数量单位一致时，才允许记录 `minute_end_provisional` 或
+`minute_start_provisional`。两边都匹配、两边都不匹配、覆盖不足或单位不一致时保持
+`INCONCLUSIVE`。不能从时间标签文本直接推断语义。
+
+mootdx 分钟 K 线当前不提供成交笔数字段。逐笔聚合的 `trade_count` 必须保留在证据中，
+并标记 `minute_bar_field_unavailable_audit_only`；不得把它描述成已经完成字段等价性
+证明。这也是结论保持 provisional、不能成为正式决策合同的原因之一。
+
+provisional 时间合同新增字段：
+
+| 字段 | 含义 |
+|---|---|
+| `bar_label_time` | 被归因的稳定分钟行标签时间 |
+| `interval_start` / `interval_end` | 匹配的实际成交事件区间 |
+| `first_observed_at` | 首次观察到该分钟行的时间 |
+| `finalized_at` | 至少三次稳定观察后确认不再变化的时间 |
+| `is_final` | 该证据中的分钟行是否已稳定；false 时禁止进入决策 |
+| `finalization_delay_ms` | 区间结束到最终确认的延迟 |
+| `transaction_evidence_hash` | 单一来源逐笔证据哈希 |
+| `combined_evidence_hash` | 分钟证据与逐笔归因的组合哈希 |
+
+`is_final=false` 的分钟记录在规范化时以 `minute_bar_not_final` 拒绝，不得进入
+readiness、评分、`snapshot_hash` 或 `decision_hash`。即使 `is_final=true`，provisional
+合同仍不是正式决策可用合同；只有完成连续多日验证并经 PM 人工复核后才能讨论配置
+变更。
+
 2026-07-31 已执行一次真实交易日四时点采样。14:50:05 和 14:51:05 两次请求覆盖
 全部 5 只股票，且对应的 14:50 OHLCV 哈希稳定；14:49:55 和 14:50:30 因上游
 连接失败未取得覆盖。由于任一必需时点失败都只能得到 `INCONCLUSIVE`，本次证据
@@ -284,3 +320,26 @@ provider 失败，`ProviderSpec` 仍保留预期数据类型和版本，使 `FAI
 
 来源验证结果本身始终 `data_ready=false`，只用于验证真实字段、时间和连通性，不是
 冻结快照，也不会生成评分、候选、票据或订单。
+
+## 14. 分钟采样证据 v2
+
+`probe_evidence_schema_version=v2` 在 v1 的四时点行情证据之上增加可审计的调度
+合同。每个采样点必须记录：
+
+- `target_at`、`request_started_at`、`request_completed_at`；
+- `schedule_lag_ms`、`completion_lag_ms`、`request_deadline_ms`；
+- `request_timed_out`、`sample_window_missed`、`worker_terminated`；
+- 稳定的 `error_code`、固定的 `endpoint_id` 和 `returned_record_count`。
+
+顶层汇总分别记录 `late_start_count`、`deadline_exceeded_count`、
+`missed_sample_count` 和 `late_record_count`。其中 `late_record_count` 只统计成功
+返回、但晚于目标采样截止时间的数据记录；请求失败或被强制终止且没有返回记录时仍为
+零。超时和错失时点由另外三个字段表达，不能相互替代。
+
+mootdx 在四时点前执行 5/5 覆盖预检并固定一个健康端点。预检失败使用
+`SOURCE_PREFLIGHT_FAILED`，不进入四时点采样，也不生成候选、票据或订单。每个网络
+请求在独立子进程内执行；分钟请求硬截止为 2000ms，超时后必须终止并等待子进程退出。
+
+v2 的 `probe_evidence_hash` 覆盖来源预检、上述逐点审计字段和顶层汇总。缺少
+`probe_evidence_schema_version` 的历史证据继续按 v1 原始规范验证，不能用 v2 字段
+重新解释或改变 2026-08-06、2026-08-07、2026-08-10 的原始哈希。

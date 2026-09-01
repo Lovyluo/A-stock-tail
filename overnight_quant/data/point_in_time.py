@@ -148,6 +148,15 @@ def records_available_at(
             published = parse_cn_datetime(row.get("published_at")) if row.get("published_at") else None
             if event is None or observed is None or available is None or cutoff is None:
                 reason = "temporal_contract_invalid"
+            elif (
+                row.get("data_type") == "minute_bar"
+                and (
+                    row.get("is_final") is False
+                    or (row.get("payload") or {}).get("is_final")
+                    is False
+                )
+            ):
+                reason = "minute_bar_not_final"
             elif event > feature_cutoff:
                 reason = (
                     "event_after_feature_cutoff"

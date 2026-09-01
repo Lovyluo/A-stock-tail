@@ -10,6 +10,10 @@ from typing import Any
 from overnight_quant.data.market_calendar import TAIL_SESSION, get_session_state
 from overnight_quant.data.position_accounting import summarize_order_rows
 from overnight_quant.data.stock_catalog import load_stock_catalog, resolve_stock_name
+from overnight_quant.data.tencent_shadow_snapshot import (
+    TENCENT_SHADOW_SNAPSHOT_READY,
+    build_tencent_shadow_snapshot,
+)
 from overnight_quant.ui.result_parser import (
     SimpleTable,
     find_latest_file,
@@ -1977,6 +1981,7 @@ def main() -> None:
     tabs = st.tabs(premium_tab_labels(language))
     with tabs[0]:
         _render_overview(st, state, language)
+        _render_tencent_shadow_snapshot_fragment(st, language)
     with tabs[1]:
         _render_news_briefing_content(st, state, language)
     with tabs[2]:
@@ -2048,6 +2053,120 @@ def main() -> None:
         _render_report_section(st, "尾盘审计" if language == "zh" else "Tail Audit", state["dry_run"], language, "dry_run")
         with st.expander(t(language, "audit_artifacts")):
             render_key_value_rows(st, audit_file_rows(state, language), language)
+
+
+def _render_tencent_shadow_snapshot_fragment(st, language: str) -> None:
+    fragment = getattr(st, "fragment", None) or getattr(
+        st, "experimental_fragment", None
+    )
+    if callable(fragment):
+        fragment(_render_tencent_shadow_snapshot_panel)(st, language)
+    else:
+        _render_tencent_shadow_snapshot_panel(st, language)
+
+
+def _render_tencent_shadow_snapshot_panel(
+    st,
+    language: str,
+    *,
+    runner=build_tencent_shadow_snapshot,
+) -> None:
+    st.markdown(
+        "#### 腾讯行情/估值"
+        if language == "zh"
+        else "#### Tencent Quote / Valuation"
+    )
+    controls = st.columns([3, 1])
+    codes_text = controls[0].text_input(
+        "股票代码" if language == "zh" else "Stock codes",
+        "000001,000333,600000,600519,601318",
+        key="tencent_shadow_snapshot_codes",
+    )
+    refresh_clicked = controls[1].button(
+        "刷新只读快照" if language == "zh" else "Refresh read-only snapshot",
+        use_container_width=True,
+        key="refresh_tencent_shadow_snapshot",
+    )
+    session_state = getattr(st, "session_state", {})
+    if refresh_clicked:
+        codes = [item.strip() for item in codes_text.split(",") if item.strip()]
+        result = runner(codes, network=True)
+        if hasattr(session_state, "__setitem__"):
+            session_state["tencent_shadow_snapshot"] = result
+
+    result = (
+        session_state.get("tencent_shadow_snapshot")
+        if hasattr(session_state, "get")
+        else None
+    )
+    if not isinstance(result, dict):
+        st.caption(
+            "仅在点击刷新时读取腾讯行情；不会自动轮询，也不会进入策略评分。"
+            if language == "zh"
+            else "Tencent data is fetched only on click; there is no polling or strategy integration."
+        )
+        return
+
+    if result.get("status") != TENCENT_SHADOW_SNAPSHOT_READY:
+        status = str(result.get("status") or "UNKNOWN")
+        st.warning(
+            f"数据未就绪：{status}"
+            if language == "zh"
+            else f"Data not ready: {status}"
+        )
+        return
+
+    source = result.get("source") or {}
+    collected_at = str(result.get("collected_at") or "")
+    source_text = (
+        f"{source.get('origin_source', 'tencent')} / "
+        f"{source.get('adapter', 'direct_http')} / "
+        f"{source.get('source_version', '')}"
+    )
+    st.info(
+        f"只读影子快照已更新；来源：{source_text}；采集时间：{collected_at}"
+        if language == "zh"
+        else f"Read-only shadow snapshot updated; source: {source_text}; collected: {collected_at}"
+    )
+    rows = tencent_shadow_snapshot_table_rows(result, language)
+    st.dataframe(rows, use_container_width=True)
+    st.caption(
+        "只用于页面查看；data_ready=false，不参与策略、门禁或交易输出。"
+        if language == "zh"
+        else "Display only; data_ready=false and excluded from strategy, gates, and trading outputs."
+    )
+
+
+def tencent_shadow_snapshot_table_rows(
+    result: dict[str, Any], language: str = DEFAULT_LANGUAGE
+) -> list[dict[str, Any]]:
+    labels = {
+        "zh": {
+            "code": "代码",
+            "name": "名称",
+            "price": "现价",
+            "pe_ttm": "PE(TTM)",
+            "pb": "PB",
+            "market_cap_yi": "总市值(亿元)",
+            "float_market_cap_yi": "流通市值(亿元)",
+            "event_time": "来源时间",
+        },
+        "en": {
+            "code": "Code",
+            "name": "Name",
+            "price": "Price",
+            "pe_ttm": "PE (TTM)",
+            "pb": "PB",
+            "market_cap_yi": "Market Cap (CNY 100m)",
+            "float_market_cap_yi": "Float Cap (CNY 100m)",
+            "event_time": "Source Time",
+        },
+    }["zh" if language == "zh" else "en"]
+    return [
+        {label: row.get(field) for field, label in labels.items()}
+        for row in result.get("rows", [])
+        if isinstance(row, dict)
+    ]
 
 
 def _render_top_status_bar(st, state: dict[str, Any], language: str) -> None:
