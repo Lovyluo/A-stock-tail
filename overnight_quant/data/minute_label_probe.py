@@ -42,6 +42,7 @@ PROBE_CLOCKS = (
     time(14, 51, 5),
 )
 MAX_PROBE_START_LAG_SECONDS = 2.0
+ENDPOINT_DISCOVERY_CUTOFF = time(14, 49, 40)
 MINUTE_REQUEST_DEADLINE_MS = 2000
 TRANSACTION_REQUEST_DEADLINE_MS = 5000
 PROBE_EVIDENCE_SCHEMA_V1 = "v1"
@@ -553,7 +554,11 @@ def run_scheduled_minute_label_probe(
         result["combined_evidence_hash"] = str(
             attribution.get("combined_evidence_hash") or ""
         )
-        if attribution.get("status") != ATTRIBUTION_INCONCLUSIVE:
+        sampling_failed = _probe_sampling_failed(samples, audit_summary)
+        if (
+            attribution.get("status") != ATTRIBUTION_INCONCLUSIVE
+            and not sampling_failed
+        ):
             result["status"] = "MINUTE_LABEL_PROVISIONAL"
             result["minute_label_semantics"] = attribution["status"]
             result["minute_label_validation_status"] = (
@@ -624,6 +629,27 @@ def _source_preflight(
             "coverage_ratio": 0.0,
             "request_elapsed_ms": 0.0,
             "attempts": [],
+        }
+
+    if (
+        source == PROBE_SOURCE_MOOTDX
+        and process_isolated
+        and endpoint_candidates is None
+        and observed_at.timetz().replace(tzinfo=None) >= ENDPOINT_DISCOVERY_CUTOFF
+    ):
+        now = clock().isoformat(timespec="milliseconds")
+        return {
+            "status": "SOURCE_PREFLIGHT_FAILED",
+            "source": source,
+            "started_at": now,
+            "completed_at": now,
+            "endpoint_id": "",
+            "selected_endpoint": None,
+            "covered_codes": [],
+            "coverage_ratio": 0.0,
+            "request_elapsed_ms": 0.0,
+            "attempts": [],
+            "error_code": "FIXED_ENDPOINT_REQUIRED_IN_FORMAL_WINDOW",
         }
 
     candidates = list(
@@ -966,6 +992,29 @@ def _probe_audit_summary(
     }
 
 
+def _probe_sampling_failed(
+    samples: list[dict[str, Any]],
+    audit_summary: dict[str, Any],
+) -> bool:
+    if any(
+        int(audit_summary.get(key) or 0) > 0
+        for key in (
+            "late_start_count",
+            "deadline_exceeded_count",
+            "missed_sample_count",
+            "late_record_count",
+        )
+    ):
+        return True
+    return any(
+        sample.get("request_timed_out") is True
+        or sample.get("sample_window_missed") is True
+        or bool(str(sample.get("error_code") or "").strip())
+        or bool(str(sample.get("error") or "").strip())
+        for sample in samples
+    )
+
+
 def _collect_transaction_evidence(
     *,
     collectors: Any | None,
@@ -1119,7 +1168,7 @@ def _probe_result(
         "source": source,
         "tracked_codes": tracked_codes or [],
         "probe_evidence_hash": probe_evidence_hash,
-        "reasons": reasons,
+        "reasons": _deduplicate_preserving_order(reasons),
         "samples": samples,
         "recommended_time_contract": contract.as_dict(),
     }
@@ -1127,6 +1176,17 @@ def _probe_result(
         result["probe_evidence_schema_version"] = schema_version
         result["source_preflight"] = source_preflight or {}
         result.update(audit_summary or _probe_audit_summary(samples))
+    return result
+
+
+def _deduplicate_preserving_order(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
     return result
 
 

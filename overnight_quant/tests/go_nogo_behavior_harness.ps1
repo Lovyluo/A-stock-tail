@@ -91,7 +91,8 @@ function global:Get-ScheduledTask {
             [pscustomobject]@{
                 Arguments = (
                     "-ProjectRoot `"$ProjectRoot`" " +
-                    "-Codes `"$taskCodes`""
+                    "-Codes `"$taskCodes`" " +
+                    "-MootdxEndpoint `"127.0.0.1:1`""
                 )
             }
         )

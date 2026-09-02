@@ -55,6 +55,11 @@ mootdx 分钟 K 线没有成交笔数字段，所以逐笔 `trade_count` 只作�
 任一请求失败、迟到、覆盖不足、来源版本缺失、原始哈希缺失、证据哈希无法独立重算
 或分钟变化模式不明确，都只能得到 `INCONCLUSIVE`。
 
+基础分钟采样状态采用单向降级：只要存在 missed、late、timeout 或 error，逐笔归因即使
+得到 provisional 子结论，也只能保存在 `transaction_attribution` 中，不得把顶层状态从
+`MINUTE_LABEL_INCONCLUSIVE` 升级。此类 CLI 运行返回非零。合法记录的失败证据仍可通过
+完整性校验，但资格层继续依据时序审计计数拒绝计日。
+
 `compute_probe_evidence_hash()` 必须显式传入非空 `source`。独立校验命令分别重算
 分钟、逐笔和组合哈希；任何来源不一致或哈希漂移都会失败。`is_final=false` 的分钟行
 不进入 readiness、评分、`snapshot_hash` 或 `decision_hash`。
@@ -95,7 +100,7 @@ Eastmoney 结果无论是否完整都标记为 `audit_only`，不得进入上述
 ```powershell
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source eastmoney --codes 000001,000333,600000,600519,601318 --date YYYY-MM-DD --output overnight_quant/data/cache/minute_label_probe_eastmoney_YYYY-MM-DD.json
 
-D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source mootdx --codes 000001,000333,600000,600519,601318 --date YYYY-MM-DD --output overnight_quant/data/cache/minute_label_probe_mootdx_YYYY-MM-DD.json
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source mootdx --codes 000001,000333,600000,600519,601318 --date YYYY-MM-DD --endpoint HOST:7709 --endpoint-id LOCKED_ENDPOINT_ID --output overnight_quant/data/cache/minute_label_probe_mootdx_YYYY-MM-DD.json
 
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_probe_evidence_verify.py --source mootdx --input overnight_quant/data/cache/minute_label_probe_mootdx_YYYY-MM-DD.json
 ```
@@ -103,6 +108,10 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_probe_evidence_v
 `YYYY-MM-DD` 依次替换为 2026-08-04、2026-08-05、2026-08-06。14:40-14:52
 不运行 30/50 股票压力测试。单日得到 provisional 也不修改正式配置，必须累计至少
 三个连续交易日并完成 PM 复核。
+
+mootdx 正式运行必须使用 Go/No-Go 在正式窗口前选定的固定节点。`--endpoint` 只形成单一
+候选，固定节点失败时直接记录失败，不扫描或回退到其他节点；14:49:40 后未携带固定节点
+的进程会在发起 worker 请求前失效关闭。
 
 ## 7. 其他正式来源
 

@@ -49,15 +49,40 @@ def main() -> int:
             "do not pipe through Tee-Object."
         ),
     )
+    parser.add_argument(
+        "--endpoint",
+        default="",
+        help=(
+            "Optional fixed mootdx host:port selected before the formal "
+            "sampling window. A supplied endpoint is the only endpoint tried."
+        ),
+    )
+    parser.add_argument(
+        "--endpoint-id",
+        default="",
+        help="Optional stable identifier for the fixed mootdx endpoint.",
+    )
     args = parser.parse_args()
+    endpoint_candidates = None
+    if args.endpoint:
+        if args.source != "mootdx":
+            parser.error("--endpoint is only valid with --source mootdx")
+        endpoint_candidates = [
+            _parse_fixed_endpoint(args.endpoint, args.endpoint_id)
+        ]
+    probe_kwargs = {
+        "trade_date": args.date,
+        "source": args.source,
+    }
+    if endpoint_candidates is not None:
+        probe_kwargs["endpoint_candidates"] = endpoint_candidates
     result = run_scheduled_minute_label_probe(
         [
             item.strip()
             for item in str(args.codes).split(",")
             if item.strip()
         ],
-        trade_date=args.date,
-        source=args.source,
+        **probe_kwargs,
     )
     if args.output:
         write_probe_json_atomic(result, args.output)
@@ -68,6 +93,28 @@ def main() -> int:
         in {"MINUTE_LABEL_VERIFIED", "MINUTE_LABEL_PROVISIONAL"}
         else 2
     )
+
+
+def _parse_fixed_endpoint(value: str, endpoint_id: str = "") -> dict:
+    host, separator, raw_port = str(value or "").strip().rpartition(":")
+    if not separator or not host.strip():
+        raise argparse.ArgumentTypeError("endpoint must use host:port")
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("endpoint port must be an integer") from exc
+    if port <= 0 or port > 65535:
+        raise argparse.ArgumentTypeError("endpoint port is out of range")
+    normalized_host = host.strip()
+    identifier = str(endpoint_id or "").strip()
+    if not identifier:
+        identifier = f"mootdx_fixed@{normalized_host}:{port}"
+    return {
+        "id": identifier,
+        "name": "mootdx_fixed",
+        "host": normalized_host,
+        "port": port,
+    }
 
 
 if __name__ == "__main__":

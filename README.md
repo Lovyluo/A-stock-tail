@@ -162,7 +162,7 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_close_snapshot_c
 # Probe each supplier independently and atomically write UTF-8 JSON
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source eastmoney --codes 000001,000333,600000,600519,601318 --date 2026-08-03 --output overnight_quant/data/cache/minute_label_probe_eastmoney_2026-08-03.json
 
-D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source mootdx --codes 000001,000333,600000,600519,601318 --date 2026-08-03 --output overnight_quant/data/cache/minute_label_probe_mootdx_2026-08-03.json
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_probe.py --source mootdx --codes 000001,000333,600000,600519,601318 --date 2026-08-03 --endpoint HOST:7709 --endpoint-id LOCKED_ENDPOINT_ID --output overnight_quant/data/cache/minute_label_probe_mootdx_2026-08-03.json
 
 # Independently recompute source-specific minute, transaction and combined hashes
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_probe_evidence_verify.py --source mootdx --input overnight_quant/data/cache/minute_label_probe_mootdx_2026-08-04.json
