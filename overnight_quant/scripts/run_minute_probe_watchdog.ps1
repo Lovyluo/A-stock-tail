@@ -8,6 +8,10 @@ param(
 
     [string]$ProjectRoot = '',
 
+    [string]$MootdxEndpoint = '',
+
+    [string]$MootdxEndpointId = '',
+
     [switch]$ValidateOnly
 )
 
@@ -32,6 +36,9 @@ $probeScript = Join-Path $ProjectRoot 'overnight_quant\scripts\run_minute_label_
 $stateMachineScript = Join-Path `
     $ProjectRoot `
     'overnight_quant\scripts\minute_probe_watchdog_state.ps1'
+$proxyReadinessScript = Join-Path `
+    $ProjectRoot `
+    'overnight_quant\scripts\source_proxy_readiness.ps1'
 $cacheDir = Join-Path $ProjectRoot 'overnight_quant\data\cache'
 $day = [datetime]::ParseExact(
     $Date,
@@ -49,7 +56,20 @@ $directProcesses = @{}
 if (-not (Test-Path -LiteralPath $stateMachineScript -PathType Leaf)) {
     throw "state_machine_script_missing:$stateMachineScript"
 }
+if (-not (Test-Path -LiteralPath $proxyReadinessScript -PathType Leaf)) {
+    throw "proxy_readiness_script_missing:$proxyReadinessScript"
+}
 . $stateMachineScript
+. $proxyReadinessScript
+
+$sourceReadiness = [ordered]@{
+    mootdx = Get-SourceProxyReadiness -Source 'mootdx'
+    eastmoney = Get-SourceProxyReadiness -Source 'eastmoney'
+}
+$activeSources = @(
+    $sources |
+        Where-Object { $sourceReadiness[$_].source_allowed -eq $true }
+)
 
 $sourceStates = @{}
 foreach ($source in $sources) {
@@ -116,6 +136,12 @@ function Start-DirectProbe {
         '--date', $Date,
         '--output', $output
     )
+    if ($Source -eq 'mootdx') {
+        $arguments += @('--endpoint', $MootdxEndpoint)
+        if (-not [string]::IsNullOrWhiteSpace($MootdxEndpointId)) {
+            $arguments += @('--endpoint-id', $MootdxEndpointId)
+        }
+    }
     $process = Start-Process `
         -FilePath $python `
         -ArgumentList $arguments `
@@ -145,8 +171,22 @@ function Test-ProbeCanStart {
 function Test-ProbeScheduledTaskExists {
     param([string]$Source)
     $taskName = Get-ProbeTaskName $Source
-    return $null -ne (
-        Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask `
+        -TaskName $taskName `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        return $false
+    }
+    if ($Source -ne 'mootdx') {
+        return $true
+    }
+    $arguments = [string](@($task.Actions)[0].Arguments)
+    return (
+        $arguments -like "*--endpoint $MootdxEndpoint*" -and
+        (
+            [string]::IsNullOrWhiteSpace($MootdxEndpointId) -or
+            $arguments -like "*--endpoint-id $MootdxEndpointId*"
+        )
     )
 }
 
@@ -220,6 +260,7 @@ function Write-WatchdogResult {
         $result = Get-ProbeResult $output
         $present = $null -ne $result
         $sampleCount = if ($present) { @($result.samples).Count } else { 0 }
+        $sourceAllowed = $sourceReadiness[$source].source_allowed -eq $true
         $sourceResults[$source] = [ordered]@{
             output_present = $filePresent
             output_readable = $present
@@ -228,6 +269,9 @@ function Write-WatchdogResult {
             }
             elseif ($filePresent) {
                 'UNREADABLE_OUTPUT'
+            }
+            elseif (-not $sourceAllowed) {
+                [string]$sourceReadiness[$source].status
             }
             else {
                 'MISSING'
@@ -242,7 +286,7 @@ function Write-WatchdogResult {
             orders = if ($present) { @($result.orders).Count } else { 0 }
             source_state = $sourceStates[$source]
         }
-        if (-not $present -or $sampleCount -ne 4) {
+        if ($sourceAllowed -and (-not $present -or $sampleCount -ne 4)) {
             $allPresent = $false
         }
     }
@@ -255,6 +299,8 @@ function Write-WatchdogResult {
         completed_at = [datetime]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
         start_at = $startAt.ToString('yyyy-MM-ddTHH:mm:ssK')
         last_safe_start = $lastSafeStart.ToString('yyyy-MM-ddTHH:mm:ssK')
+        source_readiness = $sourceReadiness
+        active_sources = $activeSources
         sources = $sourceResults
         events = @($events)
         candidates = @()
@@ -292,20 +338,54 @@ if (-not (Test-Path -LiteralPath $probeScript -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $cacheDir -PathType Container)) {
     throw "cache_directory_missing:$cacheDir"
 }
+$endpointText = ([string]$MootdxEndpoint).Trim()
+$endpointSeparatorIndex = $endpointText.LastIndexOf(':')
+$endpointHost = if ($endpointSeparatorIndex -gt 0) {
+    $endpointText.Substring(0, $endpointSeparatorIndex).Trim()
+}
+else { '' }
+$endpointPortText = if (
+    $endpointSeparatorIndex -gt 0 -and
+    $endpointSeparatorIndex -lt ($endpointText.Length - 1)
+) {
+    $endpointText.Substring($endpointSeparatorIndex + 1)
+}
+else { '' }
+$endpointPort = 0
+$fixedEndpointValid = (
+    $endpointSeparatorIndex -gt 0 -and
+    -not [string]::IsNullOrWhiteSpace($endpointHost) -and
+    [int]::TryParse($endpointPortText, [ref]$endpointPort) -and
+    $endpointPort -gt 0 -and
+    $endpointPort -le 65535
+)
 
 if ($ValidateOnly) {
     [ordered]@{
-        status = 'WATCHDOG_VALIDATED'
+        status = if ($fixedEndpointValid) {
+            'WATCHDOG_VALIDATED'
+        }
+        else {
+            'WATCHDOG_FIXED_ENDPOINT_REQUIRED'
+        }
         trade_date = $Date
         start_at = $startAt.ToString('yyyy-MM-ddTHH:mm:ssK')
         last_safe_start = $lastSafeStart.ToString('yyyy-MM-ddTHH:mm:ssK')
         finish_at = $finishAt.ToString('yyyy-MM-ddTHH:mm:ssK')
         sources = $sources
+        source_readiness = $sourceReadiness
+        active_sources = $activeSources
+        mootdx_endpoint = $MootdxEndpoint
+        mootdx_endpoint_id = $MootdxEndpointId
         candidates = @()
         tickets = @()
         orders = @()
     } | ConvertTo-Json -Depth 4
-    exit 0
+    exit $(if ($fixedEndpointValid) { 0 } else { 2 })
+}
+
+if (-not $fixedEndpointValid) {
+    throw 'mootdx_fixed_endpoint_required'
 }
 
 if ([datetime]::Now.Date -ne $day.Date -or [datetime]::Now -gt $finishAt) {
@@ -318,7 +398,7 @@ if ([datetime]::Now.Date -ne $day.Date -or [datetime]::Now -gt $finishAt) {
 while ([datetime]::Now -lt $finishAt) {
     $now = [datetime]::Now
     if ($now -ge $startAt -and $now -le $lastSafeStart) {
-        foreach ($source in $sources) {
+        foreach ($source in $activeSources) {
             Ensure-ProbeRunning $source
         }
     }

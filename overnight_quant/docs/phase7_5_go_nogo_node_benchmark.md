@@ -24,6 +24,11 @@ Tushare 和 Ashare 的角色固定为 `retired/disabled_by_policy`，本阶段�
 与该范围完全一致。单股、缺股、多股或替换 `600000` 都返回 `SAMPLING_NO_GO`。
 `ValidateOnly` 只读取状态，不启用也不禁用任务。
 
+Go/No-Go 将筛选结果中的 mootdx 节点作为固定参数传给 watchdog；watchdog 在正式采样中
+只能调用该节点，不做串行节点扫描或 fallback。Eastmoney 只有在系统实际为其解析到本机
+代理时才检查本机监听端口。监听不可用只把 Eastmoney 标记为来源级拒绝并从活动来源中
+排除，不阻断 mootdx，也不会自动启动代理或绕过既有代理设置。
+
 标准结果采用不可覆盖写入。恢复模式写入独立文件，并记录原始 `SAMPLING_NO_GO` 文件的
 SHA-256；原文件永不删除或覆盖。
 

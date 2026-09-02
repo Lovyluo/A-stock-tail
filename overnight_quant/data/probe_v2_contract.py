@@ -252,10 +252,18 @@ def _validate_v2_samples(
             or any(code not in tracked_codes for code in covered_codes)
         ):
             errors.append(f"probe_sample_covered_codes_mismatch:{clock}")
-        if source == "mootdx" and str(
-            sample.get("endpoint_id") or ""
-        ).strip() != endpoint_id:
-            errors.append(f"probe_sample_endpoint_id_mismatch:{clock}")
+        if source == "mootdx":
+            sample_endpoint_id = str(
+                sample.get("endpoint_id") or ""
+            ).strip()
+            unstarted_missed_sample = _is_unstarted_missed_sample(sample)
+            if unstarted_missed_sample:
+                if sample_endpoint_id:
+                    errors.append(
+                        f"probe_missed_sample_endpoint_must_be_empty:{clock}"
+                    )
+            elif sample_endpoint_id != endpoint_id:
+                errors.append(f"probe_sample_endpoint_id_mismatch:{clock}")
         errors.extend(
             _validate_sample_timing(
                 sample,
@@ -272,6 +280,22 @@ def _sample_has_failure(sample: dict[str, Any]) -> bool:
         or sample.get("sample_window_missed") is True
         or bool(str(sample.get("error_code") or "").strip())
         or bool(str(sample.get("error") or "").strip())
+    )
+
+
+def _is_unstarted_missed_sample(sample: dict[str, Any]) -> bool:
+    return (
+        sample.get("sample_window_missed") is True
+        and sample.get("request_timed_out") is False
+        and sample.get("worker_terminated") is False
+        and str(sample.get("error_code") or "") == "SAMPLE_WINDOW_MISSED"
+        and _integer(sample.get("returned_record_count")) == 0
+        and not (sample.get("covered_codes") or [])
+        and not (sample.get("signatures") or {})
+        and not (sample.get("raw_response_hashes") or [])
+        and not str(sample.get("provider_raw_hash") or "").strip()
+        and not (sample.get("source_versions") or [])
+        and _number(sample.get("request_elapsed_ms")) == 0.0
     )
 
 

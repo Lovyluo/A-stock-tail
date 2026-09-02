@@ -306,6 +306,10 @@ function Test-TaskSettings {
         & $AddCheck "${Prefix}_task_formal_codes_exact" `
             ([bool]$taskCodes.valid) `
             ([string]$taskCodes.normalized)
+        $taskArguments = Get-TaskArguments $Task
+        & $AddCheck "${Prefix}_task_fixed_mootdx_endpoint" `
+            ($taskArguments -like "*${Endpoint}*") `
+            $taskArguments
     }
 }
 
@@ -529,6 +533,21 @@ function Invoke-GoNoGo {
         orders = @()
     }
     $originalGuardSha256 = ''
+    $sourceReadiness = [ordered]@{
+        mootdx = [ordered]@{
+            status = 'SOURCE_PENDING_GLOBAL_GATES'
+            source_allowed = $false
+        }
+        eastmoney = [ordered]@{
+            status = 'SOURCE_PROXY_CHECK_NOT_RUN'
+            execution_ok = $false
+            data_ready = $false
+            source_allowed = $false
+            candidates = @()
+            tickets = @()
+            orders = @()
+        }
+    }
 
     $addCheck = {
         param(
@@ -592,6 +611,22 @@ function Invoke-GoNoGo {
     & $addCheck 'windows_time_service' `
         ($LASTEXITCODE -eq 0) `
         "exit=$LASTEXITCODE"
+
+    $proxyReadinessScript = Join-Path `
+        $MainRoot `
+        'overnight_quant\scripts\source_proxy_readiness.ps1'
+    if (Test-Path -LiteralPath $proxyReadinessScript -PathType Leaf) {
+        try {
+            . $proxyReadinessScript
+            $sourceReadiness.eastmoney = Get-SourceProxyReadiness `
+                -Source 'eastmoney'
+        }
+        catch {
+            $sourceReadiness.eastmoney.status = 'SOURCE_PROXY_CHECK_FAILED'
+            $sourceReadiness.eastmoney.execution_ok = $false
+            $sourceReadiness.eastmoney.source_allowed = $false
+        }
+    }
 
     if ($script:isRecovery) {
         $originalValid = $false
@@ -709,6 +744,8 @@ function Invoke-GoNoGo {
                 -Date $Date `
                 -ProjectRoot $MainRoot `
                 -Codes $script:codesText `
+                -MootdxEndpoint $Endpoint `
+                -MootdxEndpointId $script:effectiveEndpointId `
                 -ValidateOnly
             $watchdogExit = $LASTEXITCODE
             $watchdog = ($watchdogRaw | Out-String) | ConvertFrom-Json
@@ -835,8 +872,20 @@ function Invoke-GoNoGo {
     }
 
     $enabledTasks = @()
+    $enabledSources = @()
     if ($script:go) {
         $enabledTasks = @(Get-TargetTaskNames)
+        $sourceReadiness.mootdx.status = 'SOURCE_ENDPOINT_READY'
+        $sourceReadiness.mootdx.source_allowed = $true
+        $enabledSources = @(
+            $sourceReadiness.GetEnumerator() |
+                Where-Object { $_.Value.source_allowed -eq $true } |
+                ForEach-Object { $_.Key }
+        )
+    }
+    else {
+        $sourceReadiness.mootdx.status = 'SOURCE_REJECTED_BY_GATES'
+        $sourceReadiness.mootdx.source_allowed = $false
     }
     return [ordered]@{
         status = if ($script:go) { 'SAMPLING_GO' } else { 'SAMPLING_NO_GO' }
@@ -851,6 +900,8 @@ function Invoke-GoNoGo {
         recovery_mode = $RecoveryMode
         original_guard_sha256 = $originalGuardSha256
         endpoint_preflight = $endpointResult
+        source_readiness = $sourceReadiness
+        enabled_sources = $enabledSources
         checks = @($script:checks)
         errors = @($script:disableErrors)
         enabled_tasks = $enabledTasks
