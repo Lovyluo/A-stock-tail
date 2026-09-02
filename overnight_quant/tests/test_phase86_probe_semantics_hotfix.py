@@ -225,6 +225,68 @@ def test_late_formal_window_without_fixed_endpoint_fails_before_worker_call():
     _assert_safe(result)
 
 
+def test_exact_discovery_cutoff_requires_fixed_endpoint_without_worker_call():
+    clock = _Clock(f"{DAY}T14:49:40.000+08:00")
+    calls = []
+
+    def worker(task, _deadline_ms):
+        calls.append(task)
+        raise AssertionError("worker must not be called")
+
+    result = run_scheduled_minute_label_probe(
+        CODES,
+        trade_date=DAY,
+        source="mootdx",
+        clock=clock,
+        sleep=clock.advance,
+        monotonic=clock.monotonic,
+        worker_runner=worker,
+    )
+
+    assert result["status"] == "SOURCE_PREFLIGHT_FAILED"
+    assert result["source_preflight"]["error_code"] == (
+        "FIXED_ENDPOINT_REQUIRED_IN_FORMAL_WINDOW"
+    )
+    assert calls == []
+    _assert_safe(result)
+
+
+def test_before_discovery_cutoff_allows_endpoint_preflight(monkeypatch):
+    clock = _Clock(f"{DAY}T14:49:39.999+08:00")
+    calls = []
+    monkeypatch.setattr(
+        "overnight_quant.data.minute_label_probe.mootdx_server_candidates",
+        lambda: [ENDPOINT],
+    )
+
+    def worker(task, _deadline_ms):
+        calls.append(task["endpoint"]["id"])
+        return {
+            "ok": False,
+            "error_code": "PROBE_REQUEST_FAILED",
+            "error": "unit failure",
+            "request_timed_out": False,
+            "worker_terminated": False,
+        }
+
+    result = run_scheduled_minute_label_probe(
+        CODES,
+        trade_date=DAY,
+        source="mootdx",
+        clock=clock,
+        sleep=clock.advance,
+        monotonic=clock.monotonic,
+        worker_runner=worker,
+    )
+
+    assert result["status"] == "SOURCE_PREFLIGHT_FAILED"
+    assert result["source_preflight"].get("error_code") != (
+        "FIXED_ENDPOINT_REQUIRED_IN_FORMAL_WINDOW"
+    )
+    assert calls == [ENDPOINT["id"]]
+    _assert_safe(result)
+
+
 def test_fixed_endpoint_is_the_only_endpoint_tried_and_failure_is_final():
     clock = _Clock(f"{DAY}T14:49:49+08:00")
     calls = []

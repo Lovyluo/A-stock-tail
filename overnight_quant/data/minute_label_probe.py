@@ -635,7 +635,7 @@ def _source_preflight(
         source == PROBE_SOURCE_MOOTDX
         and process_isolated
         and endpoint_candidates is None
-        and observed_at.timetz().replace(tzinfo=None) > ENDPOINT_DISCOVERY_CUTOFF
+        and observed_at.timetz().replace(tzinfo=None) >= ENDPOINT_DISCOVERY_CUTOFF
     ):
         now = clock().isoformat(timespec="milliseconds")
         return {
