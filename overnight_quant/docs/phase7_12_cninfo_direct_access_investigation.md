@@ -58,10 +58,14 @@ impersonate CNINFO.
 All outcomes remain research-only:
 
 ```text
-bound_count=4
+bound_count=8
 data_ready=false
 hard_gate_authorized=false
 candidates=[]
 tickets=[]
 orders=[]
 ```
+
+The count change reflects four separately approved non-CNINFO S1 providers.
+CNINFO itself remains `qualification_status=unqualified`,
+`implementation_status=candidate_not_activated`, and `selected_source=null`.

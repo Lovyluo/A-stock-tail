@@ -195,7 +195,7 @@ def test_adapter_registry_binds_exactly_two_qualified_mootdx_providers():
         and row["capability"] in {"minute_bar", "transaction"}
     ]
 
-    assert audit["bound_count"] == 4
+    assert audit["bound_count"] == 8
     assert {row["provider_key"] for row in rows} == {
         MOOTDX_MINUTE_PROVIDER_KEY,
         MOOTDX_TRANSACTION_PROVIDER_KEY,

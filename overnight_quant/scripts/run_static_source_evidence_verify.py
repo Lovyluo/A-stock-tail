@@ -26,6 +26,11 @@ from overnight_quant.data.static_source_providers import (
     StaticSourceProviders,
     compute_static_source_verifier_contract_hash,
 )
+from overnight_quant.data.static_source_qualification import (
+    S1_EVIDENCE_CAPABILITY_REGISTRY_HASH,
+    S1_EVIDENCE_FILE_SHA256,
+    S1_EVIDENCE_HASH,
+)
 from overnight_quant.scripts.run_static_source_validation import (
     compute_evidence_hash,
     write_json_atomic,
@@ -96,7 +101,17 @@ def verify_static_source_evidence(
         errors.append("provider_keys_mismatch")
     if payload.get("provider_verifier_contract_hash") != compute_static_source_verifier_contract_hash():
         errors.append("verifier_contract_hash_mismatch")
-    if payload.get("capability_registry_hash") != compute_source_capability_registry_hash():
+    current_registry_hash = compute_source_capability_registry_hash()
+    approved_legacy_registry = (
+        payload.get("evidence_hash") == S1_EVIDENCE_HASH
+        and expected_file_sha256 == S1_EVIDENCE_FILE_SHA256
+        and payload.get("capability_registry_hash")
+        == S1_EVIDENCE_CAPABILITY_REGISTRY_HASH
+    )
+    if (
+        payload.get("capability_registry_hash") != current_registry_hash
+        and not approved_legacy_registry
+    ):
         errors.append("capability_registry_hash_mismatch")
     for key in ("data_ready", "hard_gate_authorized", "automatic_configuration_change"):
         if payload.get(key) is not False:

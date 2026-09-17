@@ -12,21 +12,26 @@ from overnight_quant.data.source_capability_registry import (
     route_source_capability,
     validate_source_provenance_batch,
 )
+from overnight_quant.data.static_source_qualification import (
+    S1_APPROVED_PROVIDER_KEYS,
+    S1_PARTIAL_QUALIFICATION_RECORD_HASH,
+    S1_UNQUALIFIED_PROVIDER_KEYS,
+)
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v4"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v5"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v3"
+    "source_capability_adapter_registry_v4"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
+    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "register_v043_static_source_contract_candidates_without_activation"
+    "activate_pm_approved_s1_sources_and_retain_cninfo_unqualified_candidate"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -342,55 +347,12 @@ _MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS = {
 _QUALIFIED_SHADOW_PROVIDER_KEYS = {
     **_TENCENT_SHADOW_PROVIDER_KEYS,
     **_MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS,
+    **S1_APPROVED_PROVIDER_KEYS,
 }
 
-_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = {
-    _identity(
-        "trading_calendar",
-        "tencent",
-        "direct_http",
-        "ifzq_fqkline_day_v2026-07-30",
-    ): (
-        "static_source_providers.StaticSourceProviders."
-        "collect_trading_calendar_records"
-    ),
-    _identity(
-        "daily_bar_qfq",
-        "tencent",
-        "direct_http",
-        "ifzq_fqkline_qfqday_v2026-07-30",
-    ): (
-        "static_source_providers.StaticSourceProviders."
-        "collect_qfq_daily_records"
-    ),
-    _identity(
-        "stock_news",
-        "eastmoney",
-        "direct_http",
-        "search_api_cms_old_v2026-07-30",
-    ): (
-        "static_source_providers.StaticSourceProviders."
-        "collect_stock_news_records"
-    ),
-    _identity(
-        "global_news",
-        "eastmoney",
-        "direct_http",
-        "np_weblist_724_v2026-07-30",
-    ): (
-        "static_source_providers.StaticSourceProviders."
-        "collect_global_news_records"
-    ),
-    _identity(
-        "announcement",
-        "cninfo",
-        "direct_http",
-        "cninfo_query_v2026-07-30",
-    ): (
-        "static_source_providers.StaticSourceProviders."
-        "collect_announcement_records"
-    ),
-}
+_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = dict(
+    S1_UNQUALIFIED_PROVIDER_KEYS
+)
 
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
@@ -601,6 +563,9 @@ def _hash_adapter_bindings(entries: Iterable[Mapping[str, Any]]) -> str:
             "adapter_registry_schema_version": ADAPTER_REGISTRY_SCHEMA_VERSION,
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
+            "s1_partial_qualification_record_hash": (
+                S1_PARTIAL_QUALIFICATION_RECORD_HASH
+            ),
             "bindings": list(entries),
         }
     )
@@ -665,6 +630,9 @@ def audit_source_adapters(
             ),
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
+            "s1_partial_qualification_record_hash": (
+                S1_PARTIAL_QUALIFICATION_RECORD_HASH
+            ),
             "adapter_entry_count": len(matrix),
             "bound_count": sum(
                 row["implementation_status"] == IMPLEMENTATION_BOUND
@@ -837,6 +805,7 @@ def _execute_source_adapter_core(
             capability=capability,
             requested_identity=list(requested),
             binding=binding,
+            selected_source=None,
             rejection_reasons=["source_adapter_candidate_not_activated"],
             route_status=route["status"],
             test_only=test_only,

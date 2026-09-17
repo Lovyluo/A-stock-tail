@@ -10,7 +10,7 @@ Provider。它不创建
 固定安全状态为：
 
 ```text
-bound_count=2 (B2.2c 阶段；v0.4.2 固定节点接入后为 4)
+bound_count=2 (B2.2c 阶段；v0.4.2 固定节点接入后为 4；S1 部分批准后为 8)
 data_ready=false
 hard_gate_authorized=false
 candidates=[]
@@ -104,13 +104,13 @@ B2.2c 只读影子绑定后的 Schema v3 生产 hash：
 8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0
 ```
 
-资格更新后的 B1 registry v2 hash 为：
+S1 部分资格批准后的 B1 registry v3 hash 为：
 
 ```text
-e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc
+4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5
 ```
 
-离线审计必须输出 28 项完整矩阵、当前 `bound_count=4`、`candidate_count=0`、
+离线审计必须输出 28 项完整矩阵、当前 `bound_count=8`、`candidate_count=1`、
 `legacy_implementation_present_count=13`、生产/selection hash、`network_requests_made=0`
 及全部安全空输出。注册表输入换序不改变 hash；任意槽位或状态变化会改变测试 hash，并在
 生产完整矩阵校验中被拒绝。

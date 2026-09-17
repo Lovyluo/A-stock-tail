@@ -2,17 +2,18 @@
 
 ## Scope
 
-S1 introduces contract-compatible, read-only candidate providers for five
-static or non-tail-critical capabilities. It does not activate any provider,
-change readiness, or connect data to strategy scoring.
+S1 introduces contract-compatible, read-only providers for five static or
+non-tail-critical capabilities. PM approved four providers for explicit-envelope
+production routing on 2026-09-18. This does not change snapshot readiness or
+connect data to strategy scoring.
 
 | Capability | Origin | Provider state | Network policy |
 | --- | --- | --- | --- |
-| trading calendar | Tencent | candidate, not activated | explicit `--network` only |
-| 60-day qfq daily bars | Tencent | candidate, not activated | explicit `--network` only |
-| stock news | Eastmoney | candidate, not activated | explicit `--network` only |
-| global news | Eastmoney | candidate, not activated | explicit `--network` only |
-| announcement | CNINFO | candidate, not activated | explicit `--network` only |
+| trading calendar | Tencent | bound, PM approved | explicit provider envelope only |
+| 60-day qfq daily bars | Tencent | bound, PM approved | explicit provider envelope only |
+| stock news | Eastmoney | bound, PM approved | explicit provider envelope only |
+| global news | Eastmoney | bound, PM approved | explicit provider envelope only |
+| announcement | CNINFO | candidate, unqualified | never selected for a formal gate |
 
 AKShare remains an unqualified optional wrapper. Tushare and Ashare remain
 retired. No wrapper, legacy implementation, or proxy can satisfy a formal
@@ -71,6 +72,7 @@ official-edge HTML 403. The provider now preserves this response as auditable
 failure evidence and emits `CNINFO_DIRECT_ACCESS_UNAVAILABLE`; it still cannot
 satisfy validation or any hard gate.
 
-This PR therefore remains Draft. PM review may authorize a separate CNINFO
-request-contract investigation; it must not promote any S1 candidate until all
-five capabilities have validated evidence.
+The 2026-09-18 partial approval is evaluated per capability. It promotes the
+four validated providers without promoting CNINFO or changing readiness. The
+deterministic approval record is documented in Phase 7.13. This PR remains
+Draft.

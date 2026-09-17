@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
-REGISTRY_SCHEMA_VERSION = "source_capability_registry_v2"
+REGISTRY_SCHEMA_VERSION = "source_capability_registry_v3"
 QUALIFICATION_PROGRESS_MOOTDX = "3/3"
 QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED = "0/3"
 QUALIFIED_MOOTDX_ENDPOINT_ID = "mootdx_locked@59.36.5.11:7709"
@@ -183,11 +183,13 @@ SOURCE_CAPABILITIES = (
         False,
         False,
         True,
-        False,
+        True,
         True,
         "trading_calendar",
         "ifzq_fqkline_day_v2026-07-30",
         True,
+        "qualified",
+        "pm_approved_s1",
     ),
     SourceCapability(
         "daily_bar_qfq",
@@ -197,11 +199,13 @@ SOURCE_CAPABILITIES = (
         False,
         False,
         True,
-        False,
+        True,
         True,
         "daily_bar_qfq",
         "ifzq_fqkline_qfqday_v2026-07-30",
         True,
+        "qualified",
+        "pm_approved_s1",
     ),
     SourceCapability(
         "minute_bar",
@@ -315,11 +319,13 @@ SOURCE_CAPABILITIES = (
         True,
         False,
         False,
-        False,
+        True,
         True,
         "stock_news",
         "search_api_cms_old_v2026-07-30",
         True,
+        "qualified",
+        "pm_approved_s1",
     ),
     SourceCapability(
         "global_news",
@@ -329,11 +335,13 @@ SOURCE_CAPABILITIES = (
         True,
         False,
         False,
-        False,
+        True,
         True,
         "global_news",
         "np_weblist_724_v2026-07-30",
         True,
+        "qualified",
+        "pm_approved_s1",
     ),
     SourceCapability(
         "industry_snapshot",
@@ -372,12 +380,14 @@ SOURCE_CAPABILITIES = (
         "primary",
         True,
         False,
-        True,
         False,
+        True,
         True,
         "announcement",
         "cninfo_query_v2026-07-30",
         True,
+        "unqualified",
+        "pm_rejected_s1",
     ),
     SourceCapability(
         "global_news",
