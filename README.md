@@ -108,11 +108,12 @@ It does not include a real automated market-data collector, and it is not ready 
 formal 60-trading-day shadow acceptance period. The production-grade point-in-time collector
 is deferred to a separate v0.4.1 phase.
 
-v0.4.1 now includes real-source provider interfaces and a validation matrix. Mootdx is the
-primary minute-source qualification candidate, but it is not a formal source. Eastmoney
-minute probing remains independent audit evidence and is excluded from consecutive qualified
-day counts. Eastmoney `push2` stability, a verified industry-breadth backup, and the exact
-availability semantics of the 14:50 minute event remain blockers. These providers therefore
+v0.4.1 includes real-source provider interfaces and a validation matrix. After PM review of
+three consecutive qualified days (2026-09-15 through 2026-09-17), v0.4.2 limits mootdx
+qualification to minute bars and transactions on the fixed endpoint `59.36.5.11:7709` and the
+five-stock validation scope. Eastmoney minute probing remains independent audit evidence and is
+excluded from qualification. Market breadth, industry breadth, formal fund flow and complete
+snapshot coverage remain blockers. These providers therefore
 do not yet authorize the formal 60-trading-day shadow acceptance period.
 
 The current conservative contract keeps `feature_event_cutoff=14:50:00`, waits until
@@ -139,6 +140,7 @@ See also:
 - [v0.4.1 real collector design](overnight_quant/docs/phase7_1_real_point_in_time_collectors_design.md)
 - [v0.4.1 source validation matrix](overnight_quant/docs/phase7_1_source_validation_matrix.md)
 - [v0.4.1 source qualification design](overnight_quant/docs/phase7_2_source_qualification_design.md)
+- [v0.4.2 mootdx qualification and shadow integration](overnight_quant/docs/phase7_11_mootdx_shadow_integration_design.md)
 - [v0.4 safety boundary](overnight_quant/docs/phase7_0_safety_boundary.md)
 
 ## Common Commands
@@ -166,6 +168,9 @@ D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_minute_label_pro
 
 # Independently recompute source-specific minute, transaction and combined hashes
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_probe_evidence_verify.py --source mootdx --input overnight_quant/data/cache/minute_label_probe_mootdx_2026-08-04.json
+
+# Explicit fixed-endpoint shadow records; does not make the application data-ready
+D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_mootdx_shadow_records.py --network --codes 000001,000333,600000,600519,601318
 
 # Benchmark real providers for 1/10/30/50 stocks without writing snapshots
 D:\A-stock\.venv\Scripts\python.exe overnight_quant/scripts/run_real_collector_stress.py --sizes 1,10,30,50 --deadline-seconds 8

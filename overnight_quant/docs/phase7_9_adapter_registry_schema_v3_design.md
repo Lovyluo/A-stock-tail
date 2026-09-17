@@ -10,7 +10,7 @@ Provider。它不创建
 固定安全状态为：
 
 ```text
-bound_count=2
+bound_count=2 (B2.2c 阶段；v0.4.2 固定节点接入后为 4)
 data_ready=false
 hard_gate_authorized=false
 candidates=[]
@@ -98,15 +98,19 @@ B2.2c 只读影子绑定后的 Schema v3 生产 hash：
 61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39
 ```
 
-变化原因固定记录为
-`schema_v3_provider_candidate_legacy_slots_and_tencent_candidates`。B1 registry 内容没有
-变化，其 hash 继续为：
+上述值是 B2.2c 历史基线。v0.4.2 固定节点接入后的生产 hash 为：
 
 ```text
-303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69
+8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0
 ```
 
-离线审计必须输出 28 项完整矩阵、`bound_count=2`、`candidate_count=0`、
+资格更新后的 B1 registry v2 hash 为：
+
+```text
+e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc
+```
+
+离线审计必须输出 28 项完整矩阵、当前 `bound_count=4`、`candidate_count=0`、
 `legacy_implementation_present_count=13`、生产/selection hash、`network_requests_made=0`
 及全部安全空输出。注册表输入换序不改变 hash；任意槽位或状态变化会改变测试 hash，并在
 生产完整矩阵校验中被拒绝。

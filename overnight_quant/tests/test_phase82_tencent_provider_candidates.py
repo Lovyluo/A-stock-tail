@@ -646,7 +646,7 @@ def test_candidates_pass_private_test_only_execution_without_production_binding(
     _assert_safe(result)
 
 
-def test_production_bindings_activate_two_read_only_shadow_providers():
+def test_production_bindings_keep_two_tencent_read_only_shadow_providers():
     audit = audit_source_adapters(environ={})
     production = [
         row
@@ -655,7 +655,7 @@ def test_production_bindings_activate_two_read_only_shadow_providers():
         and row["capability"] in {"quote", "valuation"}
     ]
 
-    assert audit["bound_count"] == 2
+    assert audit["bound_count"] == 4
     assert audit["candidate_count"] == 0
     assert len(production) == 2
     assert all(row["legacy_implementation_present"] is True for row in production)

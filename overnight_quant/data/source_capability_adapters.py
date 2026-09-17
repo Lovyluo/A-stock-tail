@@ -19,14 +19,14 @@ PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
     "source_capability_adapter_registry_v3"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
+    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "schema_v3_activate_tencent_quote_valuation_shadow_bindings"
+    "qualify_fixed_endpoint_mootdx_minute_and_transaction_shadow_bindings"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+    "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -318,6 +318,32 @@ _TENCENT_SHADOW_PROVIDER_KEYS = {
     ),
 }
 
+_MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS = {
+    _identity(
+        "minute_bar",
+        "tongdaxin",
+        "mootdx",
+        "mootdx_0.11.7_tdx_std_bars_1m_v2026-07-31",
+    ): (
+        "mootdx_shadow_providers.MootdxQualifiedShadowProviders."
+        "collect_minute_records"
+    ),
+    _identity(
+        "transaction",
+        "tongdaxin",
+        "mootdx",
+        "mootdx_0.11.7_tdx_std_transaction_v2026-08-06",
+    ): (
+        "mootdx_shadow_providers.MootdxQualifiedShadowProviders."
+        "collect_transaction_records"
+    ),
+}
+
+_QUALIFIED_SHADOW_PROVIDER_KEYS = {
+    **_TENCENT_SHADOW_PROVIDER_KEYS,
+    **_MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS,
+}
+
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
     rows = get_source_capability_registry()
@@ -339,7 +365,7 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
             row["source_version"],
         )
         legacy_provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
-        shadow_provider_key = _TENCENT_SHADOW_PROVIDER_KEYS.get(identity, "")
+        shadow_provider_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
         if shadow_provider_key:
             implementation_status = IMPLEMENTATION_BOUND
         elif legacy_provider_key:
@@ -455,8 +481,8 @@ def _validate_binding_policy(
     identity = _binding_identity(binding)
     candidate_provider_key = binding["candidate_provider_key"]
     provider_key = binding["provider_key"]
-    expected_shadow_key = _TENCENT_SHADOW_PROVIDER_KEYS.get(identity, "")
-    for shadow_identity, reserved_key in _TENCENT_SHADOW_PROVIDER_KEYS.items():
+    expected_shadow_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
+    for shadow_identity, reserved_key in _QUALIFIED_SHADOW_PROVIDER_KEYS.items():
         if (
             reserved_key in {provider_key, candidate_provider_key}
             and identity != shadow_identity
