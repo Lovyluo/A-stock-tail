@@ -26,7 +26,8 @@ orders=[]
 automatic_configuration_change=false
 ```
 
-B2.2c 只读影子绑定完成后，当前注册表为 `bound_count=2`、`candidate_count=0`；其余安全
+B2.2c 只读影子绑定完成时注册表为 `bound_count=2`、`candidate_count=0`；v0.4.2
+固定节点 mootdx 影子接入后当前值为 `bound_count=4`、`candidate_count=0`。其余安全
 字段保持不变。`bound` 只表示精确 envelope 可以执行只读 Provider，不代表正式来源资格。
 
 ## 2. 注入合同

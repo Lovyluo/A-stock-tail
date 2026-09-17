@@ -8,8 +8,20 @@ from typing import Any, Iterable, Mapping
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
-REGISTRY_SCHEMA_VERSION = "source_capability_registry_v1"
-QUALIFICATION_PROGRESS_MOOTDX = "0/3"
+REGISTRY_SCHEMA_VERSION = "source_capability_registry_v2"
+QUALIFICATION_PROGRESS_MOOTDX = "3/3"
+QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED = "0/3"
+QUALIFIED_MOOTDX_ENDPOINT_ID = "mootdx_locked@59.36.5.11:7709"
+QUALIFIED_MOOTDX_RECORD_SHA256 = (
+    "0c772e6a900c87281a0e7c6336f5a66a49d32b7d793f1582b3caf0fd1e694f69"
+)
+QUALIFIED_MOOTDX_CODES = {
+    "000001",
+    "000333",
+    "600000",
+    "600519",
+    "601318",
+}
 
 ROLES = {
     "primary",
@@ -195,32 +207,32 @@ SOURCE_CAPABILITIES = (
         "minute_bar",
         "tongdaxin",
         "mootdx",
-        "audit_only",
+        "primary",
         True,
         False,
-        False,
+        True,
         True,
         True,
         "minute_bar",
         "mootdx_0.11.7_tdx_std_bars_1m_v2026-07-31",
         True,
-        "unqualified",
+        "qualified",
         QUALIFICATION_PROGRESS_MOOTDX,
     ),
     SourceCapability(
         "transaction",
         "tongdaxin",
         "mootdx",
-        "audit_only",
+        "primary",
         True,
         False,
-        False,
+        True,
         True,
         True,
         "transaction",
         "mootdx_0.11.7_tdx_std_transaction_v2026-08-06",
         True,
-        "unqualified",
+        "qualified",
         QUALIFICATION_PROGRESS_MOOTDX,
     ),
     SourceCapability(
@@ -237,7 +249,7 @@ SOURCE_CAPABILITIES = (
         "mootdx_0.11.7_tdx_std_quote_v2026-08-24",
         True,
         "unqualified",
-        QUALIFICATION_PROGRESS_MOOTDX,
+        QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED,
     ),
     SourceCapability(
         "announcement_summary",
@@ -981,6 +993,55 @@ def _validate_source_provenance_batch_core(
             registry,
         )
 
+    if (
+        origin_source == "tongdaxin"
+        and adapter == "mootdx"
+        and requested_capability in {"minute_bar", "transaction"}
+    ):
+        scope_errors = []
+        payloads = [row.get("payload") for row in rows]
+        if any(not isinstance(payload, Mapping) for payload in payloads):
+            scope_errors.append("qualified_mootdx_payload_missing")
+        else:
+            endpoint_ids = {
+                str(payload.get("endpoint_id") or "") for payload in payloads
+            }
+            endpoints = {
+                (
+                    str((payload.get("endpoint") or {}).get("host") or ""),
+                    (payload.get("endpoint") or {}).get("port"),
+                )
+                for payload in payloads
+                if isinstance(payload.get("endpoint"), Mapping)
+            }
+            qualification_hashes = {
+                str(payload.get("qualification_record_sha256") or "")
+                for payload in payloads
+            }
+            codes = {str(payload.get("code") or "") for payload in payloads}
+            if endpoint_ids != {QUALIFIED_MOOTDX_ENDPOINT_ID}:
+                scope_errors.append("qualified_mootdx_endpoint_mismatch")
+            if endpoints != {("59.36.5.11", 7709)}:
+                scope_errors.append("qualified_mootdx_endpoint_address_mismatch")
+            if qualification_hashes != {QUALIFIED_MOOTDX_RECORD_SHA256}:
+                scope_errors.append(
+                    "qualified_mootdx_confirmation_hash_mismatch"
+                )
+            if codes != QUALIFIED_MOOTDX_CODES:
+                scope_errors.append("qualified_mootdx_stock_scope_mismatch")
+        if scope_errors:
+            return _provenance_output(
+                {
+                    "status": "PROVENANCE_SCOPE_REJECTED",
+                    "execution_ok": True,
+                    "capability": requested_capability,
+                    "record_count": len(rows),
+                    "scope_errors": sorted(scope_errors),
+                    "provenance": None,
+                },
+                registry,
+            )
+
     required_fields = {"request_hash", "raw_hash"}
     if selected.get("point_in_time_required"):
         required_fields.update({"event_time", "observed_at", "available_at"})
@@ -1393,6 +1454,10 @@ def _routing_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
 
 __all__ = [
     "QUALIFICATION_PROGRESS_MOOTDX",
+    "QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED",
+    "QUALIFIED_MOOTDX_CODES",
+    "QUALIFIED_MOOTDX_ENDPOINT_ID",
+    "QUALIFIED_MOOTDX_RECORD_SHA256",
     "REGISTRY_SCHEMA_VERSION",
     "SOURCE_CAPABILITIES",
     "SourceCapability",

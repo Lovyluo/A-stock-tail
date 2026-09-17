@@ -14,6 +14,7 @@ import pytest
 from overnight_quant.data import source_capability_registry as registry_module
 from overnight_quant.data.source_capability_registry import (
     QUALIFICATION_PROGRESS_MOOTDX,
+    QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED,
     REGISTRY_SCHEMA_VERSION,
     SourceCapability,
     audit_source_capabilities,
@@ -77,9 +78,9 @@ def test_registry_order_does_not_change_hash():
     assert len(forward) == 64
     assert reverse == forward
     assert all(REQUIRED_FIELDS <= set(row) for row in registry)
-    assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v1"
+    assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v2"
     assert forward == (
-        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
     )
 
 
@@ -429,11 +430,8 @@ def test_akshare_preserves_origin_and_cannot_satisfy_hard_gate():
     _assert_safe(result)
 
 
-@pytest.mark.parametrize(
-    "capability",
-    ["minute_bar", "transaction", "order_book"],
-)
-def test_unqualified_mootdx_cannot_become_formal_source(capability):
+def test_unqualified_mootdx_order_book_cannot_become_formal_source():
+    capability = "order_book"
     registry = get_source_capability_registry()
     row = next(
         item
@@ -451,10 +449,36 @@ def test_unqualified_mootdx_cannot_become_formal_source(capability):
 
     assert row["role"] == "audit_only"
     assert row["qualification_status"] == "unqualified"
-    assert row["qualification_progress"] == QUALIFICATION_PROGRESS_MOOTDX
+    assert row["qualification_progress"] == (
+        QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED
+    )
     assert result["status"] == "SOURCE_UNQUALIFIED"
     assert "source_unqualified" in result["rejection_reasons"]
     assert result["selected_source"] is None
+    _assert_safe(result)
+
+
+@pytest.mark.parametrize("capability", ["minute_bar", "transaction"])
+def test_qualified_fixed_endpoint_mootdx_capabilities_enter_formal_route(
+    capability,
+):
+    row = next(
+        item
+        for item in get_source_capability_registry()
+        if item["capability"] == capability and item["adapter"] == "mootdx"
+    )
+    result = route_source_capability(
+        capability,
+        origin_source="tongdaxin",
+        adapter="mootdx",
+        require_hard_gate=True,
+    )
+
+    assert row["role"] == "primary"
+    assert row["qualification_status"] == "qualified"
+    assert row["qualification_progress"] == QUALIFICATION_PROGRESS_MOOTDX
+    assert result["status"] == "SOURCE_ROUTE_SELECTED"
+    assert result["hard_gate_authorized"] is True
     _assert_safe(result)
 
 
@@ -835,7 +859,7 @@ def _assert_safe(result):
 def _assert_provenance_registry_contract(result):
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
     )
 
 
@@ -853,7 +877,7 @@ def _assert_invalid_route_request(result):
     assert result["selected_source"] is None
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
     )
     _assert_safe(result)
 

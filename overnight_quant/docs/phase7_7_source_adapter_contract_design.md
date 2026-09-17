@@ -21,7 +21,8 @@ automatic_configuration_change=false
 
 因此 `SOURCE_ADAPTER_BOUND` 只表示“provider key、调用签名、返回结构、来源身份和 B1
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
-生产矩阵只有腾讯 quote/valuation 两项满足这一条件，`bound_count=2`。这里的 `bound`
+在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
+分钟线和逐笔也使用独立合同兼容 Provider，当前 `bound_count=4`。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -92,8 +93,8 @@ key 移入 `provider_key`，状态改为 `bound`，并保留历史实现；其�
 | global_news | 财联社 | direct_http | `fetch_cls_telegraph` | 返回普通 list，缺 B1 身份与哈希字段 |
 | stock_news | 东财 | direct_http | `collect_stock_news` | 返回 `ProviderBatch`，记录使用旧 `source` 身份 |
 | announcement | 巨潮 | direct_http | `collect_announcements` | 返回 `ProviderBatch`，记录使用旧 `source` 身份 |
-| minute_bar | 通达信 | mootdx | `collect_minute_bars` | 返回 `ProviderBatch`，audit only，资格 0/3 |
-| transaction | 通达信 | mootdx | `collect_transaction_evidence` | 返回证据 dict，不是 provenance record list |
+| minute_bar | 通达信 | mootdx | `collect_minute_bars` | 历史实现；v0.4.2 由固定节点 Provider 取代 |
+| transaction | 通达信 | mootdx | `collect_transaction_evidence` | 历史实现；v0.4.2 由固定节点 Provider 取代 |
 
 其余 15 项保持以下状态之一：
 
@@ -124,8 +125,14 @@ B2.2c 腾讯只读影子绑定后的 Schema v3 哈希为：
 61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39
 ```
 
-本次哈希变化仅来自两个候选进入显式只读 `provider_key`；B1 registry hash 保持
-`303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69`。
+v0.4.2 固定节点接入后的 Schema v3 哈希为：
+
+```text
+8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0
+```
+
+资格更新后的 B1 registry v2 hash 为
+`e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc`。
 
 ## 4. 失效关闭执行链
 

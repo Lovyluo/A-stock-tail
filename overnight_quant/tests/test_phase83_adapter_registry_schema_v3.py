@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "303db7cd50d8cc53e3729d69c7aeb3c053e203ba1885cecda1b10f0cdd321c69"
+    "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -75,11 +75,12 @@ def _quote_record() -> dict:
     }
 
 
-def _shadow_rows() -> list[dict]:
+def _tencent_shadow_rows() -> list[dict]:
     return [
         row
         for row in get_source_adapter_registry()
         if row["implementation_status"] == "bound"
+        and row["origin_source"] == "tencent"
     ]
 
 
@@ -91,18 +92,22 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
         "source_capability_adapter_registry_v3"
     )
     assert audit["adapter_entry_count"] == len(rows) == 28
-    assert audit["bound_count"] == 2
+    assert audit["bound_count"] == 4
     assert audit["candidate_count"] == 0
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 11
+    assert audit["contract_incompatible_count"] == 9
     assert audit["previous_adapter_registry_schema_version"] == (
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
     assert PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION == (
         "source_capability_adapter_registry_v3"
     )
-    assert PREVIOUS_ADAPTER_REGISTRY_HASH == EXPECTED_CANDIDATE_V3_HASH
-    assert audit["previous_adapter_registry_hash"] == EXPECTED_CANDIDATE_V3_HASH
+    assert PREVIOUS_ADAPTER_REGISTRY_HASH == (
+        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    )
+    assert audit["previous_adapter_registry_hash"] == (
+        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    )
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON
     )
@@ -110,7 +115,7 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     assert audit["selection_adapter_registry_hash"] == EXPECTED_SHADOW_V3_HASH
     assert audit["capability_registry_hash"] == EXPECTED_B1_HASH
     assert compute_source_capability_registry_hash() == EXPECTED_B1_HASH
-    assert sum(bool(row["provider_key"]) for row in rows) == 2
+    assert sum(bool(row["provider_key"]) for row in rows) == 4
     assert all(
         row["legacy_implementation_present"]
         is bool(row["legacy_provider_key"])
@@ -125,7 +130,7 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
 
 
 def test_tencent_quote_and_valuation_shadow_bindings_have_exact_slot_identity():
-    rows = _shadow_rows()
+    rows = _tencent_shadow_rows()
 
     assert [row["capability"] for row in rows] == ["quote", "valuation"]
     assert {row["provider_key"] for row in rows} == {

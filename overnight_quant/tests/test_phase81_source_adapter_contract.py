@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -245,7 +245,7 @@ def test_production_adapter_matrix_exactly_covers_b1_28_identities():
     )
 
 
-def test_production_registry_has_two_shadow_bindings_and_13_legacy_entries():
+def test_production_registry_has_four_shadow_bindings_and_13_legacy_entries():
     audit = audit_source_adapters(environ={})
     legacy = [
         row
@@ -253,15 +253,15 @@ def test_production_registry_has_two_shadow_bindings_and_13_legacy_entries():
         if row["legacy_implementation_present"]
     ]
 
-    assert audit["bound_count"] == 2
+    assert audit["bound_count"] == 4
     assert audit["candidate_count"] == 0
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 11
+    assert audit["contract_incompatible_count"] == 9
     assert len(legacy) == 13
     assert {
         row["implementation_status"] for row in legacy
     } == {"bound", "contract_incompatible"}
-    assert sum(row["status"] == SOURCE_ADAPTER_BOUND for row in legacy) == 2
+    assert sum(row["status"] == SOURCE_ADAPTER_BOUND for row in legacy) == 4
     _assert_safe(audit, audit=True)
 
 
@@ -776,7 +776,7 @@ def test_audit_is_complete_deterministic_and_safe():
     assert first == second
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
     assert first["adapter_entry_count"] == 28
-    assert first["bound_count"] == 2
+    assert first["bound_count"] == 4
     assert first["candidate_count"] == 0
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
@@ -813,7 +813,7 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     assert b"must-not-appear" not in first
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
-    assert payload["bound_count"] == 2
+    assert payload["bound_count"] == 4
     assert payload["candidate_count"] == 0
     _assert_safe(payload, audit=True)
 

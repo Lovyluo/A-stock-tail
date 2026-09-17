@@ -65,7 +65,8 @@ hard gate。
 | 能力 | 原始来源 | 适配器 | 角色 | 当前 hard gate |
 |---|---|---|---|---|
 | 报价、估值、交易日历、前复权日线 | 腾讯 | `direct_http` | `primary` | 仅注册表允许的能力可路由 |
-| 分钟线、逐笔、盘口 | 通达信 | `mootdx` | `audit_only` | 禁止，资格为 `0/3` |
+| 分钟线、逐笔 | 通达信 | `mootdx` | `primary` | 仅固定节点与五股验证范围，资格 `3/3` |
+| 盘口 | 通达信 | `mootdx` | `audit_only` | 禁止，资格为 `0/3` |
 | 研报、新闻 | 东财 | `direct_http` | `primary` | 研究展示，不单独形成交易就绪 |
 | 行业、资金流 | 东财 | `direct_http` | `secondary` | 未资格，禁止 |
 | 公告 | 巨潮 | `direct_http` | `primary` | 来源合同允许，实际数据仍需时点门禁 |
@@ -76,8 +77,9 @@ hard gate。
 | 语义研报增强 | 问财 | `iwencai_openapi` | `optional_enrichment` | 永远禁止 |
 | 旧行情能力 | Tushare、Ashare | 对应退役适配器 | `retired` | 政策禁用 |
 
-东财行业和资金流虽然是候选来源，但阶段 B1 不改变其既有资格状态。mootdx 的分钟、
-逐笔和盘口继续保持 `audit_only/unqualified`，连续资格计数仍为 `0/3`。
+东财行业和资金流虽然是候选来源，但阶段 B1 不改变其既有资格状态。后续 v0.4.2
+经 PM 审核只将固定节点 `59.36.5.11:7709` 的分钟线和逐笔更新为 `qualified 3/3`；
+盘口、F10、财务和其他节点继续保持未资格状态。
 
 ## 5. 失效关闭路由
 
@@ -153,7 +155,8 @@ Base URL 是否配置的布尔状态。输出使用稳定排序的 UTF-8 JSON，
 
 ```text
 腾讯报价：SOURCE_ROUTE_SELECTED
-mootdx 正式分钟请求：SOURCE_UNQUALIFIED
+mootdx 固定节点分钟请求：SOURCE_ROUTE_SELECTED
+mootdx 盘口请求：SOURCE_UNQUALIFIED
 AKShare hard gate：OPTIONAL_ADAPTER_UNAVAILABLE
 问财缺少 Key：OPTIONAL_UNCONFIGURED
 未知来源：UNKNOWN_SOURCE
