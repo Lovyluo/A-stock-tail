@@ -22,7 +22,8 @@ automatic_configuration_change=false
 因此 `SOURCE_ADAPTER_BOUND` 只表示“provider key、调用签名、返回结构、来源身份和 B1
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
 在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
-分钟线和逐笔也使用独立合同兼容 Provider，当前 `bound_count=4`。这里的 `bound`
+分钟线和逐笔也使用独立合同兼容 Provider。S1 部分资格批准后当前
+`bound_count=8`；巨潮是唯一未激活候选，`candidate_count=1`。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -41,7 +42,8 @@ provider_key + candidate_provider_key + legacy_provider_key
 implementation_status
 ```
 
-`provider_key` 只保存已经选择的显式只读 Provider，当前仅腾讯 quote/valuation 两项非空；
+`provider_key` 只保存已经选择的显式只读 Provider；当前包括腾讯 quote/valuation、
+资格化 mootdx 分钟线/逐笔，以及四项 PM 批准的 S1 Provider；
 `candidate_provider_key` 保存合同兼容但尚未启用的候选实现；`legacy_provider_key` 保存仅供
 审计的历史实现。`legacy_implementation_present` 如需出现在兼容审计输出中，只能由
 `legacy_provider_key` 是否非空确定性派生，不能由调用方自由声明。审计命令不会导入这些
@@ -50,7 +52,7 @@ implementation_status
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v3`；
+- `source_capability_adapter_registry_v5`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 28 项适配绑定。
@@ -76,23 +78,23 @@ scope 为 `production`。
 
 ## 3. 覆盖矩阵
 
-B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。B2.2c 只将腾讯 quote 和 valuation 的候选
-key 移入 `provider_key`，状态改为 `bound`，并保留历史实现；其余 11 项历史实现仍为
-`contract_incompatible`：
+B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。后续阶段将已批准候选移入
+`provider_key` 并保留历史实现。S1 部分批准后 13 项历史实现中有 8 项为 bound、
+巨潮公告为 candidate、4 项仍为 `contract_incompatible`：
 
 | 能力 | 原始来源 | 适配器 | candidate/legacy provider key | 状态或不兼容原因 |
 |---|---|---|---|---|
 | quote | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_quote_records` / `AStockClient._tencent_quotes` | `bound`，只接受显式 envelope |
 | valuation | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_valuation_records` / `AStockClient._tencent_quotes` | `bound`，只接受显式 envelope |
-| trading_calendar | 腾讯 | direct_http | `collect_trading_calendar` | 需要实例与 observed_at，返回 `ProviderBatch` |
-| daily_bar_qfq | 腾讯 | direct_http | `collect_qfq_daily_bars` | 需要实例与 observed_at，返回 `ProviderBatch` |
+| trading_calendar | 腾讯 | direct_http | `StaticSourceProviders.collect_trading_calendar_records` / `collect_trading_calendar` | `bound`，只接受显式 envelope |
+| daily_bar_qfq | 腾讯 | direct_http | `StaticSourceProviders.collect_qfq_daily_records` / `collect_qfq_daily_bars` | `bound`，只接受显式 envelope |
 | industry_snapshot | 东财 | direct_http | `collect_industry` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | fund_flow | 东财 | direct_http | `collect_eastmoney_fund_flow` | 需要实例与 observed_at，返回 `ProviderBatch` |
 | fund_flow | 新浪 | direct_http | `collect_sina_fund_flow` | 返回 proxy `ProviderBatch`，非 B1 batch |
-| global_news | 东财 | direct_http | `collect_global_news` | 返回 `ProviderBatch`，记录使用旧 `source` 身份 |
+| global_news | 东财 | direct_http | `StaticSourceProviders.collect_global_news_records` / `collect_global_news` | `bound`，成功零记录合法 |
 | global_news | 财联社 | direct_http | `fetch_cls_telegraph` | 返回普通 list，缺 B1 身份与哈希字段 |
-| stock_news | 东财 | direct_http | `collect_stock_news` | 返回 `ProviderBatch`，记录使用旧 `source` 身份 |
-| announcement | 巨潮 | direct_http | `collect_announcements` | 返回 `ProviderBatch`，记录使用旧 `source` 身份 |
+| stock_news | 东财 | direct_http | `StaticSourceProviders.collect_stock_news_records` / `collect_stock_news` | `bound`，只接受显式 envelope |
+| announcement | 巨潮 | direct_http | `StaticSourceProviders.collect_announcement_records` / `collect_announcements` | `candidate_not_activated`，unqualified |
 | minute_bar | 通达信 | mootdx | `collect_minute_bars` | 历史实现；v0.4.2 由固定节点 Provider 取代 |
 | transaction | 通达信 | mootdx | `collect_transaction_evidence` | 历史实现；v0.4.2 由固定节点 Provider 取代 |
 
@@ -128,11 +130,17 @@ B2.2c 腾讯只读影子绑定后的 Schema v3 哈希为：
 v0.4.2 固定节点接入后的 Schema v3 哈希为：
 
 ```text
-8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0
+5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5
 ```
 
-资格更新后的 B1 registry v2 hash 为
-`e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc`。
+S1 部分资格批准后的 Schema v5 哈希为：
+
+```text
+05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369
+```
+
+对应 B1 registry v3 hash 为
+`4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5`。
 
 ## 4. 失效关闭执行链
 

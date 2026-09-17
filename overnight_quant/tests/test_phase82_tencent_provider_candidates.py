@@ -655,8 +655,8 @@ def test_production_bindings_keep_two_tencent_read_only_shadow_providers():
         and row["capability"] in {"quote", "valuation"}
     ]
 
-    assert audit["bound_count"] == 4
-    assert audit["candidate_count"] == 0
+    assert audit["bound_count"] == 8
+    assert audit["candidate_count"] == 1
     assert len(production) == 2
     assert all(row["legacy_implementation_present"] is True for row in production)
     assert all(

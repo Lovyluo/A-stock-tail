@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
+    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -81,6 +81,7 @@ def _tencent_shadow_rows() -> list[dict]:
         for row in get_source_adapter_registry()
         if row["implementation_status"] == "bound"
         and row["origin_source"] == "tencent"
+        and row["capability"] in {"quote", "valuation"}
     ]
 
 
@@ -89,24 +90,24 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     rows = audit["adapter_matrix"]
 
     assert ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v3"
+        "source_capability_adapter_registry_v5"
     )
     assert audit["adapter_entry_count"] == len(rows) == 28
-    assert audit["bound_count"] == 4
-    assert audit["candidate_count"] == 0
+    assert audit["bound_count"] == 8
+    assert audit["candidate_count"] == 1
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 9
+    assert audit["contract_incompatible_count"] == 4
     assert audit["previous_adapter_registry_schema_version"] == (
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
     assert PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v3"
+        "source_capability_adapter_registry_v4"
     )
     assert PREVIOUS_ADAPTER_REGISTRY_HASH == (
-        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+        "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
     )
     assert audit["previous_adapter_registry_hash"] == (
-        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+        "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
     )
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON
@@ -115,7 +116,7 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     assert audit["selection_adapter_registry_hash"] == EXPECTED_SHADOW_V3_HASH
     assert audit["capability_registry_hash"] == EXPECTED_B1_HASH
     assert compute_source_capability_registry_hash() == EXPECTED_B1_HASH
-    assert sum(bool(row["provider_key"]) for row in rows) == 4
+    assert sum(bool(row["provider_key"]) for row in rows) == 8
     assert all(
         row["legacy_implementation_present"]
         is bool(row["legacy_provider_key"])
@@ -197,21 +198,16 @@ def test_shadow_binding_cannot_be_downgraded_by_private_rehash_or_patch(
     quote["candidate_provider_key"] = quote["provider_key"]
     quote["provider_key"] = ""
     quote["implementation_status"] = "candidate_not_activated"
-    downgraded_hash = adapters._compute_source_adapter_registry_hash_for_test(
-        rows
-    )
-
-    assert downgraded_hash != EXPECTED_SHADOW_V3_HASH
     with pytest.raises(
         ValueError,
-        match="production_source_adapter_binding_modified",
+        match="source_adapter_candidate_binding_mismatch",
     ):
-        adapters._validate_production_source_adapter_bindings(rows)
+        adapters._compute_source_adapter_registry_hash_for_test(rows)
 
     monkeypatch.setattr(adapters, "SOURCE_ADAPTER_BINDINGS", tuple(rows))
     with pytest.raises(
         ValueError,
-        match="production_source_adapter_binding_modified",
+        match="source_adapter_candidate_binding_mismatch",
     ):
         compute_source_adapter_registry_hash()
 
@@ -288,6 +284,7 @@ def test_non_tencent_identity_cannot_inject_tencent_shadow_provider():
         if item["capability"] == "daily_bar_qfq"
     )
     row["provider_key"] = QUOTE_CANDIDATE_KEY
+    row["candidate_provider_key"] = ""
     row["implementation_status"] = "bound"
 
     with pytest.raises(

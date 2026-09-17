@@ -12,21 +12,26 @@ from overnight_quant.data.source_capability_registry import (
     route_source_capability,
     validate_source_provenance_batch,
 )
+from overnight_quant.data.static_source_qualification import (
+    S1_APPROVED_PROVIDER_KEYS,
+    S1_PARTIAL_QUALIFICATION_RECORD_HASH,
+    S1_UNQUALIFIED_PROVIDER_KEYS,
+)
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v3"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v5"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v3"
+    "source_capability_adapter_registry_v4"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "qualify_fixed_endpoint_mootdx_minute_and_transaction_shadow_bindings"
+    "activate_pm_approved_s1_sources_and_retain_cninfo_unqualified_candidate"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -342,7 +347,12 @@ _MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS = {
 _QUALIFIED_SHADOW_PROVIDER_KEYS = {
     **_TENCENT_SHADOW_PROVIDER_KEYS,
     **_MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS,
+    **S1_APPROVED_PROVIDER_KEYS,
 }
+
+_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = dict(
+    S1_UNQUALIFIED_PROVIDER_KEYS
+)
 
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
@@ -366,8 +376,13 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
         )
         legacy_provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
         shadow_provider_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
+        candidate_provider_key = _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.get(
+            identity, ""
+        )
         if shadow_provider_key:
             implementation_status = IMPLEMENTATION_BOUND
+        elif candidate_provider_key:
+            implementation_status = IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
         elif legacy_provider_key:
             implementation_status = IMPLEMENTATION_CONTRACT_INCOMPATIBLE
         elif row["role"] == "retired":
@@ -383,7 +398,7 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
                 adapter=row["adapter"],
                 source_version=row["source_version"],
                 provider_key=shadow_provider_key,
-                candidate_provider_key="",
+                candidate_provider_key=candidate_provider_key,
                 legacy_provider_key=legacy_provider_key,
                 implementation_status=implementation_status,
             )
@@ -482,7 +497,14 @@ def _validate_binding_policy(
     candidate_provider_key = binding["candidate_provider_key"]
     provider_key = binding["provider_key"]
     expected_shadow_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
-    for shadow_identity, reserved_key in _QUALIFIED_SHADOW_PROVIDER_KEYS.items():
+    expected_candidate_key = _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.get(
+        identity, ""
+    )
+    reserved_provider_keys = {
+        **_QUALIFIED_SHADOW_PROVIDER_KEYS,
+        **_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS,
+    }
+    for shadow_identity, reserved_key in reserved_provider_keys.items():
         if (
             reserved_key in {provider_key, candidate_provider_key}
             and identity != shadow_identity
@@ -502,8 +524,8 @@ def _validate_binding_policy(
         raise ValueError("optional_unconfigured_adapter_identity_invalid")
     if status == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED:
         if (
-            not expected_shadow_key
-            or candidate_provider_key != expected_shadow_key
+            not expected_candidate_key
+            or candidate_provider_key != expected_candidate_key
             or binding["legacy_provider_key"]
             != _LEGACY_PROVIDER_KEYS.get(identity, "")
         ):
@@ -541,6 +563,9 @@ def _hash_adapter_bindings(entries: Iterable[Mapping[str, Any]]) -> str:
             "adapter_registry_schema_version": ADAPTER_REGISTRY_SCHEMA_VERSION,
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
+            "s1_partial_qualification_record_hash": (
+                S1_PARTIAL_QUALIFICATION_RECORD_HASH
+            ),
             "bindings": list(entries),
         }
     )
@@ -605,6 +630,9 @@ def audit_source_adapters(
             ),
             "capability_registry_schema_version": REGISTRY_SCHEMA_VERSION,
             "capability_registry_hash": compute_source_capability_registry_hash(),
+            "s1_partial_qualification_record_hash": (
+                S1_PARTIAL_QUALIFICATION_RECORD_HASH
+            ),
             "adapter_entry_count": len(matrix),
             "bound_count": sum(
                 row["implementation_status"] == IMPLEMENTATION_BOUND
@@ -777,6 +805,7 @@ def _execute_source_adapter_core(
             capability=capability,
             requested_identity=list(requested),
             binding=binding,
+            selected_source=None,
             rejection_reasons=["source_adapter_candidate_not_activated"],
             route_status=route["status"],
             test_only=test_only,

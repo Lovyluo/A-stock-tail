@@ -78,9 +78,9 @@ def test_registry_order_does_not_change_hash():
     assert len(forward) == 64
     assert reverse == forward
     assert all(REQUIRED_FIELDS <= set(row) for row in registry)
-    assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v2"
+    assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v3"
     assert forward == (
-        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+        "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
     )
 
 
@@ -216,6 +216,10 @@ def test_private_custom_registry_helpers_never_authorize_hard_gate():
         {
             "origin_source": "unit_custom_source",
             "source_version": "unit_custom_source_v1",
+            "hard_gate_eligible": True,
+            "qualification_required": False,
+            "qualification_status": "not_required",
+            "qualification_progress": "",
         }
     )
     record = {
@@ -365,10 +369,16 @@ def test_valid_boolean_hard_gate_behavior_remains_unchanged(require_hard_gate):
         require_hard_gate=require_hard_gate,
     )
 
-    assert route["status"] == "SOURCE_ROUTE_SELECTED"
-    assert provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
-    assert route["hard_gate_authorized"] is require_hard_gate
-    assert provenance["hard_gate_authorized"] is require_hard_gate
+    if require_hard_gate:
+        assert route["status"] == "SOURCE_UNQUALIFIED"
+        assert provenance["status"] == "SOURCE_UNQUALIFIED"
+        assert route["selected_source"] is None
+        assert provenance["provenance"] is None
+    else:
+        assert route["status"] == "SOURCE_ROUTE_SELECTED"
+        assert provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
+    assert route["hard_gate_authorized"] is False
+    assert provenance["hard_gate_authorized"] is False
     _assert_safe(route)
     _assert_safe(provenance)
 
@@ -554,12 +564,9 @@ def test_cninfo_is_primary_announcement_source():
         require_hard_gate=True,
     )
 
-    assert result["status"] == "SOURCE_ROUTE_SELECTED"
-    assert result["source_count"] == 1
-    assert result["hard_gate_authorized"] is True
-    assert result["selected_source"]["origin_source"] == "cninfo"
-    assert result["selected_source"]["adapter"] == "direct_http"
-    assert result["selected_source"]["role"] == "primary"
+    assert result["status"] == "SOURCE_UNQUALIFIED"
+    assert result["hard_gate_authorized"] is False
+    assert result["selected_source"] is None
     _assert_safe(result)
 
 
@@ -645,11 +652,11 @@ def test_single_origin_provenance_contract_is_auditable_but_not_data_ready():
     result = validate_source_provenance_batch(
         "announcement",
         [record],
-        require_hard_gate=True,
+        require_hard_gate=False,
     )
 
     assert result["status"] == "SOURCE_PROVENANCE_ACCEPTED"
-    assert result["hard_gate_authorized"] is True
+    assert result["hard_gate_authorized"] is False
     assert result["provenance"]["origin_source"] == "cninfo"
     assert len(result["provenance"]["record_hash"]) == 64
     _assert_provenance_registry_contract(result)
@@ -688,7 +695,7 @@ def test_invalid_or_reversed_provenance_times_are_rejected(
     result = validate_source_provenance_batch(
         "announcement",
         [record],
-        require_hard_gate=True,
+        require_hard_gate=False,
     )
 
     assert result["status"] == expected_status
@@ -714,7 +721,7 @@ def test_malformed_sha256_provenance_hashes_are_rejected(field, value):
     result = validate_source_provenance_batch(
         "announcement",
         [record],
-        require_hard_gate=True,
+        require_hard_gate=False,
     )
 
     assert result["status"] == "PROVENANCE_HASH_INVALID"
@@ -859,7 +866,7 @@ def _assert_safe(result):
 def _assert_provenance_registry_contract(result):
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+        "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
     )
 
 
@@ -877,7 +884,7 @@ def _assert_invalid_route_request(result):
     assert result["selected_source"] is None
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "e4efac3a9d03dce1bb8e7edd063f82699b788c9cf404e4eba61308fb0d1457bc"
+        "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
     )
     _assert_safe(result)
 
