@@ -14,15 +14,15 @@ from overnight_quant.data.source_capability_registry import (
 )
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v3"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v4"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
     "source_capability_adapter_registry_v3"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "qualify_fixed_endpoint_mootdx_minute_and_transaction_shadow_bindings"
+    "register_v043_static_source_contract_candidates_without_activation"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
@@ -344,6 +344,54 @@ _QUALIFIED_SHADOW_PROVIDER_KEYS = {
     **_MOOTDX_QUALIFIED_SHADOW_PROVIDER_KEYS,
 }
 
+_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = {
+    _identity(
+        "trading_calendar",
+        "tencent",
+        "direct_http",
+        "ifzq_fqkline_day_v2026-07-30",
+    ): (
+        "static_source_providers.StaticSourceProviders."
+        "collect_trading_calendar_records"
+    ),
+    _identity(
+        "daily_bar_qfq",
+        "tencent",
+        "direct_http",
+        "ifzq_fqkline_qfqday_v2026-07-30",
+    ): (
+        "static_source_providers.StaticSourceProviders."
+        "collect_qfq_daily_records"
+    ),
+    _identity(
+        "stock_news",
+        "eastmoney",
+        "direct_http",
+        "search_api_cms_old_v2026-07-30",
+    ): (
+        "static_source_providers.StaticSourceProviders."
+        "collect_stock_news_records"
+    ),
+    _identity(
+        "global_news",
+        "eastmoney",
+        "direct_http",
+        "np_weblist_724_v2026-07-30",
+    ): (
+        "static_source_providers.StaticSourceProviders."
+        "collect_global_news_records"
+    ),
+    _identity(
+        "announcement",
+        "cninfo",
+        "direct_http",
+        "cninfo_query_v2026-07-30",
+    ): (
+        "static_source_providers.StaticSourceProviders."
+        "collect_announcement_records"
+    ),
+}
+
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
     rows = get_source_capability_registry()
@@ -366,8 +414,13 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
         )
         legacy_provider_key = _LEGACY_PROVIDER_KEYS.get(identity, "")
         shadow_provider_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
+        candidate_provider_key = _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.get(
+            identity, ""
+        )
         if shadow_provider_key:
             implementation_status = IMPLEMENTATION_BOUND
+        elif candidate_provider_key:
+            implementation_status = IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED
         elif legacy_provider_key:
             implementation_status = IMPLEMENTATION_CONTRACT_INCOMPATIBLE
         elif row["role"] == "retired":
@@ -383,7 +436,7 @@ def _build_expected_production_bindings() -> tuple[SourceAdapterBinding, ...]:
                 adapter=row["adapter"],
                 source_version=row["source_version"],
                 provider_key=shadow_provider_key,
-                candidate_provider_key="",
+                candidate_provider_key=candidate_provider_key,
                 legacy_provider_key=legacy_provider_key,
                 implementation_status=implementation_status,
             )
@@ -482,7 +535,14 @@ def _validate_binding_policy(
     candidate_provider_key = binding["candidate_provider_key"]
     provider_key = binding["provider_key"]
     expected_shadow_key = _QUALIFIED_SHADOW_PROVIDER_KEYS.get(identity, "")
-    for shadow_identity, reserved_key in _QUALIFIED_SHADOW_PROVIDER_KEYS.items():
+    expected_candidate_key = _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.get(
+        identity, ""
+    )
+    reserved_provider_keys = {
+        **_QUALIFIED_SHADOW_PROVIDER_KEYS,
+        **_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS,
+    }
+    for shadow_identity, reserved_key in reserved_provider_keys.items():
         if (
             reserved_key in {provider_key, candidate_provider_key}
             and identity != shadow_identity
@@ -502,8 +562,8 @@ def _validate_binding_policy(
         raise ValueError("optional_unconfigured_adapter_identity_invalid")
     if status == IMPLEMENTATION_CANDIDATE_NOT_ACTIVATED:
         if (
-            not expected_shadow_key
-            or candidate_provider_key != expected_shadow_key
+            not expected_candidate_key
+            or candidate_provider_key != expected_candidate_key
             or binding["legacy_provider_key"]
             != _LEGACY_PROVIDER_KEYS.get(identity, "")
         ):

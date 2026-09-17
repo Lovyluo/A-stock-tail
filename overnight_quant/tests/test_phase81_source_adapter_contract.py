@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
+    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -239,7 +239,7 @@ def test_production_adapter_matrix_exactly_covers_b1_28_identities():
             row["provider_key"],
         ),
     )
-    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v3"
+    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v4"
     assert compute_source_capability_registry_hash() == (
         adapters.EXPECTED_CAPABILITY_REGISTRY_HASH
     )
@@ -254,13 +254,13 @@ def test_production_registry_has_four_shadow_bindings_and_13_legacy_entries():
     ]
 
     assert audit["bound_count"] == 4
-    assert audit["candidate_count"] == 0
+    assert audit["candidate_count"] == 5
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 9
+    assert audit["contract_incompatible_count"] == 4
     assert len(legacy) == 13
     assert {
         row["implementation_status"] for row in legacy
-    } == {"bound", "contract_incompatible"}
+    } == {"bound", "candidate_not_activated", "contract_incompatible"}
     assert sum(row["status"] == SOURCE_ADAPTER_BOUND for row in legacy) == 4
     _assert_safe(audit, audit=True)
 
@@ -777,7 +777,7 @@ def test_audit_is_complete_deterministic_and_safe():
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
     assert first["adapter_entry_count"] == 28
     assert first["bound_count"] == 4
-    assert first["candidate_count"] == 0
+    assert first["candidate_count"] == 5
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
@@ -814,7 +814,7 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
     assert payload["bound_count"] == 4
-    assert payload["candidate_count"] == 0
+    assert payload["candidate_count"] == 5
     _assert_safe(payload, audit=True)
 
 

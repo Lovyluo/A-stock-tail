@@ -22,7 +22,8 @@ automatic_configuration_change=false
 因此 `SOURCE_ADAPTER_BOUND` 只表示“provider key、调用签名、返回结构、来源身份和 B1
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
 在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
-分钟线和逐笔也使用独立合同兼容 Provider，当前 `bound_count=4`。这里的 `bound`
+分钟线和逐笔也使用独立合同兼容 Provider，当前 `bound_count=4`。S1 另外登记
+5 个静态来源候选，`candidate_count=5`；候选仍不可执行。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -50,7 +51,7 @@ implementation_status
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v3`；
+- `source_capability_adapter_registry_v4`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 28 项适配绑定。
@@ -128,7 +129,7 @@ B2.2c 腾讯只读影子绑定后的 Schema v3 哈希为：
 v0.4.2 固定节点接入后的 Schema v3 哈希为：
 
 ```text
-8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0
+5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5
 ```
 
 资格更新后的 B1 registry v2 hash 为

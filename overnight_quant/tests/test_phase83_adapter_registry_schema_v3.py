@@ -31,7 +31,7 @@ EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
+    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -89,13 +89,13 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     rows = audit["adapter_matrix"]
 
     assert ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v3"
+        "source_capability_adapter_registry_v4"
     )
     assert audit["adapter_entry_count"] == len(rows) == 28
     assert audit["bound_count"] == 4
-    assert audit["candidate_count"] == 0
+    assert audit["candidate_count"] == 5
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 9
+    assert audit["contract_incompatible_count"] == 4
     assert audit["previous_adapter_registry_schema_version"] == (
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
@@ -103,10 +103,10 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
         "source_capability_adapter_registry_v3"
     )
     assert PREVIOUS_ADAPTER_REGISTRY_HASH == (
-        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+        "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
     )
     assert audit["previous_adapter_registry_hash"] == (
-        "61758c08282a12b0c68d07bc46155dfe5848d1e44bf9a42ac96276e51642bd39"
+        "8e4cf5db543654e3888dd491f35ee49d34a2363355bfd43c292bb3b32edcb2d0"
     )
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON
@@ -197,21 +197,16 @@ def test_shadow_binding_cannot_be_downgraded_by_private_rehash_or_patch(
     quote["candidate_provider_key"] = quote["provider_key"]
     quote["provider_key"] = ""
     quote["implementation_status"] = "candidate_not_activated"
-    downgraded_hash = adapters._compute_source_adapter_registry_hash_for_test(
-        rows
-    )
-
-    assert downgraded_hash != EXPECTED_SHADOW_V3_HASH
     with pytest.raises(
         ValueError,
-        match="production_source_adapter_binding_modified",
+        match="source_adapter_candidate_binding_mismatch",
     ):
-        adapters._validate_production_source_adapter_bindings(rows)
+        adapters._compute_source_adapter_registry_hash_for_test(rows)
 
     monkeypatch.setattr(adapters, "SOURCE_ADAPTER_BINDINGS", tuple(rows))
     with pytest.raises(
         ValueError,
-        match="production_source_adapter_binding_modified",
+        match="source_adapter_candidate_binding_mismatch",
     ):
         compute_source_adapter_registry_hash()
 
@@ -288,6 +283,7 @@ def test_non_tencent_identity_cannot_inject_tencent_shadow_provider():
         if item["capability"] == "daily_bar_qfq"
     )
     row["provider_key"] = QUOTE_CANDIDATE_KEY
+    row["candidate_provider_key"] = ""
     row["implementation_status"] = "bound"
 
     with pytest.raises(
