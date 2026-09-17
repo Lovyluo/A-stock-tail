@@ -136,15 +136,19 @@ def run_static_source_validation(
                 _serialize_response(item) for item in batch.responses
             ]
         except (StaticSourceContractError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            captured = getattr(exc, "response_evidence", None)
             results[capability] = {
                 "status": "STATIC_SOURCE_CAPABILITY_FAILED",
                 "error_code": getattr(exc, "code", type(exc).__name__),
                 "record_count": 0,
+                "response_captured": captured is not None,
                 "started_at": started.isoformat(timespec="microseconds"),
                 "completed_at": datetime.now(CN_TZ).isoformat(timespec="microseconds"),
             }
             records_by_capability[capability] = []
-            raw_responses[capability] = []
+            raw_responses[capability] = (
+                [_serialize_response(captured)] if captured is not None else []
+            )
 
     passed = all(
         item["status"] == "STATIC_SOURCE_CAPABILITY_VALIDATED"

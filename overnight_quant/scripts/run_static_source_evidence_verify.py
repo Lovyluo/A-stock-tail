@@ -113,8 +113,54 @@ def verify_static_source_evidence(
         original_records = list((payload.get("records_by_capability") or {}).get(capability) or [])
         result = (payload.get("capability_results") or {}).get(capability) or {}
         if result.get("status") == "STATIC_SOURCE_CAPABILITY_FAILED":
-            if responses or original_records:
-                errors.append(f"{capability}:failed_payload_not_empty")
+            if original_records:
+                errors.append(f"{capability}:failed_records_not_empty")
+            error_code = result.get("error_code")
+            if error_code == "CNINFO_DIRECT_ACCESS_UNAVAILABLE":
+                if capability != "announcement":
+                    errors.append(f"{capability}:cninfo_error_on_wrong_capability")
+                if result.get("response_captured") is not True:
+                    errors.append("announcement:failure_capture_flag_invalid")
+                if len(responses) != 1:
+                    errors.append("announcement:failure_response_missing")
+                else:
+                    try:
+                        item = responses[0]
+                        raw = base64.b64decode(
+                            item.get("content_base64") or "", validate=True
+                        )
+                        if hashlib.sha256(raw).hexdigest() != item.get("raw_hash"):
+                            errors.append("announcement:failure_raw_hash_mismatch")
+                        if item.get("http_status_code") != 403:
+                            errors.append("announcement:failure_status_mismatch")
+                        content_type = str(
+                            item.get("response_content_type") or ""
+                        ).split(";", 1)[0].strip().lower()
+                        if content_type != "text/html":
+                            errors.append("announcement:failure_content_type_mismatch")
+                        body_prefix = raw[:500].decode(
+                            "utf-8", "replace"
+                        ).lower()
+                        if "<html" not in body_prefix and "<!doctype" not in body_prefix:
+                            errors.append("announcement:failure_body_not_html")
+                        expected_url = (
+                            "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+                        )
+                        if item.get("method") != "POST":
+                            errors.append("announcement:failure_method_mismatch")
+                        if item.get("url") != expected_url:
+                            errors.append("announcement:failure_request_url_mismatch")
+                        if item.get("response_url") != expected_url:
+                            errors.append("announcement:failure_url_mismatch")
+                        if item.get("response_via"):
+                            errors.append("announcement:unexpected_proxy_via")
+                    except Exception as exc:
+                        errors.append(
+                            "announcement:failure_replay_invalid:"
+                            f"{type(exc).__name__}:{exc}"
+                        )
+            elif responses:
+                errors.append(f"{capability}:unexpected_failure_response")
             replay_records[capability] = []
             continue
         try:

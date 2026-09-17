@@ -9,6 +9,7 @@ import pytest
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data import static_source_providers as static_providers
 from overnight_quant.data.source_capability_adapters import (
     SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
     SourceProviderEnvelope,
@@ -21,6 +22,7 @@ from overnight_quant.data.source_capability_registry import (
     validate_source_provenance_batch,
 )
 from overnight_quant.data.static_source_providers import (
+    CNINFO_ANNOUNCEMENT_URL,
     PROVIDER_KEYS,
     StaticHttpResponse,
     StaticSourceContractError,
@@ -30,6 +32,7 @@ from overnight_quant.data.static_source_providers import (
 from overnight_quant.scripts.run_static_source_evidence_verify import (
     EVIDENCE_INVALID,
     EVIDENCE_VERIFIED,
+    verify_file,
     verify_static_source_evidence,
 )
 from overnight_quant.scripts.run_static_source_validation import (
@@ -68,9 +71,27 @@ class Clock:
         return self.values.pop(0)
 
 
-def response(payload, url="https://web.ifzq.gtimg.cn/test"):
+def response(
+    payload,
+    url="https://web.ifzq.gtimg.cn/test",
+    *,
+    status_code=200,
+    headers=None,
+):
     return StaticHttpResponse(
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"), 200, url
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        status_code,
+        url,
+        headers or {},
+    )
+
+
+def cninfo_html_403():
+    return StaticHttpResponse(
+        b"<!doctype html><html><body>Forbidden</body></html>",
+        403,
+        CNINFO_ANNOUNCEMENT_URL,
+        {"Content-Type": "text/html; charset=utf-8", "Server": "nginx"},
     )
 
 
@@ -239,6 +260,125 @@ def test_late_announcement_is_excluded_and_identity_is_cninfo():
     batch = provider(replies).collect_announcement_batch()
     assert all(row["published_at"] <= CUTOFF for row in batch.records)
     assert all(row["origin_source"] == "cninfo" for row in batch.records)
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("600000", "gssh0600000"),
+        ("000001", "gssz0000001"),
+        ("830799", "gsbj0830799"),
+    ],
+)
+def test_cninfo_org_id_uses_official_three_market_contract(code, expected):
+    assert static_providers._cninfo_org_id(code) == expected
+
+
+def test_cninfo_html_and_non_json_responses_fail_closed():
+    with pytest.raises(
+        StaticSourceContractError,
+        match="CNINFO_DIRECT_ACCESS_UNAVAILABLE",
+    ) as captured:
+        provider([cninfo_html_403()]).collect_announcement_batch()
+    assert captured.value.response_evidence["http_status_code"] == 403
+    assert captured.value.response_evidence["response_content_type"].startswith(
+        "text/html"
+    )
+
+    html_200 = StaticHttpResponse(
+        b"<html><body>risk control</body></html>",
+        200,
+        CNINFO_ANNOUNCEMENT_URL,
+        {"Content-Type": "text/html"},
+    )
+    with pytest.raises(StaticSourceContractError, match="STATIC_SOURCE_JSON_INVALID"):
+        provider([html_200]).collect_announcement_batch()
+
+
+def test_cninfo_successful_zero_announcements_is_available_empty():
+    replies = [
+        response(
+            {"announcements": []},
+            CNINFO_ANNOUNCEMENT_URL,
+            headers={"Content-Type": "application/json"},
+        )
+        for _ in CODES
+    ]
+    batch = provider(replies).collect_announcement_batch()
+    assert batch.status == "AVAILABLE_EMPTY"
+    assert batch.records == ()
+
+
+def test_cninfo_403_failure_evidence_is_replayable_but_not_validated(
+    tmp_path, monkeypatch
+):
+    days = weekdays()
+    replies = [response({"data": {"sh000001": {"day": kline_rows(days)}}})]
+    for code in CODES:
+        symbol = ("sh" if code.startswith("6") else "sz") + code
+        replies.append(
+            response({"data": {symbol: {"qfqday": kline_rows(days[-60:])}}})
+        )
+    published = "2026-09-16T10:00:00+08:00"
+    replies.extend(
+        response(
+            {"result": {"cmsArticleWebOld": {"list": [
+                {
+                    "title": f"news-{code}",
+                    "showTime": published,
+                    "url": "https://finance.eastmoney.com/a.html",
+                }
+            ]}}},
+            "https://search-api-web.eastmoney.com/test",
+        )
+        for code in CODES
+    )
+    replies.append(
+        response(
+            {"data": {"fastNewsList": []}},
+            "https://np-weblist.eastmoney.com/test",
+        )
+    )
+    replies.append(cninfo_html_403())
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    evidence = run_static_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output="cninfo_failure.json",
+        transport=FakeTransport(replies),
+        clock=Clock(count=40),
+    )
+    path = tmp_path / "cninfo_failure.json"
+    anchor = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    announcement = evidence["capability_results"]["announcement"]
+    assert announcement["error_code"] == "CNINFO_DIRECT_ACCESS_UNAVAILABLE"
+    assert announcement["response_captured"] is True
+    assert evidence["provider_validation_passed"] is False
+    assert evidence["raw_responses"]["announcement"][0]["http_status_code"] == 403
+    assert "cookie" not in json.dumps(evidence, ensure_ascii=False).lower()
+    assert evidence["data_ready"] is False
+    assert evidence["candidates"] == evidence["tickets"] == evidence["orders"] == []
+
+    verified = verify_file(path, expected_file_sha256=anchor)
+    assert verified["status"] == EVIDENCE_VERIFIED
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["provider_validation_passed"] is False
+
+    tampered = deepcopy(evidence)
+    item = tampered["raw_responses"]["announcement"][0]
+    item["response_url"] = "https://data.eastmoney.com/announcement"
+    tampered["evidence_hash"] = compute_evidence_hash(tampered)
+    rejected = verify_static_source_evidence(
+        tampered, expected_file_sha256="d" * 64
+    )
+    assert rejected["status"] == EVIDENCE_INVALID
+    assert "announcement:failure_url_mismatch" in rejected["errors"]
+
+    assert (
+        verify_file(path, expected_file_sha256="0" * 64)["status"]
+        == EVIDENCE_INVALID
+    )
 
 
 def test_provenance_rejects_source_version_and_hash_tampering():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 import hashlib
 import json
@@ -88,8 +88,16 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class StaticSourceContractError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        response_evidence: Mapping[str, Any] | None = None,
+    ) -> None:
         self.code = str(code)
+        self.response_evidence = (
+            dict(response_evidence) if response_evidence is not None else None
+        )
         super().__init__(self.code)
 
 
@@ -98,6 +106,7 @@ class StaticHttpResponse:
     content: bytes
     status_code: int
     url: str
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -155,10 +164,18 @@ class StaticUrllibTransport:
                     content=response.read(),
                     status_code=int(response.status),
                     url=str(response.geturl()),
+                    headers=dict(response.headers.items()),
                 )
         except (TimeoutError, socket.timeout) as exc:
             raise StaticSourceContractError("STATIC_SOURCE_TIMEOUT") from exc
         except HTTPError as exc:
+            if url == CNINFO_ANNOUNCEMENT_URL:
+                return StaticHttpResponse(
+                    content=exc.read(),
+                    status_code=int(exc.code),
+                    url=str(exc.geturl()),
+                    headers=dict(exc.headers.items()),
+                )
             raise StaticSourceContractError(
                 f"STATIC_SOURCE_HTTP_{int(exc.code)}"
             ) from exc
@@ -468,12 +485,10 @@ class StaticSourceProviders:
         available = _as_cn(self.clock())
         if available < observed:
             raise StaticSourceContractError("STATIC_SOURCE_TIME_ORDER_INVALID")
-        if type(response.status_code) is not int or response.status_code != 200:
-            raise StaticSourceContractError("STATIC_SOURCE_HTTP_STATUS_INVALID")
         if not response.url.startswith("https://"):
             raise StaticSourceContractError("STATIC_SOURCE_RESPONSE_URL_INVALID")
         raw_hash = hashlib.sha256(response.content).hexdigest()
-        return {
+        response_evidence = {
             "capability": capability,
             "method": method,
             "url": url,
@@ -484,9 +499,25 @@ class StaticSourceProviders:
             "raw_bytes": response.content,
             "http_status_code": response.status_code,
             "response_url": response.url,
+            "response_content_type": str(
+                response.headers.get("Content-Type") or ""
+            ),
+            "response_server": str(response.headers.get("Server") or ""),
+            "response_via": str(response.headers.get("Via") or ""),
             "observed_at": observed.isoformat(timespec="microseconds"),
             "available_at": available.isoformat(timespec="microseconds"),
         }
+        if type(response.status_code) is not int or response.status_code != 200:
+            code = (
+                "CNINFO_DIRECT_ACCESS_UNAVAILABLE"
+                if capability == "announcement" and response.status_code == 403
+                else "STATIC_SOURCE_HTTP_STATUS_INVALID"
+            )
+            raise StaticSourceContractError(
+                code,
+                response_evidence=response_evidence,
+            )
+        return response_evidence
 
     def _record(
         self,

@@ -65,6 +65,12 @@ response. CNINFO returned HTTP 403, so provider validation is false and S1 is
 not eligible for activation. The failed origin is not replaced by AKShare or
 another announcement source.
 
+A bounded direct-access investigation is documented in Phase 7.12. Direct,
+session-warmed, standard-header, and explicit-direct requests all returned an
+official-edge HTML 403. The provider now preserves this response as auditable
+failure evidence and emits `CNINFO_DIRECT_ACCESS_UNAVAILABLE`; it still cannot
+satisfy validation or any hard gate.
+
 This PR therefore remains Draft. PM review may authorize a separate CNINFO
 request-contract investigation; it must not promote any S1 candidate until all
 five capabilities have validated evidence.
