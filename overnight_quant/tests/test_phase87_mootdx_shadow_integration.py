@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
+import sys
+import time
 
 import pytest
 
 from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.data.probe_worker_process import run_probe_worker_process
+from overnight_quant.data.real_point_in_time_collectors import SourceContractError
 from overnight_quant.data.mootdx_shadow_providers import (
     MOOTDX_MINUTE_PROVIDER_KEY,
     MOOTDX_QUALIFICATION_RECORD_SHA256,
@@ -44,8 +49,20 @@ class Frame:
 
 
 class Client:
-    def __init__(self, *, fail=False):
+    def __init__(
+        self,
+        *,
+        fail=False,
+        omit_1450=False,
+        one_minute=False,
+        invalid_ohlcv=False,
+        trade_date="2026-09-17",
+    ):
         self.fail = fail
+        self.omit_1450 = omit_1450
+        self.one_minute = one_minute
+        self.invalid_ohlcv = invalid_ohlcv
+        self.trade_date = trade_date
         self.closed = False
         self.bar_calls = []
         self.transaction_calls = []
@@ -55,12 +72,17 @@ class Client:
         if self.fail:
             raise TimeoutError("fixed endpoint unavailable")
         rows = []
-        for minute in range(39, 52):
+        minutes = [50] if self.one_minute else list(range(39, 52))
+        if self.omit_1450:
+            minutes = [minute for minute in minutes if minute != 50]
+        for minute in minutes:
             rows.append(
                 {
-                    "datetime": f"2026-09-17T14:{minute:02d}:00+08:00",
+                    "datetime": (
+                        f"{self.trade_date}T14:{minute:02d}:00+08:00"
+                    ),
                     "open": 10,
-                    "high": 10.2,
+                    "high": 9.8 if self.invalid_ohlcv else 10.2,
                     "low": 9.9,
                     "close": 10.1,
                     "vol": 1000,
@@ -99,12 +121,21 @@ class Client:
 
 
 class Clock:
-    def __init__(self):
-        self.value = datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ)
+    def __init__(self, *, decision_ready=False, transaction_late=False):
+        self.base = datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ)
+        self.calls = 0
+        self.decision_ready = decision_ready
+        self.transaction_late = transaction_late
 
     def __call__(self):
-        self.value += timedelta(milliseconds=100)
-        return self.value
+        self.calls += 1
+        if self.transaction_late and self.calls == 12:
+            return datetime(
+                2026, 9, 17, 14, 51, 5, 1000, tzinfo=CN_TZ
+            )
+        if self.decision_ready and self.calls >= 13:
+            return datetime(2026, 9, 17, 14, 51, 10, tzinfo=CN_TZ)
+        return self.base + timedelta(milliseconds=100 * self.calls)
 
 
 def _assert_safe(result):
@@ -282,7 +313,7 @@ def test_complete_fixed_endpoint_batch_is_shadow_ready_but_not_data_ready():
         MOOTDX_QUALIFIED_CODES,
         network=True,
         observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
-        clock=Clock(),
+        clock=Clock(decision_ready=True),
         client_factory=lambda: client,
     )
 
@@ -294,7 +325,239 @@ def test_complete_fixed_endpoint_batch_is_shadow_ready_but_not_data_ready():
     assert result["covered_codes"] == sorted(MOOTDX_QUALIFIED_CODES)
     assert result["source"]["endpoint"] == MOOTDX_QUALIFIED_ENDPOINT
     assert result["records_hash"]
+    assert {row["capability"] for row in result["records"]} == {
+        "minute_bar"
+    }
+    assert {row["capability"] for row in result["audit_records"]} == {
+        "transaction"
+    }
+    assert all(
+        row["feature_scoring_eligible"] is False
+        for row in result["audit_records"]
+    )
+    assert client.bar_calls == [
+        (code, "1m", 0, 800) for code in sorted(MOOTDX_QUALIFIED_CODES)
+    ]
+    assert len(client.transaction_calls) == len(MOOTDX_QUALIFIED_CODES)
     _assert_safe(result)
+
+
+@pytest.mark.parametrize(
+    ("client", "expected_error"),
+    [
+        (Client(omit_1450=True), "mootdx_minute_1450_missing:000001"),
+        (
+            Client(one_minute=True),
+            "mootdx_minute_unique_minutes_insufficient:000001",
+        ),
+        (
+            Client(invalid_ohlcv=True),
+            "mootdx_minute_ohlcv_invalid:000001:range",
+        ),
+    ],
+)
+def test_minute_batch_rejects_incomplete_or_invalid_stock_data(
+    client,
+    expected_error,
+):
+    provider = MootdxQualifiedShadowProviders(
+        MOOTDX_QUALIFIED_CODES,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(),
+        client_factory=lambda: client,
+    )
+    try:
+        with pytest.raises(SourceContractError, match=expected_error):
+            provider.collect_minute_records()
+    finally:
+        provider.close()
+
+
+def test_minute_batch_rejects_mixed_trade_dates():
+    provider = MootdxQualifiedShadowProviders(
+        MOOTDX_QUALIFIED_CODES,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(),
+        client_factory=Client,
+    )
+    try:
+        batch = provider.collector.collect_minute_bars(provider.observed_at)
+        records = [dict(row) for row in batch.records]
+        records[0]["event_time"] = "2026-09-16T14:39:00+08:00"
+        with pytest.raises(
+            SourceContractError,
+            match="mootdx_minute_trade_date_mismatch:000001",
+        ):
+            provider._validate_and_finalize_minute_records(records)
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        Client(omit_1450=True),
+        Client(one_minute=True),
+        Client(invalid_ohlcv=True),
+    ],
+)
+def test_invalid_minute_batch_never_returns_partial_shadow_records(client):
+    result = build_mootdx_shadow_records(
+        MOOTDX_QUALIFIED_CODES,
+        network=True,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(decision_ready=True),
+        client_factory=lambda: client,
+    )
+
+    assert result["status"] == MOOTDX_SHADOW_DATA_UNAVAILABLE
+    assert result["records"] == []
+    assert result["audit_records"] == []
+    _assert_safe(result)
+
+
+def test_transaction_batch_completed_after_collection_deadline_is_rejected():
+    provider = MootdxQualifiedShadowProviders(
+        MOOTDX_QUALIFIED_CODES,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(transaction_late=True),
+        client_factory=Client,
+    )
+    try:
+        provider.collect_minute_records()
+        with pytest.raises(
+            SourceContractError,
+            match="mootdx_transaction_collection_deadline_exceeded",
+        ):
+            provider.collect_transaction_records()
+    finally:
+        provider.close()
+
+    result = build_mootdx_shadow_records(
+        MOOTDX_QUALIFIED_CODES,
+        network=True,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(transaction_late=True, decision_ready=True),
+        client_factory=Client,
+    )
+    assert result["status"] == MOOTDX_SHADOW_DATA_UNAVAILABLE
+    assert result["reason"] == "transaction_provider_not_ready"
+    assert result["records"] == []
+    assert result["audit_records"] == []
+    _assert_safe(result)
+
+
+def test_shadow_batch_cannot_return_before_decision_time():
+    result = build_mootdx_shadow_records(
+        MOOTDX_QUALIFIED_CODES,
+        network=True,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(decision_ready=False),
+        client_factory=Client,
+    )
+
+    assert result["status"] == MOOTDX_SHADOW_DATA_UNAVAILABLE
+    assert result["reason"] == "decision_time_not_reached"
+    assert result["records"] == []
+    assert result["audit_records"] == []
+    _assert_safe(result)
+
+
+def test_blocked_batch_is_terminated_without_late_write(tmp_path):
+    worker = tmp_path / "blocking_shadow_worker.py"
+    started = tmp_path / "started.txt"
+    completed = tmp_path / "completed.txt"
+    worker.write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys, time",
+                "task = json.loads(sys.stdin.read())",
+                "pathlib.Path(task['started']).write_text('started')",
+                "time.sleep(40)",
+                "pathlib.Path(task['completed']).write_text('completed')",
+                "print(json.dumps({'ok': True, 'payload': {}}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def blocked_runner(task, deadline_ms):
+        return run_probe_worker_process(
+            {"started": str(started), "completed": str(completed)},
+            deadline_ms,
+            worker_command=[sys.executable, str(worker)],
+        )
+
+    result = build_mootdx_shadow_records(
+        MOOTDX_QUALIFIED_CODES,
+        network=True,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(decision_ready=True),
+        worker_runner=blocked_runner,
+    )
+
+    assert result["status"] == MOOTDX_SHADOW_DATA_UNAVAILABLE
+    assert result["reason"] == "minute_provider_not_ready"
+    assert result["batch_audit"]["shadow_minute_batch"] == {
+        "request_deadline_ms": 2000,
+        "request_timed_out": True,
+        "worker_terminated": True,
+        "elapsed_ms": result["batch_audit"]["shadow_minute_batch"][
+            "elapsed_ms"
+        ],
+        "error_code": "REQUEST_DEADLINE_EXCEEDED",
+    }
+    assert started.exists()
+    time.sleep(0.25)
+    assert not completed.exists()
+    assert not list(Path(tmp_path).glob("*.tmp"))
+    _assert_safe(result)
+
+
+def test_blocked_transaction_batch_is_terminated_without_residual_worker(
+    tmp_path,
+):
+    worker = tmp_path / "blocking_transaction_worker.py"
+    completed = tmp_path / "completed.txt"
+    worker.write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys, time",
+                "task = json.loads(sys.stdin.read())",
+                "time.sleep(40)",
+                "pathlib.Path(task['completed']).write_text('completed')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def blocked_runner(task, deadline_ms):
+        return run_probe_worker_process(
+            {"completed": str(completed)},
+            deadline_ms,
+            worker_command=[sys.executable, str(worker)],
+        )
+
+    provider = MootdxQualifiedShadowProviders(
+        MOOTDX_QUALIFIED_CODES,
+        observed_at=datetime(2026, 9, 17, 14, 51, 0, tzinfo=CN_TZ),
+        clock=Clock(decision_ready=True),
+        worker_runner=blocked_runner,
+    )
+    try:
+        with pytest.raises(
+            SourceContractError,
+            match="mootdx_shadow_transaction_batch_deadline_exceeded",
+        ):
+            provider._run_worker_batch("shadow_transaction_batch")
+    finally:
+        provider.close()
+
+    time.sleep(0.25)
+    assert not completed.exists()
+    assert provider.batch_audit["shadow_transaction_batch"][
+        "worker_terminated"
+    ] is True
 
 
 def test_fixed_endpoint_failure_closes_without_fallback_or_outputs():

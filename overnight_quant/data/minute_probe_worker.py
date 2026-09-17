@@ -25,6 +25,8 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
         "minute",
         "transaction",
         "benchmark_minute",
+        "shadow_minute_batch",
+        "shadow_transaction_batch",
     }:
         raise ValueError(f"worker_operation_invalid:{operation}")
     observed_at = parse_cn_datetime(task.get("observed_at"))
@@ -69,7 +71,17 @@ def execute_probe_worker_task(task: dict[str, Any]) -> dict[str, Any]:
                 ),
                 include_signature_event_time=benchmark_operation,
             )
-        elif operation == "transaction":
+        elif operation == "shadow_minute_batch":
+            batch = collector.collect_minute_bars(observed_at)
+            payload = {
+                "records": list(batch.records or []),
+                "source_version": str(batch.source_version or ""),
+                "raw_hash": str(batch.raw_hash or ""),
+                "endpoint_id": str(
+                    getattr(collector, "endpoint_id", "") or ""
+                ),
+            }
+        elif operation in {"transaction", "shadow_transaction_batch"}:
             collect = getattr(
                 collector,
                 "collect_transaction_evidence",

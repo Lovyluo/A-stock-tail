@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time
+import math
 from typing import Any, Callable, Iterable, Mapping
 
 from overnight_quant.data.close_time_contract import CloseTimeContract
@@ -14,6 +15,10 @@ from overnight_quant.data.point_in_time import (
     parse_cn_datetime,
     records_available_at,
     stable_hash,
+)
+from overnight_quant.data.probe_worker_process import (
+    WORKER_TIMEOUT_ERROR,
+    run_probe_worker_process,
 )
 from overnight_quant.data.real_point_in_time_collectors import SourceContractError
 from overnight_quant.data.source_capability_adapters import (
@@ -49,11 +54,12 @@ MOOTDX_TRANSACTION_PROVIDER_KEY = (
 MOOTDX_QUALIFICATION_RECORD_SHA256 = (
     "0c772e6a900c87281a0e7c6336f5a66a49d32b7d793f1582b3caf0fd1e694f69"
 )
-MOOTDX_SHADOW_CONTRACT_VERSION = "mootdx_qualified_shadow_records_v1"
+MOOTDX_SHADOW_CONTRACT_VERSION = "mootdx_qualified_shadow_records_v2"
 MOOTDX_SHADOW_RECORDS_READY = "MOOTDX_SHADOW_RECORDS_READY"
 MOOTDX_SHADOW_DATA_UNAVAILABLE = "MOOTDX_SHADOW_DATA_UNAVAILABLE"
 MOOTDX_SHADOW_NETWORK_NOT_REQUESTED = "MOOTDX_SHADOW_NETWORK_NOT_REQUESTED"
 MOOTDX_SHADOW_REQUEST_INVALID = "MOOTDX_SHADOW_REQUEST_INVALID"
+MOOTDX_SHADOW_BATCH_DEADLINE_MS = 2000
 
 
 class MootdxQualifiedShadowProviders:
@@ -66,6 +72,9 @@ class MootdxQualifiedShadowProviders:
         observed_at: datetime,
         clock: Callable[[], datetime] | None = None,
         client_factory: Callable[[], Any] | None = None,
+        worker_runner: (
+            Callable[[dict[str, Any], int], dict[str, Any]] | None
+        ) = None,
         request_timeout_seconds: float = 2.0,
     ) -> None:
         normalized_codes = tuple(sorted(str(code).strip() for code in codes))
@@ -89,6 +98,11 @@ class MootdxQualifiedShadowProviders:
         self.observed_at = observed.astimezone(CN_TZ)
         self.clock = clock or (lambda: datetime.now(CN_TZ))
         self.time_contract = _qualified_time_contract(self.observed_at)
+        self.worker_runner = worker_runner or run_probe_worker_process
+        self.process_isolated = (
+            client_factory is None or worker_runner is not None
+        )
+        self.batch_audit: dict[str, Any] = {}
         self.collector = MootdxMinuteProbeCollectors(
             self.codes,
             clock=self.clock,
@@ -102,25 +116,19 @@ class MootdxQualifiedShadowProviders:
             raise SourceContractError("mootdx_qualified_endpoint_mismatch")
 
     def collect_minute_records(self) -> list[dict[str, Any]]:
-        batch = self.collector.collect_minute_bars(self.observed_at)
-        if batch.source_version != MOOTDX_MINUTE_SOURCE_VERSION:
+        if self.process_isolated:
+            payload = self._run_worker_batch("shadow_minute_batch")
+            source_version = str(payload.get("source_version") or "")
+            source_records = list(payload.get("records") or [])
+            if payload.get("endpoint_id") != MOOTDX_QUALIFIED_ENDPOINT["id"]:
+                raise SourceContractError("mootdx_minute_endpoint_mismatch")
+        else:
+            batch = self.collector.collect_minute_bars(self.observed_at)
+            source_version = batch.source_version
+            source_records = list(batch.records or [])
+        if source_version != MOOTDX_MINUTE_SOURCE_VERSION:
             raise SourceContractError("mootdx_minute_source_version_mismatch")
-        feature_cutoff = parse_cn_datetime(
-            self.time_contract.feature_event_cutoff
-        )
-        records = [
-            self._minute_record(row)
-            for row in batch.records
-            if (
-                parse_cn_datetime(row.get("event_time")) is not None
-                and parse_cn_datetime(row.get("event_time")) <= feature_cutoff
-            )
-        ]
-        covered_codes = sorted(
-            {str((row.get("payload") or {}).get("code") or "") for row in records}
-        )
-        if covered_codes != list(self.codes):
-            raise SourceContractError("mootdx_minute_coverage_incomplete")
+        records = self._validate_and_finalize_minute_records(source_records)
         return sorted(
             records,
             key=lambda row: (
@@ -131,7 +139,14 @@ class MootdxQualifiedShadowProviders:
         )
 
     def collect_transaction_records(self) -> list[dict[str, Any]]:
-        evidence = self.collector.collect_transaction_evidence(self.observed_at)
+        if self.process_isolated:
+            payload = self._run_worker_batch("shadow_transaction_batch")
+            evidence = dict(payload.get("transaction_evidence") or {})
+        else:
+            evidence = self.collector.collect_transaction_evidence(
+                self.observed_at
+            )
+        self._validate_transaction_time_contract(evidence)
         if evidence.get("endpoint_id") != MOOTDX_QUALIFIED_ENDPOINT["id"]:
             raise SourceContractError("mootdx_transaction_endpoint_mismatch")
         if evidence.get("source_version") != MOOTDX_TRANSACTION_SOURCE_VERSION:
@@ -174,6 +189,184 @@ class MootdxQualifiedShadowProviders:
 
     def close(self) -> None:
         self.collector.close()
+
+    def _run_worker_batch(self, operation: str) -> dict[str, Any]:
+        result = self.worker_runner(
+            {
+                "operation": operation,
+                "source": "mootdx",
+                "codes": list(self.codes),
+                "observed_at": self.observed_at.isoformat(),
+                "endpoint": dict(MOOTDX_QUALIFIED_ENDPOINT),
+                "provider_timeout_seconds": 2.0,
+            },
+            MOOTDX_SHADOW_BATCH_DEADLINE_MS,
+        )
+        self.batch_audit[operation] = {
+            "request_deadline_ms": MOOTDX_SHADOW_BATCH_DEADLINE_MS,
+            "request_timed_out": bool(result.get("request_timed_out")),
+            "worker_terminated": bool(result.get("worker_terminated")),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "error_code": str(result.get("error_code") or ""),
+        }
+        if result.get("ok") is not True:
+            error_code = str(result.get("error_code") or "WORKER_PROCESS_FAILED")
+            if error_code == WORKER_TIMEOUT_ERROR:
+                raise SourceContractError(
+                    f"mootdx_{operation}_deadline_exceeded"
+                )
+            raise SourceContractError(
+                f"mootdx_{operation}_failed:{error_code}"
+            )
+        payload = dict(result.get("payload") or {})
+        worker_started = parse_cn_datetime(
+            payload.get("worker_request_started_at")
+        )
+        worker_completed = parse_cn_datetime(
+            payload.get("worker_request_completed_at")
+        )
+        collection_deadline = parse_cn_datetime(
+            self.time_contract.collection_deadline
+        )
+        if (
+            worker_started is None
+            or worker_completed is None
+            or worker_started > worker_completed
+            or worker_completed > collection_deadline
+        ):
+            raise SourceContractError(
+                f"mootdx_{operation}_collection_time_invalid"
+            )
+        return payload
+
+    def _validate_and_finalize_minute_records(
+        self,
+        source_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        cutoff = parse_cn_datetime(self.time_contract.feature_event_cutoff)
+        deadline = parse_cn_datetime(self.time_contract.collection_deadline)
+        trade_date = self.observed_at.date()
+        by_code: dict[str, list[dict[str, Any]]] = {
+            code: [] for code in self.codes
+        }
+        for row in source_records:
+            payload = row.get("payload") or {}
+            code = str(payload.get("code") or "")
+            event = parse_cn_datetime(row.get("event_time"))
+            observed = parse_cn_datetime(row.get("observed_at"))
+            available = parse_cn_datetime(row.get("available_at"))
+            if code not in by_code or event is None:
+                raise SourceContractError("mootdx_minute_identity_invalid")
+            if event.date() != trade_date:
+                raise SourceContractError(
+                    f"mootdx_minute_trade_date_mismatch:{code}"
+                )
+            if observed is None or available is None or observed > available:
+                raise SourceContractError(
+                    f"mootdx_minute_time_contract_invalid:{code}"
+                )
+            if available > deadline:
+                raise SourceContractError(
+                    f"mootdx_minute_collection_deadline_exceeded:{code}"
+                )
+            if event <= cutoff:
+                self._validate_ohlcv(code, payload)
+                by_code[code].append(dict(row))
+
+        finalized: list[dict[str, Any]] = []
+        for code in self.codes:
+            rows = by_code[code]
+            unique_minutes = {
+                parse_cn_datetime(row.get("event_time")).replace(
+                    second=0, microsecond=0
+                )
+                for row in rows
+            }
+            if len(unique_minutes) != len(rows):
+                raise SourceContractError(
+                    f"mootdx_minute_duplicate_event_minute:{code}"
+                )
+            required_minute = datetime.combine(
+                trade_date, time(14, 50), tzinfo=CN_TZ
+            )
+            if required_minute not in unique_minutes:
+                raise SourceContractError(
+                    f"mootdx_minute_1450_missing:{code}"
+                )
+            if len(unique_minutes) < 12:
+                raise SourceContractError(
+                    f"mootdx_minute_unique_minutes_insufficient:{code}"
+                )
+            finalized.extend(self._minute_record(row) for row in rows)
+        return finalized
+
+    @staticmethod
+    def _validate_ohlcv(code: str, payload: Mapping[str, Any]) -> None:
+        values: dict[str, float] = {}
+        for field in ("open", "high", "low", "close", "volume"):
+            value = payload.get(field)
+            if isinstance(value, bool):
+                raise SourceContractError(
+                    f"mootdx_minute_ohlcv_invalid:{code}:{field}"
+                )
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise SourceContractError(
+                    f"mootdx_minute_ohlcv_invalid:{code}:{field}"
+                ) from None
+            if not math.isfinite(numeric):
+                raise SourceContractError(
+                    f"mootdx_minute_ohlcv_invalid:{code}:{field}"
+                )
+            values[field] = numeric
+        if any(values[field] <= 0 for field in ("open", "high", "low", "close")):
+            raise SourceContractError(
+                f"mootdx_minute_ohlcv_invalid:{code}:price"
+            )
+        if values["volume"] < 0:
+            raise SourceContractError(
+                f"mootdx_minute_ohlcv_invalid:{code}:volume"
+            )
+        if (
+            values["high"] < max(values["open"], values["close"])
+            or values["low"] > min(values["open"], values["close"])
+            or values["high"] < values["low"]
+        ):
+            raise SourceContractError(
+                f"mootdx_minute_ohlcv_invalid:{code}:range"
+            )
+
+    def _validate_transaction_time_contract(
+        self,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        started = parse_cn_datetime(evidence.get("request_started_at"))
+        completed = parse_cn_datetime(evidence.get("request_completed_at"))
+        deadline = parse_cn_datetime(self.time_contract.collection_deadline)
+        if started is None or completed is None or started > completed:
+            raise SourceContractError(
+                "mootdx_transaction_request_time_invalid"
+            )
+        if completed > deadline:
+            raise SourceContractError(
+                "mootdx_transaction_collection_deadline_exceeded"
+            )
+        for code in self.codes:
+            item = (evidence.get("by_code") or {}).get(code)
+            if not isinstance(item, Mapping):
+                continue
+            observed = parse_cn_datetime(item.get("observed_at"))
+            available = parse_cn_datetime(item.get("available_at"))
+            if (
+                observed is None
+                or available is None
+                or observed > available
+                or available > completed
+            ):
+                raise SourceContractError(
+                    f"mootdx_transaction_time_contract_invalid:{code}"
+                )
 
     def _minute_record(self, row: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(row.get("payload") or {})
@@ -223,6 +416,8 @@ class MootdxQualifiedShadowProviders:
                     MOOTDX_QUALIFICATION_RECORD_SHA256
                 ),
                 "shadow_only": True,
+                "attribution_audit_only": True,
+                "feature_scoring_eligible": False,
             }
         )
         request = {
@@ -245,6 +440,8 @@ class MootdxQualifiedShadowProviders:
             "request_hash": stable_hash(request),
             "raw_hash": raw_hash,
             "data_type": "transaction",
+            "audit_only": True,
+            "feature_scoring_eligible": False,
             "payload": payload,
             **_time_contract_fields(self.time_contract),
         }
@@ -257,6 +454,9 @@ def build_mootdx_shadow_records(
     observed_at: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
     client_factory: Callable[[], Any] | None = None,
+    worker_runner: (
+        Callable[[dict[str, Any], int], dict[str, Any]] | None
+    ) = None,
 ) -> dict[str, Any]:
     requested_codes = sorted(str(code).strip() for code in codes)
     if type(network) is not bool:
@@ -289,6 +489,7 @@ def build_mootdx_shadow_records(
             observed_at=current,
             clock=clock,
             client_factory=client_factory,
+            worker_runner=worker_runner,
         )
         minute_records: list[dict[str, Any]] = []
         transaction_records: list[dict[str, Any]] = []
@@ -313,6 +514,7 @@ def build_mootdx_shadow_records(
                 requested_codes=requested_codes,
                 adapter_statuses={"minute_bar": minute_result.get("status")},
                 reason="minute_provider_not_ready",
+                batch_audit=dict(provider.batch_audit),
             )
         transaction_result = execute_source_adapter(
             "transaction",
@@ -338,6 +540,7 @@ def build_mootdx_shadow_records(
                     "transaction": transaction_result.get("status"),
                 },
                 reason="transaction_provider_not_ready",
+                batch_audit=dict(provider.batch_audit),
             )
         accepted, rejected = records_available_at(
             minute_records,
@@ -356,7 +559,21 @@ def build_mootdx_shadow_records(
                 reason="point_in_time_minute_records_rejected",
                 rejected_record_count=len(rejected),
             )
-        records = minute_records + transaction_records
+        decision_observed = parse_cn_datetime(provider.clock())
+        decision_time = parse_cn_datetime(provider.time_contract.decision_time)
+        if decision_observed is None or decision_observed < decision_time:
+            return _safe_result(
+                MOOTDX_SHADOW_DATA_UNAVAILABLE,
+                execution_ok=True,
+                requested_codes=requested_codes,
+                adapter_statuses={
+                    "minute_bar": minute_result.get("status"),
+                    "transaction": transaction_result.get("status"),
+                },
+                reason="decision_time_not_reached",
+                batch_audit=dict(provider.batch_audit),
+            )
+        records = minute_records
         return _safe_result(
             MOOTDX_SHADOW_RECORDS_READY,
             execution_ok=True,
@@ -383,6 +600,9 @@ def build_mootdx_shadow_records(
             transaction_record_count=len(transaction_records),
             records=records,
             records_hash=stable_hash(records),
+            audit_records=transaction_records,
+            audit_records_hash=stable_hash(transaction_records),
+            batch_audit=dict(provider.batch_audit),
         )
     except (SourceContractError, TypeError, ValueError) as exc:
         return _safe_result(
@@ -457,6 +677,7 @@ def _safe_result(
         "tickets": [],
         "orders": [],
         "records": [],
+        "audit_records": [],
         **payload,
     }
 
@@ -469,6 +690,7 @@ __all__ = [
     "MOOTDX_QUALIFIED_CODES",
     "MOOTDX_QUALIFIED_ENDPOINT",
     "MOOTDX_SHADOW_DATA_UNAVAILABLE",
+    "MOOTDX_SHADOW_BATCH_DEADLINE_MS",
     "MOOTDX_SHADOW_NETWORK_NOT_REQUESTED",
     "MOOTDX_SHADOW_RECORDS_READY",
     "MOOTDX_TRANSACTION_PROVIDER_KEY",

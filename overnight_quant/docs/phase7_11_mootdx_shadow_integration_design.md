@@ -52,6 +52,20 @@ nodes, retries, falls back to another source or stitches records. A fixed-endpoi
 error yields `MOOTDX_SHADOW_DATA_UNAVAILABLE`, no partial records and no call to
 the transaction Provider after a minute-bar failure.
 
+Both the five-stock minute batch and the transaction batch run in a killable
+child process with one global 2000ms deadline. Socket timeout alone is not the
+deadline contract. A timed-out child is terminated and joined before the caller
+returns, so it cannot continue requesting data or write a late result.
+Injected clients remain a test-only seam; the production network path always
+uses the process-isolated v2 shadow-record contract.
+
+Each stock must contain the 14:50 event minute, at least 12 unique event minutes,
+valid OHLCV values and one consistent trade date. Source rows remain non-final
+until the complete five-stock batch and every point-in-time check pass. Transaction
+collection must complete no later than the collection deadline; a late code makes
+the entire transaction batch unavailable. Transaction attribution is retained in
+`audit_records` only and is explicitly ineligible for feature scoring.
+
 All records retain origin, adapter, source version, event/observation/availability
 times, request hash, raw hash, endpoint id and qualification-record hash.
 
