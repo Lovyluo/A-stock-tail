@@ -24,6 +24,7 @@ from overnight_quant.data.exchange_announcement_providers import (
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
     compute_exchange_announcement_verifier_contract_hash,
+    validate_exchange_announcement_audit_records,
     validate_exchange_announcement_records,
 )
 from overnight_quant.data.market_calendar import CN_TZ
@@ -114,7 +115,14 @@ def run_exchange_announcement_validation(
             feature_cutoff=cutoff,
             codes=requested_codes,
         )
-        passed = bool(contract["valid"])
+        audit_records = list(batch.audit_records)
+        audit_contract = validate_exchange_announcement_audit_records(
+            source,
+            audit_records,
+            feature_cutoff=cutoff,
+            codes=requested_codes,
+        )
+        passed = bool(contract["valid"] and audit_contract["valid"])
         result = {
             "status": (
                 "EXCHANGE_ANNOUNCEMENT_SOURCE_VALIDATED"
@@ -124,13 +132,17 @@ def run_exchange_announcement_validation(
             "batch_status": batch.status,
             "record_count": len(records),
             "records_hash": contract["records_hash"],
+            "audit_record_count": len(audit_records),
+            "audit_records_hash": audit_contract["records_hash"],
             "contract_status": contract["status"],
-            "errors": contract["errors"],
+            "audit_contract_status": audit_contract["status"],
+            "errors": contract["errors"] + audit_contract["errors"],
         }
         responses = list(batch.responses)
     except (ExchangeAnnouncementContractError, ValueError, KeyError) as exc:
         passed = False
         records = []
+        audit_records = []
         error_code = getattr(exc, "code", type(exc).__name__)
         captured_response = getattr(exc, "response_evidence", None)
         responses = [captured_response] if captured_response is not None else []
@@ -167,7 +179,9 @@ def run_exchange_announcement_validation(
             "requested_codes": sorted(requested_codes),
             "producer_commit_sha": _git_head(),
             "provider_verifier_contract_hash": (
-                compute_exchange_announcement_verifier_contract_hash()
+                compute_exchange_announcement_verifier_contract_hash(
+                    EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION
+                )
             ),
             "capability_registry_hash": (
                 compute_source_capability_registry_hash()
@@ -175,6 +189,14 @@ def run_exchange_announcement_validation(
             "capability_result": result,
             "records": sorted(
                 records,
+                key=lambda row: (
+                    row["code"],
+                    row["published_at"],
+                    row["announcement_id"],
+                ),
+            ),
+            "audit_records": sorted(
+                audit_records,
                 key=lambda row: (
                     row["code"],
                     row["published_at"],
@@ -308,4 +330,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

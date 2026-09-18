@@ -12,6 +12,7 @@ from overnight_quant.data.exchange_announcement_providers import (
     BSE_ANNOUNCEMENT_URL,
     BSE_LANDING_URL,
     EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION,
+    EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
     SSE_ANNOUNCEMENT_URL,
@@ -19,6 +20,7 @@ from overnight_quant.data.exchange_announcement_providers import (
     ExchangeAnnouncementContractError,
     ExchangeAnnouncementProviders,
     ExchangeHttpResponse,
+    compute_exchange_announcement_verifier_contract_hash,
     replay_exchange_announcement_responses,
     validate_exchange_announcement_records,
 )
@@ -30,18 +32,20 @@ from overnight_quant.data.source_capability_adapters import (
     execute_source_adapter,
 )
 from overnight_quant.data.source_capability_registry import (
+    compute_source_capability_registry_hash,
     get_source_capability_registry,
 )
 from overnight_quant.scripts import run_exchange_announcement_evidence_verify as verifier
 from overnight_quant.scripts import run_exchange_announcement_validation as validation
+from overnight_quant.scripts import run_exchange_announcement_reanalysis as reanalysis
 
 
 CUTOFF = "2026-09-18T14:50:00+08:00"
 
 
 class Clock:
-    def __init__(self, count: int = 40) -> None:
-        base = datetime(2026, 9, 18, 14, 40, tzinfo=CN_TZ)
+    def __init__(self, count: int = 40, *, hour: int = 14, minute: int = 40) -> None:
+        base = datetime(2026, 9, 18, hour, minute, tzinfo=CN_TZ)
         self.values = [
             base + timedelta(milliseconds=index) for index in range(count)
         ]
@@ -139,7 +143,7 @@ def bse_payload(code="920925", *, published="2026-09-18"):
     return f"null({json.dumps(value, ensure_ascii=False)})".encode("utf-8")
 
 
-def provider(source, codes, payload):
+def provider(source, codes, payload, *, clock=None):
     responses = []
     if source == "bse":
         responses.append(
@@ -158,7 +162,7 @@ def provider(source, codes, payload):
         codes,
         feature_cutoff=CUTOFF,
         transport=transport,
-        clock=Clock(),
+        clock=clock or Clock(),
     )
     return instance, transport
 
@@ -194,6 +198,10 @@ def test_registry_keeps_three_exchange_sources_candidate_and_cninfo_unqualified(
 def test_official_sources_emit_complete_single_origin_records(
     source, codes, payload, expected_count
 ):
+    if source == "sse":
+        payload = [sse_payload(code, published="2026-09-17") for code in codes]
+    elif source == "bse":
+        payload = bse_payload(published="2026-09-17")
     instance, transport = provider(source, codes, payload)
     batch = getattr(instance, f"collect_{source}_batch")()
     assert len(batch.records) == expected_count
@@ -241,6 +249,10 @@ def test_after_cutoff_is_filtered_and_zero_result_is_legal():
     batch = instance.collect_szse_batch()
     assert batch.status == "AVAILABLE_EMPTY"
     assert batch.records == ()
+    assert len(batch.audit_records) == 1
+    assert batch.audit_records[0]["audit_reason"] == (
+        "publication_at_or_after_cutoff"
+    )
     contract = validate_exchange_announcement_records(
         "szse", [], feature_cutoff=CUTOFF, codes=("000001",)
     )
@@ -268,10 +280,16 @@ def test_nonofficial_document_url_and_html_api_fail_closed():
 
 def test_input_order_does_not_change_records_or_hashes():
     forward, _ = provider(
-        "sse", ("600000", "600519"), [sse_payload("600000"), sse_payload("600519")]
+        "sse", ("600000", "600519"), [
+            sse_payload("600000", published="2026-09-17"),
+            sse_payload("600519", published="2026-09-17"),
+        ]
     )
     reverse, _ = provider(
-        "sse", ("600519", "600000"), [sse_payload("600000"), sse_payload("600519")]
+        "sse", ("600519", "600000"), [
+            sse_payload("600000", published="2026-09-17"),
+            sse_payload("600519", published="2026-09-17"),
+        ]
     )
     assert forward.collect_sse_records() == reverse.collect_sse_records()
 
@@ -368,3 +386,180 @@ def test_replay_rejects_wrong_origin_and_preserves_safe_output():
     )
     assert records == []
     assert "0:response_contract_invalid" in errors
+
+
+def _source_payload(source, published):
+    if source == "sse":
+        return [sse_payload(published=published)]
+    if source == "szse":
+        return [szse_payload(published=published)]
+    return bse_payload(published=published)
+
+
+def _date_only_value(source, day):
+    return f"{day} 00:00:00" if source == "szse" else day
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+def test_same_day_date_only_is_audit_only_for_every_exchange(source, code):
+    instance, _ = provider(
+        source,
+        (code,),
+        _source_payload(source, _date_only_value(source, "2026-09-18")),
+    )
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert batch.records == ()
+    assert len(batch.audit_records) == 1
+    row = batch.audit_records[0]
+    assert row["published_at_precision"] == "date"
+    assert row["audit_reason"] == "publication_time_precision_insufficient"
+    assert row["formal_eligible"] is False
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+def test_previous_day_date_only_remains_formally_eligible(source, code):
+    instance, _ = provider(
+        source,
+        (code,),
+        _source_payload(source, _date_only_value(source, "2026-09-17")),
+    )
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert len(batch.records) == 1
+    assert batch.audit_records == ()
+    assert batch.records[0]["published_at_precision"] == "date"
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+def test_same_day_precise_time_before_cutoff_is_formal(source, code):
+    instance, _ = provider(
+        source,
+        (code,),
+        _source_payload(source, "2026-09-18 14:49:59"),
+        clock=Clock(hour=15, minute=0),
+    )
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert len(batch.records) == 1
+    assert batch.audit_records == ()
+    assert batch.records[0]["published_at_precision"] == "datetime"
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+@pytest.mark.parametrize("clock_text", ["14:50:00", "14:50:01"])
+def test_same_day_precise_time_at_or_after_cutoff_is_rejected(
+    source, code, clock_text
+):
+    instance, _ = provider(
+        source,
+        (code,),
+        _source_payload(source, f"2026-09-18 {clock_text}"),
+        clock=Clock(hour=15, minute=0),
+    )
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert batch.records == ()
+    assert len(batch.audit_records) == 1
+    assert batch.audit_records[0]["audit_reason"] == (
+        "publication_at_or_after_cutoff"
+    )
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+def test_date_only_value_is_never_upgraded_to_datetime(source, code):
+    instance, _ = provider(
+        source,
+        (code,),
+        _source_payload(source, _date_only_value(source, "2026-09-17")),
+    )
+    row = getattr(instance, f"collect_{source}_batch")().records[0]
+    assert row["published_at_precision"] == "date"
+    assert row["payload"]["published_at_precision"] == "date"
+
+
+@pytest.mark.parametrize("source,code", [("sse", "600000"), ("szse", "000001"), ("bse", "920925")])
+def test_zero_announcement_response_is_legal_for_every_exchange(source, code):
+    if source == "sse":
+        payload = [{"result": []}]
+    elif source == "szse":
+        payload = [{"data": []}]
+    else:
+        payload = b"null([{\"listInfo\":{\"content\":[]}}])"
+    instance, _ = provider(source, (code,), payload)
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert batch.status == "AVAILABLE_EMPTY"
+    assert batch.records == batch.audit_records == ()
+
+
+def test_v1_evidence_reanalysis_moves_same_day_date_to_audit(
+    tmp_path, monkeypatch
+):
+    instance, _ = provider("sse", ("600000",), [sse_payload()])
+    batch = instance.collect_sse_batch()
+    v1_records, replay_errors = replay_exchange_announcement_responses(
+        "sse",
+        batch.responses,
+        feature_cutoff=CUTOFF,
+        codes=("600000",),
+        contract_version="v1",
+    )
+    assert replay_errors == []
+    assert len(v1_records) == 1
+    raw_responses = [validation._serialize_response(item) for item in batch.responses]
+    v1 = validation._safe(
+        {
+            "evidence_schema_version": EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1,
+            "status": "EXCHANGE_ANNOUNCEMENT_NETWORK_VALIDATED",
+            "execution_ok": True,
+            "network_mode": True,
+            "source": "sse",
+            "origin_source": "sse",
+            "source_version": SOURCE_IDENTITIES["sse"][2],
+            "provider_key": PROVIDER_KEYS["sse"],
+            "trade_date": "2026-09-18",
+            "feature_cutoff": CUTOFF,
+            "requested_codes": ["600000"],
+            "producer_commit_sha": "0" * 40,
+            "provider_verifier_contract_hash": (
+                compute_exchange_announcement_verifier_contract_hash(
+                    EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1
+                )
+            ),
+            "capability_registry_hash": compute_source_capability_registry_hash(),
+            "capability_result": {
+                "status": "EXCHANGE_ANNOUNCEMENT_SOURCE_VALIDATED",
+                "record_count": 1,
+            },
+            "records": v1_records,
+            "raw_responses": raw_responses,
+            "network_requests_made": 1,
+            "upstream_network_activity": "measured",
+            "provider_validation_passed": True,
+            "evidence_integrity_verified": False,
+            "error_code": "",
+            "evidence_hash": "",
+        }
+    )
+    v1["evidence_hash"] = validation.compute_evidence_hash(v1)
+    monkeypatch.setattr(reanalysis, "CACHE_ROOT", tmp_path)
+    source = tmp_path / "v1.json"
+    source.write_text(
+        json.dumps(v1, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    derived = reanalysis.build_exchange_announcement_reanalysis(
+        "v1.json", expected_file_sha256=source_sha
+    )
+    assert derived["evidence_schema_version"] == (
+        EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION
+    )
+    assert derived["records"] == []
+    assert len(derived["audit_records"]) == 1
+    assert derived["audit_records"][0]["audit_reason"] == (
+        "publication_time_precision_insufficient"
+    )
+    assert derived["derived_from"]["file_sha256"] == source_sha
+    checked = verifier.verify_exchange_announcement_evidence(
+        derived, expected_file_sha256="a" * 64
+    )
+    assert checked["status"] == verifier.EVIDENCE_VERIFIED
+    assert checked["data_ready"] is False
+    assert checked["candidates"] == checked["tickets"] == checked["orders"] == []

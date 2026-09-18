@@ -14,12 +14,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from overnight_quant.data.exchange_announcement_providers import (
+    EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1,
     EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
     compute_exchange_announcement_verifier_contract_hash,
+    replay_exchange_announcement_response_sets,
     replay_exchange_announcement_responses,
+    validate_exchange_announcement_audit_records,
     validate_exchange_announcement_records,
+    validate_exchange_announcement_records_v1,
 )
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_registry import (
@@ -42,9 +46,11 @@ def verify_exchange_announcement_evidence(
 ) -> dict[str, Any]:
     errors = []
     source = str(payload.get("source") or "")
-    if payload.get("evidence_schema_version") != (
-        EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION
-    ):
+    schema_version = str(payload.get("evidence_schema_version") or "")
+    if schema_version not in {
+        EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1,
+        EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION,
+    }:
         errors.append("evidence_schema_mismatch")
     if source not in SOURCE_IDENTITIES:
         errors.append("source_unknown")
@@ -56,7 +62,7 @@ def verify_exchange_announcement_evidence(
         if payload.get("provider_key") != PROVIDER_KEYS[source]:
             errors.append("provider_key_mismatch")
     if payload.get("provider_verifier_contract_hash") != (
-        compute_exchange_announcement_verifier_contract_hash()
+        compute_exchange_announcement_verifier_contract_hash(schema_version)
     ):
         errors.append("verifier_contract_hash_mismatch")
     if payload.get("capability_registry_hash") != (
@@ -92,14 +98,32 @@ def verify_exchange_announcement_evidence(
                 "content_base64", "encoding", "byte_count"
             }} | {"raw_bytes": raw}
         )
+    capability_result = payload.get("capability_result") or {}
     replay_records = []
+    replay_audit_records = []
     if source in SOURCE_IDENTITIES and not errors:
-        replay_records, replay_errors = replay_exchange_announcement_responses(
-            source,
-            responses,
-            feature_cutoff=str(payload.get("feature_cutoff") or ""),
-            codes=payload.get("requested_codes") or [],
-        )
+        if schema_version == EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1:
+            replay_records, replay_errors = (
+                replay_exchange_announcement_responses(
+                    source,
+                    responses,
+                    feature_cutoff=str(payload.get("feature_cutoff") or ""),
+                    codes=payload.get("requested_codes") or [],
+                    contract_version="v1",
+                )
+            )
+        else:
+            (
+                replay_records,
+                replay_audit_records,
+                replay_errors,
+            ) = replay_exchange_announcement_response_sets(
+                source,
+                responses,
+                feature_cutoff=str(payload.get("feature_cutoff") or ""),
+                codes=payload.get("requested_codes") or [],
+                contract_version="v2",
+            )
         errors.extend(replay_errors)
         expected_records = sorted(
             [dict(row) for row in payload.get("records") or []],
@@ -111,17 +135,62 @@ def verify_exchange_announcement_evidence(
         )
         if stable_hash(replay_records) != stable_hash(expected_records):
             errors.append("records_replay_mismatch")
-        contract = validate_exchange_announcement_records(
-            source,
-            expected_records,
-            feature_cutoff=str(payload.get("feature_cutoff") or ""),
-            codes=payload.get("requested_codes") or [],
-        )
+        if schema_version == EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1:
+            contract = validate_exchange_announcement_records_v1(
+                source,
+                expected_records,
+                feature_cutoff=str(payload.get("feature_cutoff") or ""),
+                codes=payload.get("requested_codes") or [],
+            )
+        else:
+            contract = validate_exchange_announcement_records(
+                source,
+                expected_records,
+                feature_cutoff=str(payload.get("feature_cutoff") or ""),
+                codes=payload.get("requested_codes") or [],
+            )
         if not contract["valid"]:
             errors.extend(f"record_contract:{item}" for item in contract["errors"])
+        if schema_version == EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION:
+            expected_audit_records = sorted(
+                [dict(row) for row in payload.get("audit_records") or []],
+                key=lambda row: (
+                    str(row.get("code") or ""),
+                    str(row.get("published_at") or ""),
+                    str(row.get("announcement_id") or ""),
+                ),
+            )
+            if stable_hash(replay_audit_records) != stable_hash(
+                expected_audit_records
+            ):
+                errors.append("audit_records_replay_mismatch")
+            audit_contract = validate_exchange_announcement_audit_records(
+                source,
+                expected_audit_records,
+                feature_cutoff=str(payload.get("feature_cutoff") or ""),
+                codes=payload.get("requested_codes") or [],
+            )
+            if not audit_contract["valid"]:
+                errors.extend(
+                    f"audit_record_contract:{item}"
+                    for item in audit_contract["errors"]
+                )
+            if capability_result.get("record_count") != len(expected_records):
+                errors.append("capability_record_count_mismatch")
+            if capability_result.get("audit_record_count") != len(
+                expected_audit_records
+            ):
+                errors.append("capability_audit_record_count_mismatch")
+            if capability_result.get("records_hash") != stable_hash(
+                expected_records
+            ):
+                errors.append("capability_records_hash_mismatch")
+            if capability_result.get("audit_records_hash") != stable_hash(
+                expected_audit_records
+            ):
+                errors.append("capability_audit_records_hash_mismatch")
 
     passed = bool(payload.get("provider_validation_passed"))
-    capability_result = payload.get("capability_result") or {}
     if passed:
         if payload.get("status") != "EXCHANGE_ANNOUNCEMENT_NETWORK_VALIDATED":
             errors.append("validated_status_mismatch")
@@ -147,6 +216,12 @@ def verify_exchange_announcement_evidence(
                 {
                     "source": source,
                     "records": replay_records,
+                    **(
+                        {"audit_records": replay_audit_records}
+                        if schema_version
+                        == EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION
+                        else {}
+                    ),
                     "response_hashes": [
                         response.get("raw_hash") for response in responses
                     ],
@@ -258,4 +333,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

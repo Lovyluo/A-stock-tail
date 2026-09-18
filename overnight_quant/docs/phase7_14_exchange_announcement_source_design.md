@@ -43,6 +43,32 @@ response bytes, and compares request, response, record, and evidence hashes.
 Each exchange is verified independently; success for one exchange cannot satisfy
 another exchange.
 
+## Publication-time precision contract
+
+The official raw-field investigation found:
+
+| Source | Raw field | Observed value | Precision conclusion |
+|---|---|---|---|
+| SSE | `SSEDATE` | `2026-09-18` | date only |
+| SZSE | `publishTime` | `2026-09-17 00:00:00` | date semantics; midnight padding does not prove a publication clock |
+| BSE | `publishDate` | `2026-09-17` | date only |
+
+No provider may infer a time from retrieval order, page order, another source,
+or a local clock. A non-midnight time component must be present in the official
+raw field before `published_at_precision=datetime` is allowed.
+
+For evidence v2, a date-only announcement from the target trade date is excluded
+from formal `records` and retained in `audit_records` with the stable reason
+`publication_time_precision_insufficient`. A date-only announcement strictly
+before the target trade date remains eligible and keeps
+`published_at_precision=date`. A datetime record is eligible only when its
+official time is strictly earlier than the feature cutoff; equality and later
+times are audit-only rejections.
+
+Evidence v1 remains verifiable under its original contract and hash. The v2
+reanalysis command reads immutable v1 raw responses, records the source file SHA
+and evidence hash, and produces a new non-overwriting derived evidence file.
+
 ## Registry state
 
 - Capability registry schema: `source_capability_registry_v4`

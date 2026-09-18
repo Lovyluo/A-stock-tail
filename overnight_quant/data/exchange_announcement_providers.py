@@ -14,11 +14,18 @@ from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
+EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1 = "exchange_announcement_evidence_v1"
 EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION = (
-    "exchange_announcement_evidence_v1"
+    "exchange_announcement_evidence_v2"
+)
+EXCHANGE_ANNOUNCEMENT_VERIFIER_CONTRACT_V1_HASH = (
+    "e3c359ac0bf49cebc09846fee507e7fbf9c3e68fbcf9e448d54ce52384b035e5"
 )
 EXCHANGE_ANNOUNCEMENT_VERIFIER_CONTRACT_VERSION = (
-    "exchange_announcement_verifier_v1"
+    "exchange_announcement_verifier_v2"
+)
+PUBLICATION_TIME_PRECISION_INSUFFICIENT = (
+    "publication_time_precision_insufficient"
 )
 
 SSE_ANNOUNCEMENT_URL = (
@@ -112,6 +119,7 @@ class ExchangeAnnouncementBatch:
     source: str
     status: str
     records: tuple[dict[str, Any], ...]
+    audit_records: tuple[dict[str, Any], ...]
     responses: tuple[dict[str, Any], ...]
 
 
@@ -213,6 +221,7 @@ class ExchangeAnnouncementProviders:
     def collect_sse_batch(self) -> ExchangeAnnouncementBatch:
         self._require_exchange("sse")
         records: list[dict[str, Any]] = []
+        audit_records: list[dict[str, Any]] = []
         responses = []
         date_text = self.feature_cutoff.date().isoformat()
         for code in self.codes:
@@ -246,12 +255,15 @@ class ExchangeAnnouncementProviders:
                 },
             )
             responses.append(response)
-            records.extend(self._records_from_sse(code, response))
-        return _batch("sse", records, responses)
+            formal, audit = self._records_from_sse(code, response)
+            records.extend(formal)
+            audit_records.extend(audit)
+        return _batch("sse", records, audit_records, responses)
 
     def collect_szse_batch(self) -> ExchangeAnnouncementBatch:
         self._require_exchange("szse")
         records: list[dict[str, Any]] = []
+        audit_records: list[dict[str, Any]] = []
         responses = []
         date_text = self.feature_cutoff.date().isoformat()
         for code in self.codes:
@@ -281,12 +293,15 @@ class ExchangeAnnouncementProviders:
                 },
             )
             responses.append(response)
-            records.extend(self._records_from_szse(code, response))
-        return _batch("szse", records, responses)
+            formal, audit = self._records_from_szse(code, response)
+            records.extend(formal)
+            audit_records.extend(audit)
+        return _batch("szse", records, audit_records, responses)
 
     def collect_bse_batch(self) -> ExchangeAnnouncementBatch:
         self._require_exchange("bse")
         records: list[dict[str, Any]] = []
+        audit_records: list[dict[str, Any]] = []
         responses = []
         landing = self._request(
             "bse",
@@ -346,12 +361,18 @@ class ExchangeAnnouncementProviders:
                 },
             )
             responses.append(response)
-            records.extend(self._records_from_bse(code, response))
-        return _batch("bse", records, responses)
+            formal, audit = self._records_from_bse(code, response)
+            records.extend(formal)
+            audit_records.extend(audit)
+        return _batch("bse", records, audit_records, responses)
 
     def _records_from_sse(
-        self, code: str, response: Mapping[str, Any]
-    ) -> list[dict[str, Any]]:
+        self,
+        code: str,
+        response: Mapping[str, Any],
+        *,
+        contract_version: str = "v2",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         body = _json_bytes(response["raw_bytes"])
         rows = body.get("result") or []
         flattened = []
@@ -370,11 +391,16 @@ class ExchangeAnnouncementProviders:
             time_fields=("SSEDATE",),
             url_fields=("URL",),
             code_fields=("SECURITY_CODE",),
+            contract_version=contract_version,
         )
 
     def _records_from_szse(
-        self, code: str, response: Mapping[str, Any]
-    ) -> list[dict[str, Any]]:
+        self,
+        code: str,
+        response: Mapping[str, Any],
+        *,
+        contract_version: str = "v2",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         body = _json_bytes(response["raw_bytes"])
         rows = body.get("data") or []
         return self._records(
@@ -387,11 +413,16 @@ class ExchangeAnnouncementProviders:
             time_fields=("publishTime",),
             url_fields=("attachPath",),
             code_fields=("secCode",),
+            contract_version=contract_version,
         )
 
     def _records_from_bse(
-        self, code: str, response: Mapping[str, Any]
-    ) -> list[dict[str, Any]]:
+        self,
+        code: str,
+        response: Mapping[str, Any],
+        *,
+        contract_version: str = "v2",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         body = _bse_json_bytes(response["raw_bytes"])
         wrappers = body if isinstance(body, list) else []
         rows = []
@@ -407,6 +438,7 @@ class ExchangeAnnouncementProviders:
             time_fields=("publishDate",),
             url_fields=("destFilePath",),
             code_fields=("companyCd",),
+            contract_version=contract_version,
         )
 
     def _records(
@@ -421,8 +453,10 @@ class ExchangeAnnouncementProviders:
         time_fields: Sequence[str],
         url_fields: Sequence[str],
         code_fields: Sequence[str],
-    ) -> list[dict[str, Any]]:
+        contract_version: str = "v2",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         records = []
+        audit_records = []
         seen = set()
         for row in rows:
             if not isinstance(row, Mapping):
@@ -446,9 +480,7 @@ class ExchangeAnnouncementProviders:
                 raise ExchangeAnnouncementContractError(
                     "EXCHANGE_ANNOUNCEMENT_REQUIRED_FIELD_MISSING"
                 )
-            published = _as_cn(published_text)
-            if published > self.feature_cutoff:
-                continue
+            published, precision = _publication_time(published_text)
             official_url = _official_document_url(
                 source, _first_text(row, url_fields)
             )
@@ -458,19 +490,38 @@ class ExchangeAnnouncementProviders:
                     "EXCHANGE_ANNOUNCEMENT_DUPLICATE"
                 )
             seen.add(key)
-            records.append(
-                _record(
-                    source,
-                    code,
-                    announcement_id,
-                    title,
-                    published,
-                    official_url,
-                    response,
-                    self.feature_cutoff,
-                )
+            record = _record(
+                source,
+                code,
+                announcement_id,
+                title,
+                published,
+                precision,
+                official_url,
+                response,
+                self.feature_cutoff,
+                include_top_level_precision=contract_version != "v1",
             )
-        return records
+            if contract_version == "v1":
+                if published <= self.feature_cutoff:
+                    records.append(record)
+                continue
+            exclusion_reason = _publication_exclusion_reason(
+                published,
+                precision,
+                self.feature_cutoff,
+            )
+            if exclusion_reason:
+                audit_records.append(
+                    {
+                        **record,
+                        "formal_eligible": False,
+                        "audit_reason": exclusion_reason,
+                    }
+                )
+            else:
+                records.append(record)
+        return records, audit_records
 
     def _request(
         self,
@@ -559,6 +610,59 @@ def validate_exchange_announcement_records(
     feature_cutoff: str | datetime,
     codes: Iterable[str],
 ) -> dict[str, Any]:
+    return _validate_exchange_announcement_record_set(
+        source,
+        records,
+        feature_cutoff=feature_cutoff,
+        codes=codes,
+        audit=False,
+        legacy_v1=False,
+    )
+
+
+def validate_exchange_announcement_records_v1(
+    source: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    feature_cutoff: str | datetime,
+    codes: Iterable[str],
+) -> dict[str, Any]:
+    return _validate_exchange_announcement_record_set(
+        source,
+        records,
+        feature_cutoff=feature_cutoff,
+        codes=codes,
+        audit=False,
+        legacy_v1=True,
+    )
+
+
+def validate_exchange_announcement_audit_records(
+    source: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    feature_cutoff: str | datetime,
+    codes: Iterable[str],
+) -> dict[str, Any]:
+    return _validate_exchange_announcement_record_set(
+        source,
+        records,
+        feature_cutoff=feature_cutoff,
+        codes=codes,
+        audit=True,
+        legacy_v1=False,
+    )
+
+
+def _validate_exchange_announcement_record_set(
+    source: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    feature_cutoff: str | datetime,
+    codes: Iterable[str],
+    audit: bool,
+    legacy_v1: bool,
+) -> dict[str, Any]:
     if source not in SOURCE_IDENTITIES:
         return _validation("EXCHANGE_ANNOUNCEMENT_SOURCE_UNKNOWN", False, [])
     requested = _normalize_codes(codes)
@@ -585,6 +689,10 @@ def validate_exchange_announcement_records(
             "request_hash",
             "raw_hash",
         )
+        if not legacy_v1:
+            required += ("published_at_precision",)
+        if audit:
+            required += ("audit_reason", "formal_eligible")
         missing = [field for field in required if row.get(field) in (None, "")]
         if missing:
             errors.append(f"{index}:fields_missing:{','.join(missing)}")
@@ -618,18 +726,44 @@ def validate_exchange_announcement_records(
         decision = parse_cn_datetime(row["decision_cutoff"])
         if None in {published, event, observed, available, decision}:
             errors.append(f"{index}:time_invalid")
-        elif not (
+            continue
+        if not (
             published == event
-            and published <= cutoff
             and published <= observed <= available
             and decision == cutoff
         ):
             errors.append(f"{index}:time_contract_invalid")
+            continue
+        if legacy_v1:
+            if published > cutoff:
+                errors.append(f"{index}:time_contract_invalid")
+            continue
+        precision = row.get("published_at_precision")
+        if precision not in {"date", "datetime"}:
+            errors.append(f"{index}:publication_precision_invalid")
+            continue
+        exclusion_reason = _publication_exclusion_reason(
+            published,
+            str(precision),
+            cutoff,
+        )
+        if audit:
+            if row.get("formal_eligible") is not False:
+                errors.append(f"{index}:audit_formal_eligible_invalid")
+            if not exclusion_reason:
+                errors.append(f"{index}:audit_record_formally_eligible")
+            elif row.get("audit_reason") != exclusion_reason:
+                errors.append(f"{index}:audit_reason_mismatch")
+        elif exclusion_reason:
+            errors.append(f"{index}:formal_record_ineligible:{exclusion_reason}")
     canonical = sorted(rows, key=_record_sort_key)
+    prefix = "EXCHANGE_ANNOUNCEMENT_AUDIT_RECORDS" if audit else (
+        "EXCHANGE_ANNOUNCEMENT_RECORDS"
+    )
     return _validation(
-        "EXCHANGE_ANNOUNCEMENT_RECORDS_VALID"
+        f"{prefix}_VALID"
         if not errors
-        else "EXCHANGE_ANNOUNCEMENT_RECORDS_INVALID",
+        else f"{prefix}_INVALID",
         not errors,
         errors,
         records_hash=stable_hash(canonical),
@@ -643,7 +777,30 @@ def replay_exchange_announcement_responses(
     *,
     feature_cutoff: str | datetime,
     codes: Iterable[str],
+    contract_version: str = "v2",
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    records, _audit_records, errors = (
+        replay_exchange_announcement_response_sets(
+            source,
+            responses,
+            feature_cutoff=feature_cutoff,
+            codes=codes,
+            contract_version=contract_version,
+        )
+    )
+    return records, errors
+
+
+def replay_exchange_announcement_response_sets(
+    source: str,
+    responses: Iterable[Mapping[str, Any]],
+    *,
+    feature_cutoff: str | datetime,
+    codes: Iterable[str],
+    contract_version: str = "v2",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    if contract_version not in {"v1", "v2"}:
+        return [], [], ["contract_version_invalid"]
     response_rows = [dict(item) for item in responses]
     errors = []
     raw_by_code: dict[str, Mapping[str, Any]] = {}
@@ -674,7 +831,7 @@ def replay_exchange_announcement_responses(
         if response.get("purpose") == "api" and code:
             raw_by_code[code] = response
     if errors:
-        return [], errors
+        return [], [], errors
     provider = ExchangeAnnouncementProviders(
         codes,
         feature_cutoff=feature_cutoff,
@@ -682,21 +839,42 @@ def replay_exchange_announcement_responses(
         clock=lambda: _as_cn(feature_cutoff),
     )
     records = []
+    audit_records = []
     for code in _normalize_codes(codes):
         response = raw_by_code.get(code)
         if response is None:
             errors.append(f"response_missing:{code}")
             continue
         if source == "sse":
-            records.extend(provider._records_from_sse(code, response))
+            formal, audit = provider._records_from_sse(
+                code, response, contract_version=contract_version
+            )
         elif source == "szse":
-            records.extend(provider._records_from_szse(code, response))
+            formal, audit = provider._records_from_szse(
+                code, response, contract_version=contract_version
+            )
         elif source == "bse":
-            records.extend(provider._records_from_bse(code, response))
-    return sorted(records, key=_record_sort_key), errors
+            formal, audit = provider._records_from_bse(
+                code, response, contract_version=contract_version
+            )
+        else:
+            formal, audit = [], []
+        records.extend(formal)
+        audit_records.extend(audit)
+    return (
+        sorted(records, key=_record_sort_key),
+        sorted(audit_records, key=_record_sort_key),
+        errors,
+    )
 
 
-def compute_exchange_announcement_verifier_contract_hash() -> str:
+def compute_exchange_announcement_verifier_contract_hash(
+    schema_version: str = EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION,
+) -> str:
+    if schema_version == EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_V1:
+        return EXCHANGE_ANNOUNCEMENT_VERIFIER_CONTRACT_V1_HASH
+    if schema_version != EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION:
+        return ""
     return stable_hash(
         {
             "contract_version": EXCHANGE_ANNOUNCEMENT_VERIFIER_CONTRACT_VERSION,
@@ -706,6 +884,11 @@ def compute_exchange_announcement_verifier_contract_hash() -> str:
             "official_response_hosts": OFFICIAL_RESPONSE_HOSTS,
             "official_document_hosts": {
                 key: sorted(value) for key, value in OFFICIAL_DOCUMENT_HOSTS.items()
+            },
+            "publication_precision_contract": {
+                "same_day_date_only": PUBLICATION_TIME_PRECISION_INSUFFICIENT,
+                "formal_datetime": "published_at < feature_cutoff",
+                "midnight_datetime": "date",
             },
         }
     )
@@ -724,12 +907,15 @@ def _record(
     announcement_id: str,
     title: str,
     published: datetime,
+    published_at_precision: str,
     official_url: str,
     response: Mapping[str, Any],
     cutoff: datetime,
+    *,
+    include_top_level_precision: bool = True,
 ) -> dict[str, Any]:
     origin, adapter, version = SOURCE_IDENTITIES[source]
-    return {
+    record = {
         "capability": "announcement",
         "code": code,
         "announcement_id": announcement_id,
@@ -749,24 +935,66 @@ def _record(
             "code": code,
             "announcement_id": announcement_id,
             "title": title,
-            "published_at_precision": "date",
+            "published_at_precision": published_at_precision,
             "canonical_url": official_url,
         },
     }
+    if include_top_level_precision:
+        record["published_at_precision"] = published_at_precision
+    return record
 
 
 def _batch(
     source: str,
     records: list[dict[str, Any]],
+    audit_records: list[dict[str, Any]],
     responses: list[dict[str, Any]],
 ) -> ExchangeAnnouncementBatch:
     normalized = sorted(records, key=_record_sort_key)
+    normalized_audit = sorted(audit_records, key=_record_sort_key)
     return ExchangeAnnouncementBatch(
         source=source,
         status="AVAILABLE" if normalized else "AVAILABLE_EMPTY",
         records=tuple(normalized),
+        audit_records=tuple(normalized_audit),
         responses=tuple(responses),
     )
+
+
+def _publication_time(value: str) -> tuple[datetime, str]:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return _as_cn(text), "date"
+    parsed = _as_cn(text)
+    has_explicit_time = re.search(
+        r"(?:T|\s)\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?",
+        text,
+    )
+    if not has_explicit_time:
+        raise ExchangeAnnouncementContractError(
+            "EXCHANGE_ANNOUNCEMENT_PUBLICATION_PRECISION_UNKNOWN"
+        )
+    # Official SZSE rows currently serialize a date as midnight. Without an
+    # independently meaningful clock value this remains date precision.
+    is_midnight = parsed.timetz().replace(tzinfo=None) == datetime.min.time()
+    precision = "date" if is_midnight else "datetime"
+    return parsed, precision
+
+
+def _publication_exclusion_reason(
+    published: datetime,
+    precision: str,
+    cutoff: datetime,
+) -> str:
+    if precision == "date":
+        if published.date() == cutoff.date():
+            return PUBLICATION_TIME_PRECISION_INSUFFICIENT
+        if published.date() > cutoff.date():
+            return "publication_after_cutoff"
+        return ""
+    if precision == "datetime":
+        return "publication_at_or_after_cutoff" if published >= cutoff else ""
+    return "publication_time_precision_unknown"
 
 
 def _request_material(
