@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
+    "6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
+    "23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -90,24 +90,24 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     rows = audit["adapter_matrix"]
 
     assert ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v5"
+        "source_capability_adapter_registry_v6"
     )
-    assert audit["adapter_entry_count"] == len(rows) == 28
+    assert audit["adapter_entry_count"] == len(rows) == 29
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 1
+    assert audit["candidate_count"] == 4
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 4
+    assert audit["contract_incompatible_count"] == 2
     assert audit["previous_adapter_registry_schema_version"] == (
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
     assert PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v4"
+        "source_capability_adapter_registry_v5"
     )
     assert PREVIOUS_ADAPTER_REGISTRY_HASH == (
-        "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
+        "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
     )
     assert audit["previous_adapter_registry_hash"] == (
-        "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
+        "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
     )
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON

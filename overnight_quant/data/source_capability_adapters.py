@@ -17,21 +17,25 @@ from overnight_quant.data.static_source_qualification import (
     S1_PARTIAL_QUALIFICATION_RECORD_HASH,
     S1_UNQUALIFIED_PROVIDER_KEYS,
 )
+from overnight_quant.data.market_source_providers import (
+    PROVIDER_KEYS as S2_PROVIDER_KEYS,
+    SOURCE_IDENTITIES as S2_SOURCE_IDENTITIES,
+)
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v5"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v6"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v4"
+    "source_capability_adapter_registry_v5"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
+    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "activate_pm_approved_s1_sources_and_retain_cninfo_unqualified_candidate"
+    "register_unqualified_s2_market_source_candidates"
 )
-EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
+EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 29
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
+    "6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -229,7 +233,7 @@ _LEGACY_PROVIDER_KEYS = {
         "industry_snapshot",
         "eastmoney",
         "direct_http",
-        "emweb_core+push2_board_v2026-07-30",
+        "push2_stock_industry+board_breadth_v2026-09-18",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_industry"
@@ -238,7 +242,7 @@ _LEGACY_PROVIDER_KEYS = {
         "fund_flow",
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_v2026-07-30",
+        "push2_fflow_kline_v2026-09-18",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_eastmoney_fund_flow"
@@ -353,6 +357,10 @@ _QUALIFIED_SHADOW_PROVIDER_KEYS = {
 _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = dict(
     S1_UNQUALIFIED_PROVIDER_KEYS
 )
+for _capability, _identity_values in S2_SOURCE_IDENTITIES.items():
+    _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS[
+        _identity(_capability, *_identity_values)
+    ] = S2_PROVIDER_KEYS[_capability]
 
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:
