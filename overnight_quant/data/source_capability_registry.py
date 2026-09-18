@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
-REGISTRY_SCHEMA_VERSION = "source_capability_registry_v3"
+REGISTRY_SCHEMA_VERSION = "source_capability_registry_v4"
 QUALIFICATION_PROGRESS_MOOTDX = "3/3"
 QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED = "0/3"
 QUALIFIED_MOOTDX_ENDPOINT_ID = "mootdx_locked@59.36.5.11:7709"
@@ -388,6 +388,54 @@ SOURCE_CAPABILITIES = (
         True,
         "unqualified",
         "pm_rejected_s1",
+    ),
+    SourceCapability(
+        "announcement",
+        "sse",
+        "direct_http",
+        "primary",
+        True,
+        False,
+        False,
+        True,
+        True,
+        "announcement_sse",
+        "sse_query_company_bulletin_new_v2026-09-18",
+        True,
+        "unqualified",
+        "candidate_pending_real_validation",
+    ),
+    SourceCapability(
+        "announcement",
+        "szse",
+        "direct_http",
+        "primary",
+        True,
+        False,
+        False,
+        True,
+        True,
+        "announcement_szse",
+        "szse_ann_list_v2026-09-18",
+        True,
+        "unqualified",
+        "candidate_pending_real_validation",
+    ),
+    SourceCapability(
+        "announcement",
+        "bse",
+        "direct_http",
+        "primary",
+        True,
+        False,
+        False,
+        True,
+        True,
+        "announcement_bse",
+        "bse_company_announcement_v2026-09-18",
+        True,
+        "unqualified",
+        "candidate_pending_real_validation",
     ),
     SourceCapability(
         "global_news",

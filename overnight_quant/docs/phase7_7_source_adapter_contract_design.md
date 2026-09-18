@@ -23,7 +23,7 @@ automatic_configuration_change=false
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
 在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
 分钟线和逐笔也使用独立合同兼容 Provider。S1 部分资格批准后当前
-`bound_count=8`；巨潮是唯一未激活候选，`candidate_count=1`。这里的 `bound`
+`bound_count=8`；巨潮与上交所、深交所、北交所公告均为未激活候选，`candidate_count=4`。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -52,7 +52,7 @@ implementation_status
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v5`；
+- `source_capability_adapter_registry_v6`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 28 项适配绑定。
@@ -133,14 +133,14 @@ v0.4.2 固定节点接入后的 Schema v3 哈希为：
 5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5
 ```
 
-S1 部分资格批准后的 Schema v5 哈希为：
+官方交易所公告候选登记后的 Schema v6 哈希为：
 
 ```text
-05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369
+87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a
 ```
 
-对应 B1 registry v3 hash 为
-`4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5`。
+对应 capability registry v4 hash 为
+`a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada`。
 
 ## 4. 失效关闭执行链
 
