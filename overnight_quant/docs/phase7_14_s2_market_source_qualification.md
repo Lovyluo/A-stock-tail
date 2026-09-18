@@ -97,11 +97,11 @@ started. Current state remains:
 
 ```text
 capability_registry_schema=source_capability_registry_v4
-capability_registry_hash=6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585
+capability_registry_hash=92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7
 adapter_registry_schema=source_capability_adapter_registry_v6
-adapter_registry_hash=23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e
+adapter_registry_hash=7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0
 bound_count=8
-candidate_count=4
+candidate_count=7
 consecutive_count=0/3
 data_ready=false
 hard_gate_authorized=false
@@ -110,8 +110,8 @@ tickets=[]
 orders=[]
 ```
 
-The independent S2 work remains blocked from combined registry integration
-until the separate official-announcement PR is approved and merged. After
-that merge, this branch must merge `main` normally, recompute the combined
-production hashes, and verify the expected 32 entries, 8 bound entries, and 7
-candidates. No future combined hash is hard-coded here.
+The official-announcement source work was merged normally from `main`. The
+combined production matrix was rebuilt from its actual entries and contains
+exactly 32 entries, 8 bound providers, and 7 inactive candidates. The three S2
+candidates remain unqualified at 0/3; announcement candidates do not satisfy
+any S2 readiness gate.

@@ -31,11 +31,11 @@ PREVIOUS_ADAPTER_REGISTRY_HASH = (
     "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "register_unqualified_s2_market_source_candidates"
+    "combine_s2_market_and_exchange_announcement_candidates"
 )
-EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 29
+EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 32
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585"
+    "92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -361,6 +361,37 @@ for _capability, _identity_values in S2_SOURCE_IDENTITIES.items():
     _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS[
         _identity(_capability, *_identity_values)
     ] = S2_PROVIDER_KEYS[_capability]
+_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.update(
+    {
+        _identity(
+            "announcement",
+            "sse",
+            "direct_http",
+            "sse_query_company_bulletin_new_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_sse_records"
+        ),
+        _identity(
+            "announcement",
+            "szse",
+            "direct_http",
+            "szse_ann_list_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_szse_records"
+        ),
+        _identity(
+            "announcement",
+            "bse",
+            "direct_http",
+            "bse_company_announcement_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_bse_records"
+        ),
+    }
+)
 
 
 def _get_fixed_capability_registry() -> list[dict[str, Any]]:

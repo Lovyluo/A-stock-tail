@@ -26,7 +26,7 @@ automatic_configuration_change=false
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
 在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
 分钟线和逐笔也使用独立合同兼容 Provider。S1 部分资格批准后当前
-`bound_count=8`；巨潮是唯一未激活候选，`candidate_count=1`。这里的 `bound`
+`bound_count=8`；巨潮、上交所、深交所、北交所公告及三个 S2 来源均为未激活候选，`candidate_count=7`。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -58,9 +58,9 @@ implementation_status
 - `source_capability_adapter_registry_v6`；
 - B1 registry schema；
 - B1 registry hash；
-- 规范排序后的 29 项适配绑定。
+- 规范排序后的 32 项适配绑定。
 
-生产公共哈希函数不接受调用方自定义条目，只计算固定的完整 29 项矩阵。测试所需的自定义
+生产公共哈希函数不接受调用方自定义条目，只计算固定的完整 32 项矩阵。测试所需的自定义
 子集和换序哈希入口为模块私有函数，不能用于生产授权。输入顺序不影响私有测试哈希，但
 删除一项、增加一项或修改固定绑定即使重新签名，也不能通过生产矩阵校验。
 
@@ -68,7 +68,7 @@ implementation_status
 
 | 字段 | 含义 |
 |---|---|
-| `production_adapter_registry_hash` | 固定 29 项生产矩阵的哈希 |
+| `production_adapter_registry_hash` | 固定 32 项生产矩阵的哈希 |
 | `selection_adapter_registry_hash` | 本次执行实际使用、规范化后的绑定矩阵哈希 |
 | `selection_registry_scope` | 只能为 `production` 或 `test_only` |
 | `adapter_registry_hash` | 兼容字段，固定等于本次 `selection_adapter_registry_hash` |
@@ -81,7 +81,7 @@ scope 为 `production`。
 
 ## 3. 覆盖矩阵
 
-B2.1/B2.2b 和 S2 为 B1 的全部 29 项能力输出一行。后续阶段将已批准候选移入
+B2.1/B2.2b、公告来源和 S2 为 B1 的全部 32 项能力输出一行。后续阶段将已批准候选移入
 `provider_key` 并保留历史实现。S2 登记后 13 项历史实现中有 8 项为 bound，
 巨潮公告及三个 S2 来源为 candidate，2 项仍为 `contract_incompatible`：
 
@@ -137,16 +137,16 @@ v0.4.2 固定节点接入后的 Schema v3 哈希为：
 5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5
 ```
 
-S1 部分资格批准后的 Schema v5 哈希为：
+官方交易所公告候选独立登记时的历史 Schema v6 哈希为：
 
 ```text
-05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369
+87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a
 ```
 
-对应 B1 registry v3 hash 为
-`4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5`。
+对应 capability registry v4 hash 为
+`a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada`。
 
-S2 candidate 登记后的 Schema v6 哈希为：
+S2 candidate 独立登记时的历史 Schema v6 哈希为：
 
 ```text
 23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e
@@ -155,6 +155,15 @@ S2 candidate 登记后的 Schema v6 哈希为：
 对应 capability registry v4 hash 为
 `6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585`。
 
+公告与 S2 合并后的当前生产 Schema v6 哈希为：
+
+```text
+7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0
+```
+
+当前 capability registry v4 hash 为
+`92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7`。
+
 ## 4. 失效关闭执行链
 
 `execute_source_adapter()` 的顺序固定为：
@@ -162,7 +171,7 @@ S2 candidate 登记后的 Schema v6 哈希为：
 1. 校验请求身份完整；
 2. 使用 B1 `route_source_capability(..., require_hard_gate=False)`；
 3. 路由拒绝时不调用 provider；
-4. 核对 29 项适配矩阵中的完整身份和 provider key；
+4. 核对 32 项适配矩阵中的完整身份和 provider key；
 5. 遇到 `candidate_not_activated` 立即返回
    `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED`，不检查或调用候选/历史 provider；
 6. 拒绝裸 callable、错误 envelope 和不匹配的 provider key；
@@ -192,7 +201,7 @@ request_hash, raw_hash
 
 | 状态 | 含义 |
 |---|---|
-| `SOURCE_ADAPTER_AUDIT_COMPLETE` | 29 项离线矩阵已生成 |
+| `SOURCE_ADAPTER_AUDIT_COMPLETE` | 32 项离线矩阵已生成 |
 | `SOURCE_ADAPTER_BOUND` | 完整 envelope 绑定和注入数据均通过；生产矩阵当前为 8 |
 | `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED` | 合同兼容候选已登记但未启用，provider 未调用 |
 | `SOURCE_ADAPTER_NOT_IMPLEMENTED` | 无实现或已有实现与 B1 合同不兼容 |

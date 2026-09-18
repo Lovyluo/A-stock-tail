@@ -154,7 +154,7 @@ def test_registry_adds_three_unqualified_candidates_without_binding():
         assert row["qualification_progress"] == "0/3"
     audit = audit_source_adapters(environ={})
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["network_requests_made"] == 0
     assert audit["data_ready"] is False
     assert audit["candidates"] == audit["tickets"] == audit["orders"] == []

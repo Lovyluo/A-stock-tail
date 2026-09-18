@@ -23,7 +23,7 @@ VALUATION_PROVIDER_KEY = (
 )
 LEGACY_PROVIDER_KEY = "astock_client.AStockClient._tencent_quotes"
 EXPECTED_REGISTRY_HASH = (
-    "23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e"
+    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
 )
 
 
@@ -64,7 +64,7 @@ def test_shadow_registry_activates_only_two_tencent_bindings():
 
     assert audit["adapter_registry_hash"] == EXPECTED_REGISTRY_HASH
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["legacy_implementation_present_count"] == 13
     assert [row["capability"] for row in bindings] == ["quote", "valuation"]
     assert {row["provider_key"] for row in bindings} == {

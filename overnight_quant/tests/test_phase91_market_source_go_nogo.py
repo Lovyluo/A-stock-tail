@@ -23,6 +23,9 @@ from overnight_quant.data.market_source_go_nogo import (
 from overnight_quant.data.static_source_qualification import (
     S1_PARTIAL_QUALIFICATION_RECORD_HASH,
 )
+from overnight_quant.data.source_capability_adapters import (
+    get_source_adapter_registry,
+)
 from overnight_quant.scripts import run_market_source_validation as validation
 
 
@@ -170,6 +173,31 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
     assert result["sampling_authorized"] is True
     assert result["qualification_result"] == "NOT_EVALUATED"
     _assert_safe(result)
+
+
+def test_combined_candidates_keep_announcements_outside_s2_gate():
+    candidates = [
+        row
+        for row in get_source_adapter_registry()
+        if row["implementation_status"] == "candidate_not_activated"
+    ]
+    identities = {
+        (row["capability"], row["origin_source"], row["source_version"])
+        for row in candidates
+    }
+    assert len(candidates) == 7
+    assert {
+        ("announcement", "cninfo", "cninfo_query_v2026-07-30"),
+        ("announcement", "sse", "sse_query_company_bulletin_new_v2026-09-18"),
+        ("announcement", "szse", "szse_ann_list_v2026-09-18"),
+        ("announcement", "bse", "bse_company_announcement_v2026-09-18"),
+    } <= identities
+    s2 = {identity for identity in identities if identity[0] != "announcement"}
+    assert s2 == {
+        ("market_breadth", "eastmoney", "push2_all_a_breadth+sse_index_v2026-09-18"),
+        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_v2026-09-18"),
+        ("fund_flow", "eastmoney", "push2_fflow_kline_v2026-09-18"),
+    }
 
 
 def test_environment_fixture_is_rejected_without_test_mode(tmp_path):

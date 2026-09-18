@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585"
+    "92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e"
+    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -92,9 +92,9 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     assert ADAPTER_REGISTRY_SCHEMA_VERSION == (
         "source_capability_adapter_registry_v6"
     )
-    assert audit["adapter_entry_count"] == len(rows) == 29
+    assert audit["adapter_entry_count"] == len(rows) == 32
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["legacy_implementation_present_count"] == 13
     assert audit["contract_incompatible_count"] == 2
     assert audit["previous_adapter_registry_schema_version"] == (
