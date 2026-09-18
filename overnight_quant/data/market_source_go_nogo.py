@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 import hashlib
 import json
 import os
@@ -18,6 +18,10 @@ from overnight_quant.data.market_source_providers import (
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
 )
+from overnight_quant.data.market_session_confirmation import (
+    SESSION_CONFIRMED,
+    verify_market_session_confirmation_evidence,
+)
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_registry import (
     get_source_capability_registry,
@@ -30,8 +34,10 @@ from overnight_quant.data.static_source_qualification import (
 )
 
 
-GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v1"
-GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v1"
+GO_NOGO_EVIDENCE_SCHEMA_V1 = "market_source_go_nogo_evidence_v1"
+GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v2"
+GO_NOGO_VERIFIER_CONTRACT_V1 = "market_source_go_nogo_verifier_v1"
+GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v2"
 SAMPLING_GO = "SAMPLING_GO"
 NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
@@ -50,6 +56,11 @@ def run_market_source_go_nogo(
     codes: Iterable[str],
     cutoff_clock: str = DEFAULT_CUTOFF_CLOCK,
     calendar_contract: Mapping[str, Any],
+    calendar_expected_file_sha256: str | None = None,
+    calendar_actual_file_sha256: str | None = None,
+    session_confirmation_contract: Mapping[str, Any] | None = None,
+    session_expected_file_sha256: str | None = None,
+    session_actual_file_sha256: str | None = None,
     environment: Mapping[str, Any],
     started_at: str,
     completed_at: str,
@@ -91,11 +102,37 @@ def run_market_source_go_nogo(
         type(skew) in (int, float) and abs(float(skew)) <= MAX_CLOCK_SKEW_MS,
         skew,
     )
-    calendar_errors = _calendar_errors(calendar_contract, trade_date)
+    calendar_errors = _completed_calendar_errors(
+        calendar_contract,
+        trade_date,
+        expected_file_sha256=calendar_expected_file_sha256,
+        actual_file_sha256=calendar_actual_file_sha256,
+    )
     add(
-        "trusted_trading_day",
+        "completed_calendar_contract",
         not calendar_errors,
         {"errors": calendar_errors, "source": calendar_contract.get("source"), "source_version": calendar_contract.get("source_version")},
+    )
+    confirmation = dict(session_confirmation_contract or {})
+    confirmation_verification = verify_market_session_confirmation_evidence(
+        confirmation,
+        expected_file_sha256=session_expected_file_sha256,
+        actual_file_sha256=session_actual_file_sha256,
+    )
+    session_errors = list(confirmation_verification.get("errors") or [])
+    if confirmation_verification.get("session_confirmed") is not True:
+        session_errors.append("current_session_not_confirmed")
+    if confirmation.get("trade_date") != trade_date:
+        session_errors.append("session_trade_date_mismatch")
+    add(
+        "current_session_confirmation_contract",
+        not session_errors,
+        {
+            "errors": list(dict.fromkeys(session_errors)),
+            "source": confirmation.get("origin_source"),
+            "source_version": confirmation.get("source_version"),
+            "status": confirmation.get("status"),
+        },
     )
     identity_errors = _candidate_identity_errors()
     add(
@@ -158,7 +195,20 @@ def run_market_source_go_nogo(
             "fixed_codes": list(normalized_codes),
             "source_versions": _source_versions(),
             "request_hashes": {key: request_hashes.get(key, "") for key in sorted(SOURCE_IDENTITIES)},
-            "calendar_contract_hash": stable_hash(dict(calendar_contract)),
+            "completed_calendar_contract": {
+                "contract_hash": stable_hash(dict(calendar_contract)),
+                "expected_file_sha256": calendar_expected_file_sha256 or "",
+                "actual_file_sha256": calendar_actual_file_sha256 or "",
+            },
+            "current_session_confirmation_contract": {
+                "contract_hash": stable_hash(confirmation),
+                "evidence_hash": confirmation.get(
+                    "market_session_confirmation_evidence_hash"
+                )
+                or "",
+                "expected_file_sha256": session_expected_file_sha256 or "",
+                "actual_file_sha256": session_actual_file_sha256 or "",
+            },
             "environment_checks": checks,
             "failure_reasons": failures,
             "task_actions": [],
@@ -175,12 +225,135 @@ def verify_market_source_go_nogo_evidence(
     *,
     expected_file_sha256: str | None,
     actual_file_sha256: str | None = None,
+    completed_calendar_contract: Mapping[str, Any] | None = None,
+    completed_calendar_expected_file_sha256: str | None = None,
+    completed_calendar_actual_file_sha256: str | None = None,
+    current_session_confirmation_contract: Mapping[str, Any] | None = None,
+    current_session_expected_file_sha256: str | None = None,
+    current_session_actual_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload = dict(evidence)
+    if payload.get("evidence_schema_version") == GO_NOGO_EVIDENCE_SCHEMA_V1:
+        return _verify_v1_evidence(
+            payload,
+            expected_file_sha256=expected_file_sha256,
+            actual_file_sha256=actual_file_sha256,
+        )
     errors: list[str] = []
     if payload.get("evidence_schema_version") != GO_NOGO_EVIDENCE_SCHEMA_VERSION:
         errors.append("schema_version_invalid")
     if payload.get("verifier_contract_version") != GO_NOGO_VERIFIER_CONTRACT_VERSION:
+        errors.append("verifier_contract_version_invalid")
+    if payload.get("execution_ok") is not True:
+        errors.append("execution_ok_invalid")
+    if payload.get("go_nogo_evidence_hash") != compute_go_nogo_evidence_hash(payload):
+        errors.append("evidence_hash_mismatch")
+    if not expected_file_sha256:
+        errors.append("external_sha256_anchor_required")
+    elif actual_file_sha256 != expected_file_sha256:
+        errors.append("external_sha256_anchor_mismatch")
+    if payload.get("fixed_codes") != list(FIXED_CODES):
+        errors.append("fixed_codes_mismatch")
+    if payload.get("source_versions") != _source_versions():
+        errors.append("source_versions_mismatch")
+    trade_date = str(payload.get("trade_date") or "")
+    calendar = dict(completed_calendar_contract or {})
+    calendar_errors = _completed_calendar_errors(
+        calendar,
+        trade_date,
+        expected_file_sha256=completed_calendar_expected_file_sha256,
+        actual_file_sha256=completed_calendar_actual_file_sha256,
+    )
+    calendar_reference = payload.get("completed_calendar_contract") or {}
+    expected_calendar_reference = {
+        "contract_hash": stable_hash(calendar),
+        "expected_file_sha256": completed_calendar_expected_file_sha256 or "",
+        "actual_file_sha256": completed_calendar_actual_file_sha256 or "",
+    }
+    if calendar_reference != expected_calendar_reference:
+        errors.append("completed_calendar_contract_reference_mismatch")
+
+    confirmation = dict(current_session_confirmation_contract or {})
+    confirmation_verification = verify_market_session_confirmation_evidence(
+        confirmation,
+        expected_file_sha256=current_session_expected_file_sha256,
+        actual_file_sha256=current_session_actual_file_sha256,
+    )
+    session_errors = list(confirmation_verification.get("errors") or [])
+    if confirmation_verification.get("session_confirmed") is not True:
+        session_errors.append("current_session_not_confirmed")
+    if confirmation.get("trade_date") != trade_date:
+        session_errors.append("session_trade_date_mismatch")
+    session_errors = list(dict.fromkeys(session_errors))
+    session_reference = payload.get("current_session_confirmation_contract") or {}
+    expected_session_reference = {
+        "contract_hash": stable_hash(confirmation),
+        "evidence_hash": confirmation.get(
+            "market_session_confirmation_evidence_hash"
+        )
+        or "",
+        "expected_file_sha256": current_session_expected_file_sha256 or "",
+        "actual_file_sha256": current_session_actual_file_sha256 or "",
+    }
+    if session_reference != expected_session_reference:
+        errors.append("current_session_contract_reference_mismatch")
+    evidence_scope = payload.get("evidence_scope")
+    if evidence_scope not in {"production", "test_only"}:
+        errors.append("evidence_scope_invalid")
+    checks = list(payload.get("environment_checks") or [])
+    names = [row.get("name") for row in checks if isinstance(row, Mapping)]
+    if len(names) != len(set(names)) or not names:
+        errors.append("environment_checks_invalid")
+    _validate_contract_check(
+        checks,
+        "completed_calendar_contract",
+        calendar_errors,
+        errors,
+    )
+    _validate_contract_check(
+        checks,
+        "current_session_confirmation_contract",
+        session_errors,
+        errors,
+    )
+    failed_names = [row.get("name") for row in checks if row.get("passed") is not True]
+    if payload.get("failure_reasons") != failed_names:
+        errors.append("failure_reasons_mismatch")
+    expected_status = SAMPLING_GO if not failed_names else NO_GO
+    if payload.get("status") != expected_status:
+        errors.append("status_mismatch")
+    expected_authorized = (
+        expected_status == SAMPLING_GO and evidence_scope == "production"
+    )
+    if payload.get("sampling_authorized") is not expected_authorized:
+        errors.append("sampling_authorized_mismatch")
+    _append_go_nogo_safety_errors(payload, errors)
+    verified = not errors
+    return _safe(
+        {
+            "status": "MARKET_SOURCE_GO_NOGO_EVIDENCE_VERIFIED" if verified else "MARKET_SOURCE_GO_NOGO_EVIDENCE_INVALID",
+            "execution_ok": True,
+            "evidence_integrity_verified": verified,
+            "sampling_authorized": bool(payload.get("sampling_authorized")) if verified else False,
+            "audit_only": False,
+            "qualification_result": "NOT_EVALUATED",
+            "consecutive_qualified_days": 0,
+            "expected_file_sha256": expected_file_sha256 or "",
+            "actual_file_sha256": actual_file_sha256 or "",
+            "go_nogo_evidence_hash": payload.get("go_nogo_evidence_hash") or "",
+            "errors": errors,
+        }
+    )
+
+
+def _verify_v1_evidence(
+    payload: Mapping[str, Any],
+    *,
+    expected_file_sha256: str | None,
+    actual_file_sha256: str | None,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    if payload.get("verifier_contract_version") != GO_NOGO_VERIFIER_CONTRACT_V1:
         errors.append("verifier_contract_version_invalid")
     if payload.get("go_nogo_evidence_hash") != compute_go_nogo_evidence_hash(payload):
         errors.append("evidence_hash_mismatch")
@@ -205,12 +378,63 @@ def verify_market_source_go_nogo_evidence(
     expected_status = SAMPLING_GO if not failed_names else NO_GO
     if payload.get("status") != expected_status:
         errors.append("status_mismatch")
-    expected_authorized = (
-        expected_status == SAMPLING_GO and evidence_scope == "production"
-    )
-    if payload.get("sampling_authorized") is not expected_authorized:
+    claimed_authorized = expected_status == SAMPLING_GO and evidence_scope == "production"
+    if payload.get("sampling_authorized") is not claimed_authorized:
         errors.append("sampling_authorized_mismatch")
-    for key in ("data_ready", "hard_gate_authorized", "automatic_configuration_change", "automatic_qualification_change"):
+    _append_go_nogo_safety_errors(payload, errors)
+    verified = not errors
+    return _safe(
+        {
+            "status": (
+                "MARKET_SOURCE_GO_NOGO_V1_EVIDENCE_VERIFIED_AUDIT_ONLY"
+                if verified
+                else "MARKET_SOURCE_GO_NOGO_EVIDENCE_INVALID"
+            ),
+            "execution_ok": True,
+            "evidence_integrity_verified": verified,
+            "sampling_authorized": False,
+            "audit_only": True,
+            "qualification_result": "NOT_EVALUATED",
+            "consecutive_qualified_days": 0,
+            "expected_file_sha256": expected_file_sha256 or "",
+            "actual_file_sha256": actual_file_sha256 or "",
+            "go_nogo_evidence_hash": payload.get("go_nogo_evidence_hash") or "",
+            "errors": errors,
+        }
+    )
+
+
+def _validate_contract_check(
+    checks: list[Any],
+    name: str,
+    expected_errors: list[str],
+    errors: list[str],
+) -> None:
+    rows = [
+        row
+        for row in checks
+        if isinstance(row, Mapping) and row.get("name") == name
+    ]
+    if len(rows) != 1:
+        errors.append(f"contract_check_missing:{name}")
+        return
+    row = rows[0]
+    if row.get("passed") is not (not expected_errors):
+        errors.append(f"contract_check_result_mismatch:{name}")
+    detail = row.get("detail") or {}
+    if not isinstance(detail, Mapping) or list(detail.get("errors") or []) != expected_errors:
+        errors.append(f"contract_check_errors_mismatch:{name}")
+
+
+def _append_go_nogo_safety_errors(
+    payload: Mapping[str, Any], errors: list[str]
+) -> None:
+    for key in (
+        "data_ready",
+        "hard_gate_authorized",
+        "automatic_configuration_change",
+        "automatic_qualification_change",
+    ):
         if payload.get(key) is not False:
             errors.append(f"safety_flag_invalid:{key}")
     for key in ("candidates", "tickets", "orders", "task_actions", "enabled_tasks"):
@@ -220,21 +444,6 @@ def verify_market_source_go_nogo_evidence(
         errors.append("qualification_count_changed")
     if payload.get("qualification_result") != "NOT_EVALUATED":
         errors.append("qualification_result_invalid")
-    verified = not errors
-    return _safe(
-        {
-            "status": "MARKET_SOURCE_GO_NOGO_EVIDENCE_VERIFIED" if verified else "MARKET_SOURCE_GO_NOGO_EVIDENCE_INVALID",
-            "execution_ok": True,
-            "evidence_integrity_verified": verified,
-            "sampling_authorized": bool(payload.get("sampling_authorized")) if verified else False,
-            "qualification_result": "NOT_EVALUATED",
-            "consecutive_qualified_days": 0,
-            "expected_file_sha256": expected_file_sha256 or "",
-            "actual_file_sha256": actual_file_sha256 or "",
-            "go_nogo_evidence_hash": payload.get("go_nogo_evidence_hash") or "",
-            "errors": errors,
-        }
-    )
 
 
 def compute_go_nogo_evidence_hash(evidence: Mapping[str, Any]) -> str:
@@ -324,8 +533,14 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
     }
 
 
-def _calendar_errors(contract: Mapping[str, Any], trade_date: str) -> list[str]:
-    errors = []
+def _completed_calendar_errors(
+    contract: Mapping[str, Any],
+    trade_date: str,
+    *,
+    expected_file_sha256: str | None,
+    actual_file_sha256: str | None,
+) -> list[str]:
+    errors: list[str] = []
     if contract.get("source") != "tencent":
         errors.append("calendar_source_invalid")
     if contract.get("source_version") != "ifzq_fqkline_day_v2026-07-30":
@@ -339,9 +554,39 @@ def _calendar_errors(contract: Mapping[str, Any], trade_date: str) -> list[str]:
         errors.append("calendar_qualification_status_invalid")
     if not _is_sha256(contract.get("raw_hash")):
         errors.append("calendar_raw_hash_invalid")
-    if trade_date not in set(contract.get("trade_dates") or []):
-        errors.append("trade_date_not_in_trusted_calendar")
-    return errors
+    if not _is_sha256(expected_file_sha256):
+        errors.append("calendar_external_sha256_anchor_required")
+    elif actual_file_sha256 != expected_file_sha256:
+        errors.append("calendar_external_sha256_anchor_mismatch")
+
+    target = _parse_date(trade_date)
+    values = contract.get("trade_dates")
+    if not isinstance(values, list) or not values:
+        errors.append("calendar_trade_dates_invalid")
+        return list(dict.fromkeys(errors))
+    parsed_dates: list[date] = []
+    for value in values:
+        parsed = _parse_date(value)
+        if parsed is None or parsed.isoformat() != value:
+            errors.append("calendar_trade_date_invalid")
+            continue
+        parsed_dates.append(parsed)
+    if len(parsed_dates) != len(set(parsed_dates)):
+        errors.append("calendar_trade_dates_duplicate")
+    if parsed_dates != sorted(parsed_dates):
+        errors.append("calendar_trade_dates_not_sorted")
+    if any(value.weekday() >= 5 for value in parsed_dates):
+        errors.append("calendar_non_trading_weekend_present")
+    if len(parsed_dates) < 60:
+        errors.append("calendar_trade_dates_below_60")
+    if target is None:
+        errors.append("target_trade_date_invalid")
+    elif any(value >= target for value in parsed_dates):
+        errors.append("calendar_contains_target_or_future_date")
+    latest = parsed_dates[-1].isoformat() if parsed_dates else ""
+    if contract.get("latest_completed_trade_date") != latest:
+        errors.append("calendar_latest_completed_trade_date_invalid")
+    return list(dict.fromkeys(errors))
 
 
 def _candidate_identity_errors() -> list[str]:
@@ -398,6 +643,14 @@ def _parse_iso(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(CN_TZ)
+
+
+def _parse_date(value: Any) -> date | None:
+    try:
+        parsed = date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed
 
 
 def _is_sha256(value: Any) -> bool:
@@ -465,7 +718,9 @@ def _safe(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "GO_NOGO_EVIDENCE_SCHEMA_V1",
     "GO_NOGO_EVIDENCE_SCHEMA_VERSION",
+    "GO_NOGO_VERIFIER_CONTRACT_V1",
     "GO_NOGO_VERIFIER_CONTRACT_VERSION",
     "NO_GO",
     "SAMPLING_GO",

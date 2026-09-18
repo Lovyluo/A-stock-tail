@@ -5,6 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Output,
     [Parameter(Mandatory = $true)][string]$CalendarContract,
     [Parameter(Mandatory = $true)][string]$CalendarFileSha256,
+    [Parameter(Mandatory = $true)][string]$SessionConfirmationContract,
+    [Parameter(Mandatory = $true)][string]$SessionConfirmationFileSha256,
     [string]$Codes = '000001,000333,600000,600519,601318',
     [string]$CutoffClock = '13:30:00',
     [string]$TestOnlyEnvironmentFixture = '',
@@ -29,6 +31,8 @@ $arguments = @(
     '--output', $Output,
     '--calendar-contract', $CalendarContract,
     '--calendar-file-sha256', $CalendarFileSha256,
+    '--session-confirmation-contract', $SessionConfirmationContract,
+    '--session-confirmation-file-sha256', $SessionConfirmationFileSha256,
     '--cutoff-clock', $CutoffClock
 )
 if (-not [string]::IsNullOrWhiteSpace($TestOnlyEnvironmentFixture)) {
