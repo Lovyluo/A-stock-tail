@@ -181,7 +181,7 @@ def test_registry_keeps_three_exchange_sources_candidate_and_cninfo_unqualified(
     assert all(row["qualification_status"] == "unqualified" for row in announcements)
     audit = audit_source_adapters(environ={})
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["network_requests_made"] == 0
     assert audit["data_ready"] is False
     assert audit["candidates"] == audit["tickets"] == audit["orders"] == []

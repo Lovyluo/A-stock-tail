@@ -213,7 +213,7 @@ def test_s1_partial_qualification_record_rejects_provider_key_tampering():
 def test_s1_registry_binds_four_approved_sources_and_retains_cninfo_candidate():
     audit = audit_source_adapters(environ={})
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["s1_partial_qualification_record_hash"] == (
         S1_PARTIAL_QUALIFICATION_RECORD_HASH
     )

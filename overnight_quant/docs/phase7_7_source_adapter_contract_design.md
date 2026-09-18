@@ -1,5 +1,8 @@
 # Phase 7.7 注册表驱动的只读来源适配合同
 
+> S2 扩展：adapter schema v6 登记三个新的东财 candidate provider key。
+> 它们不是生产绑定，完成资格验证并经 PM 批准前，公开执行入口不会调用。
+
 ## 1. 阶段范围
 
 阶段 B2.1 只建立 B1 静态来源注册表与仓库现有 provider 能力之间的离线映射。
@@ -23,7 +26,7 @@ automatic_configuration_change=false
 追溯字段全部兼容”，不表示来源在线、来源已取得正式资格或数据可参与策略评分。当前
 在 B2.2c 阶段只有腾讯 quote/valuation 两项满足这一条件。v0.4.2 固定节点资格通过后，
 分钟线和逐笔也使用独立合同兼容 Provider。S1 部分资格批准后当前
-`bound_count=8`；巨潮与上交所、深交所、北交所公告均为未激活候选，`candidate_count=4`。这里的 `bound`
+`bound_count=8`；巨潮、上交所、深交所、北交所公告及三个 S2 来源均为未激活候选，`candidate_count=7`。这里的 `bound`
 只允许调用方显式注入匹配的只读 Provider envelope，不创建默认网络连接，也不表示来源
 已取得正式资格或数据可参与策略评分。
 
@@ -55,9 +58,9 @@ implementation_status
 - `source_capability_adapter_registry_v6`；
 - B1 registry schema；
 - B1 registry hash；
-- 规范排序后的 28 项适配绑定。
+- 规范排序后的 32 项适配绑定。
 
-生产公共哈希函数不接受调用方自定义条目，只计算固定的完整 28 项矩阵。测试所需的自定义
+生产公共哈希函数不接受调用方自定义条目，只计算固定的完整 32 项矩阵。测试所需的自定义
 子集和换序哈希入口为模块私有函数，不能用于生产授权。输入顺序不影响私有测试哈希，但
 删除一项、增加一项或修改固定绑定即使重新签名，也不能通过生产矩阵校验。
 
@@ -65,7 +68,7 @@ implementation_status
 
 | 字段 | 含义 |
 |---|---|
-| `production_adapter_registry_hash` | 固定 28 项生产矩阵的哈希 |
+| `production_adapter_registry_hash` | 固定 32 项生产矩阵的哈希 |
 | `selection_adapter_registry_hash` | 本次执行实际使用、规范化后的绑定矩阵哈希 |
 | `selection_registry_scope` | 只能为 `production` 或 `test_only` |
 | `adapter_registry_hash` | 兼容字段，固定等于本次 `selection_adapter_registry_hash` |
@@ -78,9 +81,9 @@ scope 为 `production`。
 
 ## 3. 覆盖矩阵
 
-B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。后续阶段将已批准候选移入
-`provider_key` 并保留历史实现。S1 部分批准后 13 项历史实现中有 8 项为 bound、
-巨潮公告为 candidate、4 项仍为 `contract_incompatible`：
+B2.1/B2.2b、公告来源和 S2 为 B1 的全部 32 项能力输出一行。后续阶段将已批准候选移入
+`provider_key` 并保留历史实现。S2 登记后 13 项历史实现中有 8 项为 bound，
+巨潮公告及三个 S2 来源为 candidate，2 项仍为 `contract_incompatible`：
 
 | 能力 | 原始来源 | 适配器 | candidate/legacy provider key | 状态或不兼容原因 |
 |---|---|---|---|---|
@@ -88,8 +91,9 @@ B2.1/B2.2b 为 B1 的全部 28 项能力输出一行。后续阶段将已批准�
 | valuation | 腾讯 | direct_http | `TencentDirectHttpProviders.collect_valuation_records` / `AStockClient._tencent_quotes` | `bound`，只接受显式 envelope |
 | trading_calendar | 腾讯 | direct_http | `StaticSourceProviders.collect_trading_calendar_records` / `collect_trading_calendar` | `bound`，只接受显式 envelope |
 | daily_bar_qfq | 腾讯 | direct_http | `StaticSourceProviders.collect_qfq_daily_records` / `collect_qfq_daily_bars` | `bound`，只接受显式 envelope |
-| industry_snapshot | 东财 | direct_http | `collect_industry` | 需要实例与 observed_at，返回 `ProviderBatch` |
-| fund_flow | 东财 | direct_http | `collect_eastmoney_fund_flow` | 需要实例与 observed_at，返回 `ProviderBatch` |
+| market_breadth | 东财 | direct_http | `EastmoneyMarketSourceProviders.collect_market_breadth_records` | `candidate_not_activated`，unqualified 0/3 |
+| industry_snapshot | 东财 | direct_http | `EastmoneyMarketSourceProviders.collect_industry_records` / `collect_industry` | `candidate_not_activated`，unqualified 0/3 |
+| fund_flow | 东财 | direct_http | `EastmoneyMarketSourceProviders.collect_fund_flow_records` / `collect_eastmoney_fund_flow` | `candidate_not_activated`，unqualified 0/3 |
 | fund_flow | 新浪 | direct_http | `collect_sina_fund_flow` | 返回 proxy `ProviderBatch`，非 B1 batch |
 | global_news | 东财 | direct_http | `StaticSourceProviders.collect_global_news_records` / `collect_global_news` | `bound`，成功零记录合法 |
 | global_news | 财联社 | direct_http | `fetch_cls_telegraph` | 返回普通 list，缺 B1 身份与哈希字段 |
@@ -133,7 +137,7 @@ v0.4.2 固定节点接入后的 Schema v3 哈希为：
 5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5
 ```
 
-官方交易所公告候选登记后的 Schema v6 哈希为：
+官方交易所公告候选独立登记时的历史 Schema v6 哈希为：
 
 ```text
 87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a
@@ -142,6 +146,24 @@ v0.4.2 固定节点接入后的 Schema v3 哈希为：
 对应 capability registry v4 hash 为
 `a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada`。
 
+S2 candidate 独立登记时的历史 Schema v6 哈希为：
+
+```text
+23a8543dc7e4eae4e53a68fec3c2cc58b1cbc585ef35cf79505bf6eca632819e
+```
+
+对应 capability registry v4 hash 为
+`6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585`。
+
+公告与 S2 合并后的当前生产 Schema v6 哈希为：
+
+```text
+7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0
+```
+
+当前 capability registry v4 hash 为
+`92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7`。
+
 ## 4. 失效关闭执行链
 
 `execute_source_adapter()` 的顺序固定为：
@@ -149,7 +171,7 @@ v0.4.2 固定节点接入后的 Schema v3 哈希为：
 1. 校验请求身份完整；
 2. 使用 B1 `route_source_capability(..., require_hard_gate=False)`；
 3. 路由拒绝时不调用 provider；
-4. 核对 28 项适配矩阵中的完整身份和 provider key；
+4. 核对 32 项适配矩阵中的完整身份和 provider key；
 5. 遇到 `candidate_not_activated` 立即返回
    `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED`，不检查或调用候选/历史 provider；
 6. 拒绝裸 callable、错误 envelope 和不匹配的 provider key；
@@ -171,7 +193,7 @@ request_hash, raw_hash
 旧 collector 常用的单一 `source` 字段不会被转换成 `origin_source` 和 `adapter`，而是明确
 拒绝。
 
-生产矩阵当前没有 `bound` 条目，因此不会调用候选或这 13 个旧实现。模块私有测试入口可以
+生产矩阵当前有 8 个显式只读 `bound` 条目，但三个 S2 candidate 仍不会被调用。模块私有测试入口可以
 注入一条合同兼容的测试绑定，用于验证 envelope、provenance 和安全状态；该入口始终为
 `test_only`，不能改变生产矩阵或 hard gate。
 
@@ -179,8 +201,8 @@ request_hash, raw_hash
 
 | 状态 | 含义 |
 |---|---|
-| `SOURCE_ADAPTER_AUDIT_COMPLETE` | 28 项离线矩阵已生成 |
-| `SOURCE_ADAPTER_BOUND` | 完整 envelope 绑定和注入数据均通过；生产矩阵当前为 0 |
+| `SOURCE_ADAPTER_AUDIT_COMPLETE` | 32 项离线矩阵已生成 |
+| `SOURCE_ADAPTER_BOUND` | 完整 envelope 绑定和注入数据均通过；生产矩阵当前为 8 |
 | `SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED` | 合同兼容候选已登记但未启用，provider 未调用 |
 | `SOURCE_ADAPTER_NOT_IMPLEMENTED` | 无实现或已有实现与 B1 合同不兼容 |
 | `SOURCE_ADAPTER_REQUEST_INVALID` | 身份、版本或 provider 参数无效 |

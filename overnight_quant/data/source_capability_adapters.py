@@ -17,6 +17,10 @@ from overnight_quant.data.static_source_qualification import (
     S1_PARTIAL_QUALIFICATION_RECORD_HASH,
     S1_UNQUALIFIED_PROVIDER_KEYS,
 )
+from overnight_quant.data.market_source_providers import (
+    PROVIDER_KEYS as S2_PROVIDER_KEYS,
+    SOURCE_IDENTITIES as S2_SOURCE_IDENTITIES,
+)
 
 
 ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v6"
@@ -27,11 +31,11 @@ PREVIOUS_ADAPTER_REGISTRY_HASH = (
     "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "register_sse_szse_bse_official_announcement_candidates"
+    "combine_s2_market_and_exchange_announcement_candidates"
 )
-EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 31
+EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 32
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada"
+    "92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -229,7 +233,7 @@ _LEGACY_PROVIDER_KEYS = {
         "industry_snapshot",
         "eastmoney",
         "direct_http",
-        "emweb_core+push2_board_v2026-07-30",
+        "push2_stock_industry+board_breadth_v2026-09-18",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_industry"
@@ -238,7 +242,7 @@ _LEGACY_PROVIDER_KEYS = {
         "fund_flow",
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_v2026-07-30",
+        "push2_fflow_kline_v2026-09-18",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_eastmoney_fund_flow"
@@ -353,6 +357,10 @@ _QUALIFIED_SHADOW_PROVIDER_KEYS = {
 _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = dict(
     S1_UNQUALIFIED_PROVIDER_KEYS
 )
+for _capability, _identity_values in S2_SOURCE_IDENTITIES.items():
+    _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS[
+        _identity(_capability, *_identity_values)
+    ] = S2_PROVIDER_KEYS[_capability]
 _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.update(
     {
         _identity(

@@ -72,14 +72,14 @@ and evidence hash, and produces a new non-overwriting derived evidence file.
 ## Registry state
 
 - Capability registry schema: `source_capability_registry_v4`
-- Capability entries: 31
+- Capability entries: 32
 - Capability registry hash:
-  `a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada`
+  `92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7`
 - Adapter registry schema: `source_capability_adapter_registry_v6`
 - Adapter registry hash:
-  `87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a`
+  `7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0`
 - `bound_count=8`
-- `candidate_count=4` (CNINFO plus SSE, SZSE, and BSE)
+- `candidate_count=7` (CNINFO, SSE, SZSE, BSE, and the three S2 market candidates)
 
 The three exchange providers remain `candidate_not_activated / unqualified`.
 Production adapter execution therefore refuses to call them even when an exact

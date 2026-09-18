@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a"
+    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -209,7 +209,7 @@ def test_production_adapter_matrix_exactly_covers_registered_identities():
     capability_registry = get_source_capability_registry()
     adapter_registry = get_source_adapter_registry()
 
-    assert len(capability_registry) == len(adapter_registry) == 31
+    assert len(capability_registry) == len(adapter_registry) == 32
     expected = {
         (
             row["capability"],
@@ -254,9 +254,9 @@ def test_production_registry_has_eight_read_only_bindings_and_13_legacy_entries(
     ]
 
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 4
+    assert audit["candidate_count"] == 7
     assert audit["legacy_implementation_present_count"] == 13
-    assert audit["contract_incompatible_count"] == 4
+    assert audit["contract_incompatible_count"] == 2
     assert len(legacy) == 13
     assert {
         row["implementation_status"] for row in legacy
@@ -775,9 +775,9 @@ def test_audit_is_complete_deterministic_and_safe():
 
     assert first == second
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
-    assert first["adapter_entry_count"] == 31
+    assert first["adapter_entry_count"] == 32
     assert first["bound_count"] == 8
-    assert first["candidate_count"] == 4
+    assert first["candidate_count"] == 7
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
@@ -814,7 +814,7 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
     assert payload["bound_count"] == 8
-    assert payload["candidate_count"] == 4
+    assert payload["candidate_count"] == 7
     _assert_safe(payload, audit=True)
 
 
