@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
+    "87e9fa55448a97857c9de18aa3e460fa55ea01e7a5bde925e342922c14c5964a"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -205,11 +205,11 @@ def _assert_safe(result, *, provider_called=None, audit=False):
         assert result["upstream_network_activity"] == "not_called"
 
 
-def test_production_adapter_matrix_exactly_covers_b1_28_identities():
+def test_production_adapter_matrix_exactly_covers_registered_identities():
     capability_registry = get_source_capability_registry()
     adapter_registry = get_source_adapter_registry()
 
-    assert len(capability_registry) == len(adapter_registry) == 28
+    assert len(capability_registry) == len(adapter_registry) == 31
     expected = {
         (
             row["capability"],
@@ -239,7 +239,7 @@ def test_production_adapter_matrix_exactly_covers_b1_28_identities():
             row["provider_key"],
         ),
     )
-    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v5"
+    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v6"
     assert compute_source_capability_registry_hash() == (
         adapters.EXPECTED_CAPABILITY_REGISTRY_HASH
     )
@@ -254,7 +254,7 @@ def test_production_registry_has_eight_read_only_bindings_and_13_legacy_entries(
     ]
 
     assert audit["bound_count"] == 8
-    assert audit["candidate_count"] == 1
+    assert audit["candidate_count"] == 4
     assert audit["legacy_implementation_present_count"] == 13
     assert audit["contract_incompatible_count"] == 4
     assert len(legacy) == 13
@@ -775,9 +775,9 @@ def test_audit_is_complete_deterministic_and_safe():
 
     assert first == second
     assert first["status"] == SOURCE_ADAPTER_AUDIT_COMPLETE
-    assert first["adapter_entry_count"] == 28
+    assert first["adapter_entry_count"] == 31
     assert first["bound_count"] == 8
-    assert first["candidate_count"] == 1
+    assert first["candidate_count"] == 4
     assert first["adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["production_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
     assert first["selection_adapter_registry_hash"] == ADAPTER_REGISTRY_HASH
@@ -814,7 +814,7 @@ def test_audit_command_is_byte_deterministic_and_does_not_read_secret_environmen
     payload = json.loads(first.decode("utf-8"))
     assert payload["network_requests_made"] == 0
     assert payload["bound_count"] == 8
-    assert payload["candidate_count"] == 1
+    assert payload["candidate_count"] == 4
     _assert_safe(payload, audit=True)
 
 

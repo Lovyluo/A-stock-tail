@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timedelta
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from overnight_quant.data.exchange_announcement_providers import (
+    BSE_ANNOUNCEMENT_URL,
+    BSE_LANDING_URL,
+    EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION,
+    PROVIDER_KEYS,
+    SOURCE_IDENTITIES,
+    SSE_ANNOUNCEMENT_URL,
+    SZSE_ANNOUNCEMENT_URL,
+    ExchangeAnnouncementContractError,
+    ExchangeAnnouncementProviders,
+    ExchangeHttpResponse,
+    replay_exchange_announcement_responses,
+    validate_exchange_announcement_records,
+)
+from overnight_quant.data.market_calendar import CN_TZ
+from overnight_quant.data.source_capability_adapters import (
+    SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED,
+    SourceProviderEnvelope,
+    audit_source_adapters,
+    execute_source_adapter,
+)
+from overnight_quant.data.source_capability_registry import (
+    get_source_capability_registry,
+)
+from overnight_quant.scripts import run_exchange_announcement_evidence_verify as verifier
+from overnight_quant.scripts import run_exchange_announcement_validation as validation
+
+
+CUTOFF = "2026-09-18T14:50:00+08:00"
+
+
+class Clock:
+    def __init__(self, count: int = 40) -> None:
+        base = datetime(2026, 9, 18, 14, 40, tzinfo=CN_TZ)
+        self.values = [
+            base + timedelta(milliseconds=index) for index in range(count)
+        ]
+
+    def __call__(self) -> datetime:
+        return self.values.pop(0)
+
+
+class FakeTransport:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.request_count = 0
+        self.requests = []
+
+    def request(
+        self,
+        method,
+        url,
+        *,
+        params,
+        data,
+        json_body,
+        headers,
+        timeout_seconds,
+    ):
+        self.request_count += 1
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "params": params,
+                "data": data,
+                "json_body": json_body,
+                "headers": dict(headers),
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        value = self.responses.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def response(payload, url, *, content_type="application/json"):
+    raw = payload if isinstance(payload, bytes) else json.dumps(
+        payload, ensure_ascii=False
+    ).encode("utf-8")
+    return ExchangeHttpResponse(raw, 200, url, {"Content-Type": content_type})
+
+
+def sse_payload(code="600000", *, published="2026-09-18"):
+    return {
+        "result": [
+            {
+                "SECURITY_CODE": code,
+                "ORG_BULLETIN_ID": f"SSE-{code}-1",
+                "TITLE": "Official SSE announcement",
+                "SSEDATE": published,
+                "URL": f"/disclosure/listedinfo/announcement/c/new/{code}.pdf",
+            }
+        ]
+    }
+
+
+def szse_payload(code="000001", *, published="2026-09-18 10:00:00"):
+    return {
+        "data": [
+            {
+                "secCode": [code],
+                "id": f"SZSE-{code}-1",
+                "title": "Official SZSE announcement",
+                "publishTime": published,
+                "attachPath": f"/disc/disk03/finalpage/{code}.PDF",
+            }
+        ]
+    }
+
+
+def bse_payload(code="920925", *, published="2026-09-18"):
+    value = [
+        {
+            "listInfo": {
+                "content": [
+                    {
+                        "companyCd": code,
+                        "disclosureCode": f"BSE-{code}-1",
+                        "disclosureTitle": "Official BSE announcement",
+                        "publishDate": published,
+                        "destFilePath": f"/disclosure/{code}.PDF",
+                    }
+                ]
+            }
+        }
+    ]
+    return f"null({json.dumps(value, ensure_ascii=False)})".encode("utf-8")
+
+
+def provider(source, codes, payload):
+    responses = []
+    if source == "bse":
+        responses.append(
+            response(
+                b"<!doctype html><html><body>BSE</body></html>",
+                BSE_LANDING_URL,
+                content_type="text/html; charset=utf-8",
+            )
+        )
+        responses.append(response(payload, BSE_ANNOUNCEMENT_URL))
+    else:
+        url = SSE_ANNOUNCEMENT_URL if source == "sse" else SZSE_ANNOUNCEMENT_URL
+        responses.extend(response(item, url) for item in payload)
+    transport = FakeTransport(responses)
+    instance = ExchangeAnnouncementProviders(
+        codes,
+        feature_cutoff=CUTOFF,
+        transport=transport,
+        clock=Clock(),
+    )
+    return instance, transport
+
+
+def test_registry_keeps_three_exchange_sources_candidate_and_cninfo_unqualified():
+    rows = get_source_capability_registry()
+    announcements = [
+        row for row in rows
+        if row["capability"] == "announcement"
+        and row["adapter"] == "direct_http"
+        and row["origin_source"] in {"cninfo", "sse", "szse", "bse"}
+    ]
+    assert {row["origin_source"] for row in announcements} == {
+        "cninfo", "sse", "szse", "bse"
+    }
+    assert all(row["qualification_status"] == "unqualified" for row in announcements)
+    audit = audit_source_adapters(environ={})
+    assert audit["bound_count"] == 8
+    assert audit["candidate_count"] == 4
+    assert audit["network_requests_made"] == 0
+    assert audit["data_ready"] is False
+    assert audit["candidates"] == audit["tickets"] == audit["orders"] == []
+
+
+@pytest.mark.parametrize(
+    ("source", "codes", "payload", "expected_count"),
+    [
+        ("sse", ("600000", "600519"), [sse_payload("600000"), sse_payload("600519")], 2),
+        ("szse", ("000001", "000333"), [szse_payload("000001"), szse_payload("000333")], 2),
+        ("bse", ("920925",), bse_payload(), 1),
+    ],
+)
+def test_official_sources_emit_complete_single_origin_records(
+    source, codes, payload, expected_count
+):
+    instance, transport = provider(source, codes, payload)
+    batch = getattr(instance, f"collect_{source}_batch")()
+    assert len(batch.records) == expected_count
+    assert {row["origin_source"] for row in batch.records} == {source}
+    assert all(row["capability"] == "announcement" for row in batch.records)
+    contract = validate_exchange_announcement_records(
+        source, batch.records, feature_cutoff=CUTOFF, codes=codes
+    )
+    assert contract["valid"] is True
+    assert transport.request_count == expected_count + (1 if source == "bse" else 0)
+    if source == "bse":
+        assert ("needFields[]", "disclosureCode") in transport.requests[-1]["data"]
+        assert "Cookie" not in transport.requests[-1]["headers"]
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [("sse", "000001"), ("szse", "600000"), ("bse", "600000")],
+)
+def test_exchange_route_mismatch_fails_before_network(source, code):
+    instance, transport = provider(source, (code,), [] if source != "bse" else b"")
+    with pytest.raises(ExchangeAnnouncementContractError, match="ROUTE_MISMATCH"):
+        getattr(instance, f"collect_{source}_batch")()
+    assert transport.request_count == 0
+
+
+def test_cross_exchange_response_and_missing_time_fail_closed():
+    mismatch, _ = provider("sse", ("600000",), [sse_payload("600519")])
+    with pytest.raises(ExchangeAnnouncementContractError, match="CODE_MISMATCH"):
+        mismatch.collect_sse_batch()
+
+    missing = sse_payload()
+    del missing["result"][0]["SSEDATE"]
+    invalid, _ = provider("sse", ("600000",), [missing])
+    with pytest.raises(ExchangeAnnouncementContractError, match="TIME_INVALID"):
+        invalid.collect_sse_batch()
+
+
+def test_after_cutoff_is_filtered_and_zero_result_is_legal():
+    instance, _ = provider(
+        "szse",
+        ("000001",),
+        [szse_payload(published="2026-09-18 15:00:00")],
+    )
+    batch = instance.collect_szse_batch()
+    assert batch.status == "AVAILABLE_EMPTY"
+    assert batch.records == ()
+    contract = validate_exchange_announcement_records(
+        "szse", [], feature_cutoff=CUTOFF, codes=("000001",)
+    )
+    assert contract["valid"] is True
+
+
+def test_nonofficial_document_url_and_html_api_fail_closed():
+    payload = sse_payload()
+    payload["result"][0]["URL"] = "https://example.com/fake.pdf"
+    invalid, _ = provider("sse", ("600000",), [payload])
+    with pytest.raises(ExchangeAnnouncementContractError, match="DOCUMENT_URL_INVALID"):
+        invalid.collect_sse_batch()
+
+    html = ExchangeAnnouncementProviders(
+        ("600000",),
+        feature_cutoff=CUTOFF,
+        transport=FakeTransport(
+            [response(b"<html>blocked</html>", SSE_ANNOUNCEMENT_URL, content_type="text/html")]
+        ),
+        clock=Clock(),
+    )
+    with pytest.raises(ExchangeAnnouncementContractError, match="HTML_RESPONSE_REJECTED"):
+        html.collect_sse_batch()
+
+
+def test_input_order_does_not_change_records_or_hashes():
+    forward, _ = provider(
+        "sse", ("600000", "600519"), [sse_payload("600000"), sse_payload("600519")]
+    )
+    reverse, _ = provider(
+        "sse", ("600519", "600000"), [sse_payload("600000"), sse_payload("600519")]
+    )
+    assert forward.collect_sse_records() == reverse.collect_sse_records()
+
+
+def test_candidate_provider_is_never_called_from_production_adapter():
+    called = 0
+
+    def candidate_provider():
+        nonlocal called
+        called += 1
+        return []
+
+    source_version = SOURCE_IDENTITIES["sse"][2]
+    result = execute_source_adapter(
+        "announcement",
+        origin_source="sse",
+        adapter="direct_http",
+        source_version=source_version,
+        provider_envelope=SourceProviderEnvelope(
+            PROVIDER_KEYS["sse"], candidate_provider
+        ),
+        environ={},
+    )
+    assert result["status"] == SOURCE_ADAPTER_CANDIDATE_NOT_ACTIVATED
+    assert result["provider_called"] is False
+    assert called == 0
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
+def test_offline_validation_makes_no_network_request():
+    result = validation.run_exchange_announcement_validation(
+        network=False,
+        source="sse",
+        trade_date="2026-09-18",
+    )
+    assert result["network_requests_made"] == 0
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
+def test_evidence_replay_detects_raw_tampering_and_is_deterministic(tmp_path, monkeypatch):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(verifier, "CACHE_ROOT", tmp_path)
+    transport = FakeTransport([response(sse_payload(), SSE_ANNOUNCEMENT_URL)])
+    evidence = validation.run_exchange_announcement_validation(
+        network=True,
+        source="sse",
+        trade_date="2026-09-18",
+        codes=("600000",),
+        output="sse.json",
+        transport=transport,
+        clock=Clock(),
+    )
+    raw = (tmp_path / "sse.json").read_bytes()
+    file_hash = hashlib.sha256(raw).hexdigest()
+    first = verifier.verify_file(
+        tmp_path / "sse.json", expected_file_sha256=file_hash
+    )
+    second = verifier.verify_file(
+        tmp_path / "sse.json", expected_file_sha256=file_hash
+    )
+    assert first == second
+    assert first["status"] == verifier.EVIDENCE_VERIFIED
+    assert evidence["evidence_schema_version"] == (
+        EXCHANGE_ANNOUNCEMENT_EVIDENCE_SCHEMA_VERSION
+    )
+
+    tampered = deepcopy(evidence)
+    tampered["raw_responses"][0]["raw_hash"] = "f" * 64
+    tampered["evidence_hash"] = validation.compute_evidence_hash(tampered)
+    rejected = verifier.verify_exchange_announcement_evidence(
+        tampered, expected_file_sha256="a" * 64
+    )
+    assert rejected["status"] == verifier.EVIDENCE_INVALID
+
+
+def test_atomic_evidence_write_never_overwrites(tmp_path, monkeypatch):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path)
+    target = validation.write_json_atomic("evidence.json", {"value": 1})
+    before = target.read_bytes()
+    with pytest.raises(FileExistsError):
+        validation.write_json_atomic("evidence.json", {"value": 2})
+    assert target.read_bytes() == before
+
+
+def test_replay_rejects_wrong_origin_and_preserves_safe_output():
+    instance, _ = provider("sse", ("600000",), [sse_payload()])
+    batch = instance.collect_sse_batch()
+    response_row = dict(batch.responses[0])
+    response_row["response_url"] = "https://www.szse.cn/api/fake"
+    records, errors = replay_exchange_announcement_responses(
+        "sse", [response_row], feature_cutoff=CUTOFF, codes=("600000",)
+    )
+    assert records == []
+    assert "0:response_contract_invalid" in errors

@@ -19,19 +19,19 @@ from overnight_quant.data.static_source_qualification import (
 )
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v5"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v6"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v4"
+    "source_capability_adapter_registry_v5"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "5596301dc27041f79bde85a8987526e6beb5970a7eb5386a2928df9b7e2452b5"
+    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "activate_pm_approved_s1_sources_and_retain_cninfo_unqualified_candidate"
+    "register_sse_szse_bse_official_announcement_candidates"
 )
-EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 28
+EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 31
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "4f63ab273dc8cc98363d7043a47fad10f6dcb002a006a4c88cab118c3ff4ecb5"
+    "a5ff522cb0f26464754c1c3f69af39f65d55083dcbbe49d3af20d1201049fada"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -352,6 +352,37 @@ _QUALIFIED_SHADOW_PROVIDER_KEYS = {
 
 _STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS = dict(
     S1_UNQUALIFIED_PROVIDER_KEYS
+)
+_STATIC_SOURCE_CANDIDATE_PROVIDER_KEYS.update(
+    {
+        _identity(
+            "announcement",
+            "sse",
+            "direct_http",
+            "sse_query_company_bulletin_new_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_sse_records"
+        ),
+        _identity(
+            "announcement",
+            "szse",
+            "direct_http",
+            "szse_ann_list_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_szse_records"
+        ),
+        _identity(
+            "announcement",
+            "bse",
+            "direct_http",
+            "bse_company_announcement_v2026-09-18",
+        ): (
+            "exchange_announcement_providers.ExchangeAnnouncementProviders."
+            "collect_bse_records"
+        ),
+    }
 )
 
 
