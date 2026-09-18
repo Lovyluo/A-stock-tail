@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 import os
@@ -20,11 +20,22 @@ from overnight_quant.data.market_source_go_nogo import (
     run_market_source_go_nogo,
     verify_market_source_go_nogo_evidence,
 )
+from overnight_quant.data.market_session_confirmation import (
+    build_market_session_confirmation,
+)
 from overnight_quant.data.static_source_qualification import (
     S1_PARTIAL_QUALIFICATION_RECORD_HASH,
 )
 from overnight_quant.data.source_capability_adapters import (
+    compute_source_adapter_registry_hash,
     get_source_adapter_registry,
+)
+from overnight_quant.data.tencent_direct_http_providers import (
+    TENCENT_ADAPTER,
+    TENCENT_ORIGIN_SOURCE,
+    TENCENT_QUOTE_PROVIDER_KEY,
+    TENCENT_SOURCE_VERSION,
+    compute_tencent_request_hash,
 )
 from overnight_quant.scripts import run_market_source_validation as validation
 
@@ -37,14 +48,72 @@ FIXED_CODES = "000001,000333,600000,600519,601318"
 
 
 def _calendar() -> dict:
+    target = date.fromisoformat(TRADE_DATE)
+    days = []
+    cursor = target - timedelta(days=1)
+    while len(days) < 65:
+        if cursor.weekday() < 5:
+            days.append(cursor.isoformat())
+        cursor -= timedelta(days=1)
+    days.reverse()
     return {
         "source": "tencent",
         "source_version": "ifzq_fqkline_day_v2026-07-30",
         "raw_hash": "a" * 64,
-        "trade_dates": [TRADE_DATE],
+        "trade_dates": days,
+        "latest_completed_trade_date": days[-1],
         "qualification_record_hash": S1_PARTIAL_QUALIFICATION_RECORD_HASH,
         "qualification_status": "qualified",
     }
+
+
+def _confirmation(*, trade_date=TRADE_DATE, codes=None) -> dict:
+    selected = tuple(codes or FIXED_CODES.split(","))
+    request_hash = compute_tencent_request_hash(FIXED_CODES.split(","))
+    records = [
+        {
+            "capability": "quote",
+            "origin_source": TENCENT_ORIGIN_SOURCE,
+            "adapter": TENCENT_ADAPTER,
+            "source_version": TENCENT_SOURCE_VERSION,
+            "event_time": f"{trade_date}T10:00:00+08:00",
+            "observed_at": f"{trade_date}T10:00:01+08:00",
+            "available_at": f"{trade_date}T10:00:01.100000+08:00",
+            "request_hash": request_hash,
+            "raw_hash": "b" * 64,
+            "payload": {"code": code, "price": 10.0},
+        }
+        for code in selected
+    ]
+    binding = next(
+        row
+        for row in get_source_adapter_registry()
+        if row["capability"] == "quote" and row["origin_source"] == "tencent"
+    )
+    registry_hash = compute_source_adapter_registry_hash()
+    adapter_execution = {
+        "status": "SOURCE_ADAPTER_BOUND",
+        "execution_ok": True,
+        "provider_called": True,
+        "selection_registry_scope": "production",
+        "production_adapter_registry_hash": registry_hash,
+        "selection_adapter_registry_hash": registry_hash,
+        "requested_identity": [
+            "quote",
+            TENCENT_ORIGIN_SOURCE,
+            TENCENT_ADAPTER,
+            TENCENT_SOURCE_VERSION,
+        ],
+        "binding": binding,
+    }
+    return build_market_session_confirmation(
+        trade_date=trade_date,
+        records=records,
+        provider_key=TENCENT_QUOTE_PROVIDER_KEY,
+        adapter_execution=adapter_execution,
+        started_at=f"{trade_date}T10:00:00+08:00",
+        completed_at=f"{trade_date}T10:00:02+08:00",
+    )
 
 
 def _environment(**changes) -> dict:
@@ -75,16 +144,28 @@ def _environment(**changes) -> dict:
     return value
 
 
-def _run_ps(tmp_path: Path, environment: dict, *, calendar=None, output=None):
+def _run_ps(
+    tmp_path: Path,
+    environment: dict,
+    *,
+    calendar=None,
+    confirmation=None,
+    output=None,
+):
     if POWERSHELL is None:
         pytest.skip("PowerShell is required for behavior tests")
     output = output or tmp_path / "go_nogo.json"
     calendar_path = tmp_path / "calendar.json"
+    confirmation_path = tmp_path / "confirmation.json"
     fixture_path = tmp_path / "environment.json"
     calendar_bytes = json.dumps(
         calendar or _calendar(), ensure_ascii=False, sort_keys=True
     ).encode("utf-8")
     calendar_path.write_bytes(calendar_bytes)
+    confirmation_bytes = json.dumps(
+        confirmation or _confirmation(), ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")
+    confirmation_path.write_bytes(confirmation_bytes)
     fixture_path.write_text(
         json.dumps(environment, ensure_ascii=False, sort_keys=True), encoding="utf-8"
     )
@@ -106,6 +187,10 @@ def _run_ps(tmp_path: Path, environment: dict, *, calendar=None, output=None):
         str(calendar_path),
         "-CalendarFileSha256",
         hashlib.sha256(calendar_bytes).hexdigest(),
+        "-SessionConfirmationContract",
+        str(confirmation_path),
+        "-SessionConfirmationFileSha256",
+        hashlib.sha256(confirmation_bytes).hexdigest(),
         "-Codes",
         FIXED_CODES,
         "-CutoffClock",
@@ -154,7 +239,15 @@ def test_powershell_normal_environment_writes_sampling_go(tmp_path):
     _assert_safe(payload)
     anchor = file_sha256(output)
     verified = verify_market_source_go_nogo_evidence(
-        payload, expected_file_sha256=anchor, actual_file_sha256=anchor
+        payload,
+        expected_file_sha256=anchor,
+        actual_file_sha256=anchor,
+        completed_calendar_contract=_calendar(),
+        completed_calendar_expected_file_sha256=_json_sha(_calendar()),
+        completed_calendar_actual_file_sha256=_json_sha(_calendar()),
+        current_session_confirmation_contract=_confirmation(),
+        current_session_expected_file_sha256=_json_sha(_confirmation()),
+        current_session_actual_file_sha256=_json_sha(_confirmation()),
     )
     assert verified["evidence_integrity_verified"] is True
 
@@ -164,6 +257,11 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
         trade_date=TRADE_DATE,
         codes=FIXED_CODES.split(","),
         calendar_contract=_calendar(),
+        calendar_expected_file_sha256=_json_sha(_calendar()),
+        calendar_actual_file_sha256=_json_sha(_calendar()),
+        session_confirmation_contract=_confirmation(),
+        session_expected_file_sha256=_json_sha(_confirmation()),
+        session_actual_file_sha256=_json_sha(_confirmation()),
         environment=_environment(),
         started_at=f"{TRADE_DATE}T12:29:59+08:00",
         completed_at=f"{TRADE_DATE}T12:30:01+08:00",
@@ -205,15 +303,20 @@ def test_environment_fixture_is_rejected_without_test_mode(tmp_path):
         pytest.skip("PowerShell is required for behavior tests")
     output = tmp_path / "go_nogo.json"
     calendar_path = tmp_path / "calendar.json"
+    confirmation_path = tmp_path / "confirmation.json"
     fixture_path = tmp_path / "environment.json"
     calendar_bytes = json.dumps(_calendar(), sort_keys=True).encode("utf-8")
+    confirmation_bytes = json.dumps(_confirmation(), sort_keys=True).encode("utf-8")
     calendar_path.write_bytes(calendar_bytes)
+    confirmation_path.write_bytes(confirmation_bytes)
     fixture_path.write_text(json.dumps(_environment()), encoding="utf-8")
     command = [
         POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", str(SCRIPT), "-Date", TRADE_DATE, "-ProjectRoot", str(ROOT),
         "-Output", str(output), "-CalendarContract", str(calendar_path),
         "-CalendarFileSha256", hashlib.sha256(calendar_bytes).hexdigest(),
+        "-SessionConfirmationContract", str(confirmation_path),
+        "-SessionConfirmationFileSha256", hashlib.sha256(confirmation_bytes).hexdigest(),
         "-TestOnlyEnvironmentFixture", str(fixture_path), "-PythonExe", sys.executable,
     ]
     environment_vars = dict(os.environ)
@@ -252,11 +355,15 @@ def test_powershell_environment_failures_are_no_go(tmp_path, changes, reason):
 
 def test_powershell_non_trading_day_is_no_go(tmp_path):
     calendar = _calendar()
-    calendar["trade_dates"] = ["2026-09-17"]
-    completed, payload, _ = _run_ps(tmp_path, _environment(), calendar=calendar)
+    completed, payload, _ = _run_ps(
+        tmp_path,
+        _environment(),
+        confirmation=_confirmation(trade_date="2026-09-17"),
+        calendar=calendar,
+    )
     assert completed.returncode == 2
     assert payload["status"] == NO_GO
-    assert "trusted_trading_day" in payload["failure_reasons"]
+    assert "current_session_confirmation_contract" in payload["failure_reasons"]
     _assert_safe(payload)
 
 
@@ -309,12 +416,33 @@ def test_resigned_tampering_and_wrong_external_anchor_are_rejected(tmp_path):
     from overnight_quant.data.market_source_go_nogo import compute_go_nogo_evidence_hash
     tampered["go_nogo_evidence_hash"] = compute_go_nogo_evidence_hash(tampered)
     result = verify_market_source_go_nogo_evidence(
-        tampered, expected_file_sha256=anchor, actual_file_sha256=anchor
+        tampered,
+        expected_file_sha256=anchor,
+        actual_file_sha256=anchor,
+        completed_calendar_contract=_calendar(),
+        completed_calendar_expected_file_sha256=_json_sha(_calendar()),
+        completed_calendar_actual_file_sha256=_json_sha(_calendar()),
+        current_session_confirmation_contract=_confirmation(),
+        current_session_expected_file_sha256=_json_sha(_confirmation()),
+        current_session_actual_file_sha256=_json_sha(_confirmation()),
     )
     assert result["evidence_integrity_verified"] is False
     assert "status_mismatch" in result["errors"]
     wrong = verify_market_source_go_nogo_evidence(
-        payload, expected_file_sha256="f" * 64, actual_file_sha256=anchor
+        payload,
+        expected_file_sha256="f" * 64,
+        actual_file_sha256=anchor,
+        completed_calendar_contract=_calendar(),
+        completed_calendar_expected_file_sha256=_json_sha(_calendar()),
+        completed_calendar_actual_file_sha256=_json_sha(_calendar()),
+        current_session_confirmation_contract=_confirmation(),
+        current_session_expected_file_sha256=_json_sha(_confirmation()),
+        current_session_actual_file_sha256=_json_sha(_confirmation()),
     )
     assert wrong["evidence_integrity_verified"] is False
     assert "external_sha256_anchor_mismatch" in wrong["errors"]
+
+
+def _json_sha(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()

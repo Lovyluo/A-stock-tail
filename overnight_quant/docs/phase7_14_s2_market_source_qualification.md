@@ -60,13 +60,15 @@ day.
 ## Independent Go/No-Go evidence
 
 `run_market_source_go_nogo.ps1` is a pre-sampling environment gate. It does not
-request or require 14:50 formal records. It checks a SHA-anchored Tencent
-trading-calendar contract, China Standard Time and clock skew, the exact five
-codes, the three candidate identities and source versions, DNS/TLS/official
-endpoint reachability, applicable proxy-listener readiness, output
-writability and immutability, and the absence of residual workers, duplicate
-tasks, or similar collectors. The current time must not be later than the
-configured cutoff.
+request or require 14:50 formal records. Evidence v2 requires two independently
+anchored contracts: the S1 Tencent calendar still contains completed dates
+strictly before the target day, while a separate Tencent quote confirmation
+proves that all five fixed stocks have current-day events after the morning
+session opened. It also checks China Standard Time and clock skew, the three
+candidate identities and source versions, DNS/TLS/official endpoint
+reachability, applicable proxy-listener readiness, output writability and
+immutability, and the absence of residual workers, duplicate tasks, or similar
+collectors. The current time must not be later than the configured cutoff.
 
 The result is strict UTF-8 JSON created atomically without overwrite. A
 separate verifier requires the external file SHA-256. Evidence integrity and
@@ -79,8 +81,11 @@ leaves the day unqualified.
 Environment fixtures are accepted only behind an explicit test-mode process
 guard. Their evidence is marked `test_only` and cannot authorize a production
 sample. Production calendar checks must also reference the approved S1 partial
-qualification record; a self-signed calendar file and caller-supplied file
-hash are not sufficient on their own.
+qualification record. The current-session confirmation must use the bound
+Tencent quote provider and exact production envelope. Both input files require
+external SHA-256 anchors; self-signed files are not sufficient. Legacy v1
+Go/No-Go evidence remains verifiable for audit, but can never authorize a new
+sample.
 
 ## Qualification gate
 

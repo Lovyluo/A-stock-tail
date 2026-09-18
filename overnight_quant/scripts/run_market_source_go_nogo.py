@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--calendar-contract", required=True)
     parser.add_argument("--calendar-file-sha256", required=True)
+    parser.add_argument("--session-confirmation-contract", required=True)
+    parser.add_argument("--session-confirmation-file-sha256", required=True)
     parser.add_argument("--cutoff-clock", default="13:30:00")
     parser.add_argument("--test-only-environment-fixture")
     args = parser.parse_args(argv)
@@ -37,9 +39,12 @@ def main(argv: list[str] | None = None) -> int:
         calendar_path = Path(args.calendar_contract).resolve()
         raw_calendar = calendar_path.read_bytes()
         import hashlib
-        if hashlib.sha256(raw_calendar).hexdigest() != args.calendar_file_sha256:
-            raise ValueError("calendar_external_sha256_mismatch")
+        calendar_actual_sha256 = hashlib.sha256(raw_calendar).hexdigest()
         calendar = json.loads(raw_calendar.decode("utf-8"))
+        confirmation_path = Path(args.session_confirmation_contract).resolve()
+        raw_confirmation = confirmation_path.read_bytes()
+        confirmation_actual_sha256 = hashlib.sha256(raw_confirmation).hexdigest()
+        confirmation = json.loads(raw_confirmation.decode("utf-8"))
         if args.test_only_environment_fixture:
             if os.environ.get("A_STOCK_GO_NOGO_TEST_MODE") != "1":
                 raise ValueError("test_only_environment_fixture_forbidden")
@@ -58,6 +63,13 @@ def main(argv: list[str] | None = None) -> int:
             codes=args.codes.split(","),
             cutoff_clock=args.cutoff_clock,
             calendar_contract=calendar,
+            calendar_expected_file_sha256=args.calendar_file_sha256,
+            calendar_actual_file_sha256=calendar_actual_sha256,
+            session_confirmation_contract=confirmation,
+            session_expected_file_sha256=(
+                args.session_confirmation_file_sha256
+            ),
+            session_actual_file_sha256=confirmation_actual_sha256,
             environment=environment,
             started_at=started.isoformat(timespec="microseconds"),
             completed_at=completed.isoformat(timespec="microseconds"),
