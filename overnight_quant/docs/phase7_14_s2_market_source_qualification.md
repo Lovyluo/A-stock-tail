@@ -57,6 +57,31 @@ SHA-256 and reconstructs all normalized records from captured raw bytes.
 Failure evidence can pass integrity verification, but cannot become a qualified
 day.
 
+## Independent Go/No-Go evidence
+
+`run_market_source_go_nogo.ps1` is a pre-sampling environment gate. It does not
+request or require 14:50 formal records. It checks a SHA-anchored Tencent
+trading-calendar contract, China Standard Time and clock skew, the exact five
+codes, the three candidate identities and source versions, DNS/TLS/official
+endpoint reachability, applicable proxy-listener readiness, output
+writability and immutability, and the absence of residual workers, duplicate
+tasks, or similar collectors. The current time must not be later than the
+configured cutoff.
+
+The result is strict UTF-8 JSON created atomically without overwrite. A
+separate verifier requires the external file SHA-256. Evidence integrity and
+sampling authorization are intentionally separate: `SAMPLING_GO` only permits
+one qualification sample attempt and never changes the consecutive-day count.
+Any failed check produces `NO_GO_FOR_QUALIFICATION_SAMPLE`; neither result
+creates or enables a scheduled task. A later formal collection failure still
+leaves the day unqualified.
+
+Environment fixtures are accepted only behind an explicit test-mode process
+guard. Their evidence is marked `test_only` and cannot authorize a production
+sample. Production calendar checks must also reference the approved S1 partial
+qualification record; a self-signed calendar file and caller-supplied file
+hash are not sufficient on their own.
+
 ## Qualification gate
 
 Each qualifying day must have all three providers complete before the deadline,
@@ -84,3 +109,9 @@ candidates=[]
 tickets=[]
 orders=[]
 ```
+
+The independent S2 work remains blocked from combined registry integration
+until the separate official-announcement PR is approved and merged. After
+that merge, this branch must merge `main` normally, recompute the combined
+production hashes, and verify the expected 32 entries, 8 bound entries, and 7
+candidates. No future combined hash is hard-coded here.
