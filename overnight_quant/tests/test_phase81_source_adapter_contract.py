@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
+    "c37bea0068fa1f9d8a448307d8aac360bab9ddc23d30bf0f708d50479d93878d"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",

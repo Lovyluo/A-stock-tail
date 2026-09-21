@@ -19,9 +19,12 @@ days.
 ## Field contracts
 
 The market record uses `origin_source=eastmoney` for both components. The fixed
-benchmark is SSE Composite (`secid=1.000001`). The all-A stock pool is
-`m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23` and is versioned as
-`eastmoney_all_a_m0t6_80_m1t2_23_v1`.
+benchmark is SSE Composite (`secid=1.000001`). Market breadth uses Eastmoney
+index breadth counters for SSE Composite, SZSE Component, and BSE 50
+(`secids=1.000001,0.399001,0.899050`), versioned as
+`eastmoney_index_breadth_sh_sz_bj_v2026-09-21`. The clist endpoint currently
+caps returned rows even when a larger `pz` is requested, so it is not used to
+pretend a first page is the full stock pool.
 
 ```text
 valid_count = up_count + down_count + flat_count
@@ -36,7 +39,11 @@ with Eastmoney breadth.
 Industry mapping and industry breadth both use the Eastmoney industry
 classification `eastmoney_industry_m90t2_v1`. Every fixed stock must map by an
 exact industry name to one board row. Industry breadth uses the same count
-formula as market breadth.
+formula as market breadth. The industry board update time is the formal event
+time for breadth. The stock-to-industry mapping is a static classification
+observed before the collection deadline; its quote update timestamp is retained
+for audit, but it cannot move a valid 14:50 board breadth record into a later
+decision minute.
 
 Fund-flow values are denominated in CNY. Each row describes one minute interval
 (`value_semantics=minute_interval_net_flow`,

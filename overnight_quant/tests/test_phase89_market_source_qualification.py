@@ -13,6 +13,7 @@ from overnight_quant.data.market_source_providers import (
     EASTMONEY_CLIST_URL,
     EASTMONEY_FUND_FLOW_URL,
     EASTMONEY_STOCK_URL,
+    EASTMONEY_ULIST_URL,
     FIXED_CODES,
     INDUSTRY_CLASSIFICATION_VERSION,
     MARKET_STOCK_POOL_VERSION,
@@ -50,6 +51,8 @@ TRADE_DATE = "2026-09-18"
 CUTOFF = "2026-09-18T14:50:00+08:00"
 DEADLINE = "2026-09-18T14:51:05+08:00"
 EVENT_TS = int(datetime(2026, 9, 18, 14, 50, tzinfo=CN_TZ).timestamp())
+EVENT_TS_PLUS_SECONDS = int(datetime(2026, 9, 18, 14, 50, 5, tzinfo=CN_TZ).timestamp())
+EVENT_TS_AFTER_CUTOFF_MINUTE = int(datetime(2026, 9, 18, 14, 51, tzinfo=CN_TZ).timestamp())
 
 
 class FakeTransport:
@@ -86,14 +89,16 @@ def response(payload, url=EASTMONEY_CLIST_URL):
 
 def market_responses(*, incomplete=False, invalid_total=False):
     rows = [
-        {"f12": f"{index:06d}", "f3": change, "f124": EVENT_TS}
-        for index, change in enumerate((1, -1, 0, 2, -2), 1)
+        {"f12": "000001", "f14": "上证指数", "f3": 1.2, "f104": 2, "f105": 1, "f106": 0, "f124": EVENT_TS_PLUS_SECONDS},
+        {"f12": "399001", "f14": "深证成指", "f3": 0.8, "f104": 3, "f105": 1, "f106": 1, "f124": EVENT_TS},
+        {"f12": "899050", "f14": "北证50", "f3": 0.5, "f104": 1, "f105": 1, "f106": 0, "f124": EVENT_TS},
     ]
-    total = 6 if incomplete else len(rows)
+    if incomplete:
+        rows = rows[:-1]
     if invalid_total:
-        rows[0]["f3"] = "-"
+        rows[0]["f104"] = "-"
     return [
-        response({"data": {"total": total, "diff": rows}}),
+        response({"data": {"diff": rows}}, EASTMONEY_ULIST_URL),
         response(
             {"data": {"f3": 0.42, "f57": "000001", "f58": "上证指数", "f86": EVENT_TS}},
             EASTMONEY_STOCK_URL,
@@ -101,13 +106,14 @@ def market_responses(*, incomplete=False, invalid_total=False):
     ]
 
 
-def industry_responses(*, missing_mapping=False):
+def industry_responses(*, missing_mapping=False, mapping_after_cutoff=False, board_after_cutoff=False):
     industries = ["银行", "家电", "银行", "白酒", "保险"]
     boards = []
     for index, name in enumerate(sorted(set(industries)), 1):
         boards.append({
             "f12": f"BK{index:04d}", "f14": name, "f3": 1.2,
-            "f104": 6, "f105": 3, "f106": 1, "f124": EVENT_TS,
+            "f104": 6, "f105": 3, "f106": 1,
+            "f124": EVENT_TS_AFTER_CUTOFF_MINUTE if board_after_cutoff else EVENT_TS_PLUS_SECONDS,
         })
     values = [response({"data": {"total": len(boards), "diff": boards}})]
     for code, name in zip(FIXED_CODES, industries):
@@ -115,7 +121,7 @@ def industry_responses(*, missing_mapping=False):
             "f57": code,
             "f58": code,
             "f127": "不存在行业" if missing_mapping and code == FIXED_CODES[0] else name,
-            "f86": EVENT_TS,
+            "f86": EVENT_TS_PLUS_SECONDS if mapping_after_cutoff else EVENT_TS,
         }}, EASTMONEY_STOCK_URL))
     return values
 
@@ -190,10 +196,12 @@ def test_market_breadth_uses_full_pool_counts_and_eastmoney_index():
     assert len(batch.records) == 1
     payload = batch.records[0]["payload"]
     assert payload["stock_pool_version"] == MARKET_STOCK_POOL_VERSION
-    assert payload["total_count"] == 5
-    assert payload["valid_count"] == 5
-    assert payload["breadth_ratio"] == pytest.approx(2 / 5)
+    assert payload["stock_pool_scope"] == "sse+szse+bse_index_breadth_counts"
+    assert payload["total_count"] == 10
+    assert payload["valid_count"] == 10
+    assert payload["breadth_ratio"] == pytest.approx(6 / 10)
     assert payload["index_change_pct"] == 0.42
+    assert batch.records[0]["event_time"] == CUTOFF
     assert batch.records[0]["origin_source"] == "eastmoney"
     assert validate_market_source_records("market_breadth", batch.records)["valid"]
 
@@ -204,12 +212,21 @@ def test_market_stock_pool_incomplete_fails_closed():
 
 
 def test_industry_mapping_and_breadth_share_one_classification():
-    batch = provider(industry_responses()).collect_industry_batch()
+    batch = provider(industry_responses(mapping_after_cutoff=True)).collect_industry_batch()
     assert {row["payload"]["code"] for row in batch.records} == set(FIXED_CODES)
     assert {row["payload"]["classification_version"] for row in batch.records} == {
         INDUSTRY_CLASSIFICATION_VERSION
     }
+    assert {row["event_time"] for row in batch.records} == {CUTOFF}
+    assert {
+        row["payload"]["mapping_time_semantics"] for row in batch.records
+    } == {"static_classification_observed_before_deadline"}
     assert validate_market_source_records("industry_snapshot", reversed(batch.records))["valid"]
+
+
+def test_industry_board_event_after_cutoff_minute_fails_closed():
+    with pytest.raises(MarketSourceContractError, match="INDUSTRY_EVENT_AFTER_CUTOFF"):
+        provider(industry_responses(board_after_cutoff=True)).collect_industry_batch()
 
 
 def test_industry_mapping_mismatch_rejects_whole_batch():

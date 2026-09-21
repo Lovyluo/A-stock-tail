@@ -354,7 +354,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "market_breadth",
-        "push2_all_a_breadth+sse_index_v2026-09-18",
+        "push2_index_breadth+sse_index_v2026-09-21",
         True,
         "unqualified",
         "0/3",
