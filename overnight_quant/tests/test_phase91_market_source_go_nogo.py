@@ -12,6 +12,7 @@ import sys
 
 import pytest
 
+import overnight_quant.data.market_source_go_nogo as go_nogo
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_go_nogo import (
     NO_GO,
@@ -271,6 +272,24 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
     assert result["sampling_authorized"] is True
     assert result["qualification_result"] == "NOT_EVALUATED"
     _assert_safe(result)
+
+
+def test_task_inventory_allows_windows_cold_start_beyond_three_seconds(monkeypatch):
+    observed = {}
+
+    def fake_check_output(command, *, text, timeout):
+        observed.update(command=command, text=text, timeout=timeout)
+        return "AStockMarketSource-Zeta\nAStockMarketSource-Alpha\n"
+
+    monkeypatch.setattr(go_nogo.os, "name", "nt")
+    monkeypatch.setattr(go_nogo.subprocess, "check_output", fake_check_output)
+
+    assert go_nogo._matching_tasks() == [
+        "AStockMarketSource-Alpha",
+        "AStockMarketSource-Zeta",
+    ]
+    assert observed["timeout"] == go_nogo.TASK_INVENTORY_TIMEOUT_SECONDS
+    assert observed["timeout"] > 3
 
 
 def test_combined_candidates_keep_announcements_outside_s2_gate():

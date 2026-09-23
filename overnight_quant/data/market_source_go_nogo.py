@@ -43,6 +43,7 @@ NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
 DEFAULT_CUTOFF_CLOCK = "13:30:00"
 MAX_CLOCK_SKEW_MS = 2_000
+TASK_INVENTORY_TIMEOUT_SECONDS = 10.0
 OFFICIAL_ENDPOINTS = {
     "market_breadth": "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&fs=m%3A0%2Bt%3A6&fields=f12",
     "industry_snapshot": "https://push2.eastmoney.com/api/qt/stock/get?secid=0.000001&fields=f57%2Cf127",
@@ -698,7 +699,11 @@ def _matching_tasks() -> list[str]:
         return []
     script = "Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'AStockMarketSource*' } | Select-Object -ExpandProperty TaskName"
     try:
-        raw = subprocess.check_output(["powershell.exe", "-NoProfile", "-Command", script], text=True, timeout=3)
+        raw = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            text=True,
+            timeout=TASK_INVENTORY_TIMEOUT_SECONDS,
+        )
         return sorted(line.strip() for line in raw.splitlines() if line.strip())
     except Exception:
         return ["task_inventory_failed"]
