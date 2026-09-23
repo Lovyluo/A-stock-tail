@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -290,6 +291,39 @@ def test_task_inventory_allows_windows_cold_start_beyond_three_seconds(monkeypat
     ]
     assert observed["timeout"] == go_nogo.TASK_INVENTORY_TIMEOUT_SECONDS
     assert observed["timeout"] > 3
+
+
+def test_go_nogo_endpoints_match_formal_provider_request_shapes():
+    market = urlparse(go_nogo.OFFICIAL_ENDPOINTS["market_breadth"])
+    industry = urlparse(go_nogo.OFFICIAL_ENDPOINTS["industry_snapshot"])
+    fund = urlparse(go_nogo.OFFICIAL_ENDPOINTS["fund_flow"])
+
+    assert market.path == "/api/qt/ulist.np/get"
+    assert parse_qs(market.query) == {
+        "fields": ["f3,f12,f14,f104,f105,f106,f124"],
+        "fltt": ["2"],
+        "invt": ["2"],
+        "secids": ["1.000001,0.399001,0.899050"],
+    }
+    assert industry.path == "/api/qt/clist/get"
+    assert parse_qs(industry.query) == {
+        "fields": ["f3,f12,f14,f104,f105,f106,f124"],
+        "fltt": ["2"],
+        "fs": ["m:90+t:2"],
+        "invt": ["2"],
+        "np": ["1"],
+        "pn": ["1"],
+        "po": ["1"],
+        "pz": ["500"],
+    }
+    assert fund.path == "/api/qt/stock/fflow/kline/get"
+    assert parse_qs(fund.query) == {
+        "fields1": ["f1,f2,f3,f7"],
+        "fields2": ["f51,f52,f53,f54,f55,f56,f57"],
+        "klt": ["1"],
+        "secid": ["0.000001"],
+    }
+    assert "Chrome/126.0" in go_nogo.OFFICIAL_USER_AGENT
 
 
 def test_combined_candidates_keep_announcements_outside_s2_gate():

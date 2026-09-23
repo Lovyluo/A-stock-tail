@@ -9,11 +9,14 @@ import socket
 import ssl
 import subprocess
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, build_opener, getproxies
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import (
+    EASTMONEY_CLIST_URL,
+    EASTMONEY_FUND_FLOW_URL,
+    EASTMONEY_ULIST_URL,
     FIXED_CODES,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
@@ -44,10 +47,51 @@ OFFICIAL_HOST = "push2.eastmoney.com"
 DEFAULT_CUTOFF_CLOCK = "13:30:00"
 MAX_CLOCK_SKEW_MS = 2_000
 TASK_INVENTORY_TIMEOUT_SECONDS = 10.0
+OFFICIAL_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+)
 OFFICIAL_ENDPOINTS = {
-    "market_breadth": "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&fs=m%3A0%2Bt%3A6&fields=f12",
-    "industry_snapshot": "https://push2.eastmoney.com/api/qt/stock/get?secid=0.000001&fields=f57%2Cf127",
-    "fund_flow": "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=0.000001&klt=1&fields1=f1&fields2=f51%2Cf52",
+    "market_breadth": EASTMONEY_ULIST_URL
+    + "?"
+    + urlencode(
+        sorted(
+            {
+                "fltt": "2",
+                "invt": "2",
+                "secids": "1.000001,0.399001,0.899050",
+                "fields": "f3,f12,f14,f104,f105,f106,f124",
+            }.items()
+        )
+    ),
+    "industry_snapshot": EASTMONEY_CLIST_URL
+    + "?"
+    + urlencode(
+        sorted(
+            {
+                "pn": "1",
+                "pz": "500",
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fs": "m:90+t:2",
+                "fields": "f3,f12,f14,f104,f105,f106,f124",
+            }.items()
+        )
+    ),
+    "fund_flow": EASTMONEY_FUND_FLOW_URL
+    + "?"
+    + urlencode(
+        sorted(
+            {
+                "secid": "0.000001",
+                "klt": "1",
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            }.items()
+        )
+    ),
 }
 
 
@@ -494,7 +538,11 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
     for capability, url in sorted(OFFICIAL_ENDPOINTS.items()):
         request_hashes[capability] = stable_hash({"method": "GET", "url": url})
         try:
-            request = Request(url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
+            request = Request(
+                url,
+                headers={"User-Agent": OFFICIAL_USER_AGENT},
+                method="GET",
+            )
             before = datetime.now(timezone.utc)
             with opener.open(request, timeout=2.0) as response:
                 response.read(1)
