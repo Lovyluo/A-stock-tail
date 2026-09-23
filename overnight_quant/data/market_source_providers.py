@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import math
@@ -17,27 +17,30 @@ from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 FIXED_CODES = ("000001", "000333", "600000", "600519", "601318")
 EASTMONEY_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+EASTMONEY_ULIST_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 EASTMONEY_STOCK_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 EASTMONEY_FUND_FLOW_URL = (
     "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
 )
 MARKET_BENCHMARK_SECID = "1.000001"
-MARKET_STOCK_POOL_VERSION = "eastmoney_all_a_m0t6_80_m1t2_23_v1"
+MARKET_STOCK_POOL_VERSION = "eastmoney_index_breadth_sh_sz_bj_v2026-09-21"
 INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_industry_m90t2_v1"
-EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
-VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
+EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
+LEGACY_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
+VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
+LEGACY_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
 DEFAULT_BATCH_DEADLINE_MS = 10_000
 
 SOURCE_IDENTITIES = {
     "market_breadth": (
         "eastmoney",
         "direct_http",
-        "push2_all_a_breadth+sse_index_v2026-09-18",
+        "push2_index_breadth+sse_index_v2026-09-21",
     ),
     "industry_snapshot": (
         "eastmoney",
         "direct_http",
-        "push2_stock_industry+board_breadth_v2026-09-18",
+        "push2_stock_industry+board_breadth_v2026-09-23",
     ),
     "fund_flow": (
         "eastmoney",
@@ -180,16 +183,12 @@ class EastmoneyMarketSourceProviders:
     def collect_market_breadth_batch(self) -> MarketProviderBatch:
         breadth = self._request(
             "market_breadth",
-            EASTMONEY_CLIST_URL,
+            EASTMONEY_ULIST_URL,
             {
-                "pn": "1",
-                "pz": "6000",
-                "po": "1",
-                "np": "1",
                 "fltt": "2",
                 "invt": "2",
-                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-                "fields": "f2,f3,f12,f13,f14,f124",
+                "secids": "1.000001,0.399001,0.899050",
+                "fields": "f3,f12,f14,f104,f105,f106,f124",
             },
         )
         index = self._request(
@@ -203,29 +202,43 @@ class EastmoneyMarketSourceProviders:
             },
         )
         breadth_payload = _json_payload(breadth["raw_bytes"])
-        breadth_data = breadth_payload.get("data") or {}
-        rows = breadth_data.get("diff") or []
-        total_count = _strict_int(breadth_data.get("total"), "MARKET_TOTAL_INVALID")
-        if total_count <= 0 or len(rows) != total_count:
+        rows = (breadth_payload.get("data") or {}).get("diff") or []
+        expected_index_codes = {"000001", "399001", "899050"}
+        rows_by_code = {
+            str(item.get("f12") or "").zfill(6): item
+            for item in rows
+        }
+        if set(rows_by_code) != expected_index_codes:
             raise MarketSourceContractError("MARKET_STOCK_POOL_INCOMPLETE")
         up_count = down_count = flat_count = invalid_count = 0
         event_times: list[datetime] = []
-        for item in rows:
-            value = _optional_number(item.get("f3"))
-            if value is None:
-                invalid_count += 1
-            elif value > 0:
-                up_count += 1
-            elif value < 0:
-                down_count += 1
-            else:
-                flat_count += 1
+        index_breadth: dict[str, dict[str, Any]] = {}
+        for code in sorted(expected_index_codes):
+            item = rows_by_code[code]
+            item_up = _strict_int(item.get("f104"), "MARKET_UP_COUNT_INVALID")
+            item_down = _strict_int(item.get("f105"), "MARKET_DOWN_COUNT_INVALID")
+            item_flat = _strict_int(item.get("f106"), "MARKET_FLAT_COUNT_INVALID")
+            item_total = item_up + item_down + item_flat
+            if item_total <= 0:
+                raise MarketSourceContractError("MARKET_STOCK_POOL_INCOMPLETE")
+            up_count += item_up
+            down_count += item_down
+            flat_count += item_flat
             timestamp = _timestamp(item.get("f124"))
             if timestamp is None:
                 raise MarketSourceContractError("MARKET_STOCK_EVENT_TIME_MISSING")
             event_times.append(timestamp)
+            index_breadth[code] = {
+                "name": str(item.get("f14") or ""),
+                "up_count": item_up,
+                "down_count": item_down,
+                "flat_count": item_flat,
+                "total_count": item_total,
+                "raw_event_time": timestamp.isoformat(),
+            }
         valid_count = up_count + down_count + flat_count
-        if valid_count <= 0 or valid_count + invalid_count != total_count:
+        total_count = valid_count + invalid_count
+        if valid_count <= 0:
             raise MarketSourceContractError("MARKET_BREADTH_COUNTS_INVALID")
         index_data = (_json_payload(index["raw_bytes"]).get("data") or {})
         index_change_pct = _required_number(
@@ -236,8 +249,11 @@ class EastmoneyMarketSourceProviders:
             raise MarketSourceContractError("MARKET_INDEX_EVENT_TIME_MISSING")
         event_times.append(index_event)
         latest_event = max(event_times)
-        if latest_event > self.feature_cutoff:
-            raise MarketSourceContractError("MARKET_EVENT_AFTER_CUTOFF")
+        event_label = _minute_event_label(
+            latest_event,
+            self.feature_cutoff,
+            "MARKET_EVENT_AFTER_CUTOFF",
+        )
         payload = {
             "index_change_pct": index_change_pct,
             "breadth_ratio": up_count / valid_count,
@@ -248,6 +264,11 @@ class EastmoneyMarketSourceProviders:
             "valid_count": valid_count,
             "total_count": total_count,
             "stock_pool_version": MARKET_STOCK_POOL_VERSION,
+            "stock_pool_scope": "sse+szse+bse_index_breadth_counts",
+            "index_breadth": index_breadth,
+            "raw_latest_event_time": latest_event.isoformat(),
+            "raw_benchmark_event_time": index_event.isoformat(),
+            "event_time_granularity": "minute",
             "benchmark_secid": MARKET_BENCHMARK_SECID,
             "benchmark_name": str(index_data.get("f58") or ""),
             "field_units": {
@@ -259,7 +280,7 @@ class EastmoneyMarketSourceProviders:
         record = self._record(
             "market_breadth",
             "market",
-            latest_event,
+            event_label,
             max(_as_cn(breadth["observed_at"]), _as_cn(index["observed_at"])),
             max(_as_cn(breadth["available_at"]), _as_cn(index["available_at"])),
             stable_hash([breadth["request_hash"], index["request_hash"]]),
@@ -321,9 +342,15 @@ class EastmoneyMarketSourceProviders:
             mapping_event = _timestamp(item.get("f86"))
             if board_event is None or mapping_event is None:
                 raise MarketSourceContractError(f"INDUSTRY_EVENT_TIME_MISSING:{code}")
-            event_time = max(board_event, mapping_event)
-            if event_time > self.feature_cutoff:
-                raise MarketSourceContractError(f"INDUSTRY_EVENT_AFTER_CUTOFF:{code}")
+            event_time = _minute_event_label(
+                board_event,
+                self.feature_cutoff,
+                f"INDUSTRY_EVENT_AFTER_CUTOFF:{code}",
+            )
+            if mapping_event > self.collection_deadline:
+                raise MarketSourceContractError(
+                    f"INDUSTRY_MAPPING_AFTER_DEADLINE:{code}"
+                )
             records.append(self._record(
                 "industry_snapshot",
                 "industry",
@@ -341,6 +368,10 @@ class EastmoneyMarketSourceProviders:
                     "classification_version": INDUSTRY_CLASSIFICATION_VERSION,
                     "change_pct": change,
                     "breadth_ratio": up / total,
+                    "raw_board_event_time": board_event.isoformat(),
+                    "raw_mapping_event_time": mapping_event.isoformat(),
+                    "event_time_granularity": "minute",
+                    "mapping_time_semantics": "static_classification_observed_before_deadline",
                     "up_count": up,
                     "down_count": down,
                     "flat_count": flat,
@@ -512,7 +543,7 @@ def validate_market_source_records(
     if capability == "market_breadth":
         if len(rows) != 1:
             errors.append("market_record_count_invalid")
-        elif not _valid_market_payload(rows[0].get("payload") or {}):
+        elif not _valid_market_record(rows[0]):
             errors.append("market_payload_invalid")
     elif capability in {"industry_snapshot", "fund_flow"}:
         row_codes = [str((row.get("payload") or {}).get("code") or "").zfill(6) for row in rows]
@@ -522,7 +553,7 @@ def validate_market_source_records(
             classifications = {(row.get("payload") or {}).get("classification_version") for row in rows}
             if classifications != {INDUSTRY_CLASSIFICATION_VERSION}:
                 errors.append("industry_classification_mismatch")
-            if any(not _valid_industry_payload(row.get("payload") or {}) for row in rows):
+            if any(not _valid_industry_record(row) for row in rows):
                 errors.append("industry_payload_invalid")
         else:
             if any(not _valid_fund_payload(row.get("payload") or {}) for row in rows):
@@ -548,28 +579,102 @@ def compute_market_source_verifier_contract_hash() -> str:
     })
 
 
-def _valid_market_payload(payload: Mapping[str, Any]) -> bool:
+def compute_legacy_market_source_verifier_contract_hash() -> str:
+    legacy_identities = {
+        **SOURCE_IDENTITIES,
+        "industry_snapshot": (
+            "eastmoney",
+            "direct_http",
+            "push2_stock_industry+board_breadth_v2026-09-18",
+        ),
+    }
+    return stable_hash({
+        "version": LEGACY_VERIFIER_CONTRACT_VERSION,
+        "source_identities": legacy_identities,
+        "provider_keys": PROVIDER_KEYS,
+        "fixed_codes": FIXED_CODES,
+        "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
+        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+    })
+
+
+def _valid_market_record(record: Mapping[str, Any]) -> bool:
+    payload = record.get("payload") or {}
     counts = [payload.get(key) for key in ("up_count", "down_count", "flat_count", "invalid_count", "valid_count", "total_count")]
     if any(type(value) is not int or value < 0 for value in counts):
         return False
     up, down, flat, invalid, valid, total = counts
-    return (
+    if not (
         valid == up + down + flat
         and total == valid + invalid
         and valid > 0
         and payload.get("stock_pool_version") == MARKET_STOCK_POOL_VERSION
+        and payload.get("stock_pool_scope")
+        == "sse+szse+bse_index_breadth_counts"
+        and payload.get("event_time_granularity") == "minute"
+        and payload.get("benchmark_secid") == MARKET_BENCHMARK_SECID
         and _optional_number(payload.get("index_change_pct")) is not None
         and _ratio(payload.get("breadth_ratio"))
         and abs(float(payload["breadth_ratio"]) - up / valid) <= 1e-12
-    )
+    ):
+        return False
+    details = payload.get("index_breadth")
+    if not isinstance(details, Mapping) or set(details) != {
+        "000001", "399001", "899050"
+    }:
+        return False
+    detail_sums = {"up_count": 0, "down_count": 0, "flat_count": 0}
+    raw_times: list[datetime] = []
+    for code in ("000001", "399001", "899050"):
+        detail = details.get(code)
+        if not isinstance(detail, Mapping):
+            return False
+        detail_counts = [
+            detail.get(key)
+            for key in ("up_count", "down_count", "flat_count", "total_count")
+        ]
+        if any(type(value) is not int or value < 0 for value in detail_counts):
+            return False
+        detail_up, detail_down, detail_flat, detail_total = detail_counts
+        if detail_total != detail_up + detail_down + detail_flat:
+            return False
+        raw_event = parse_cn_datetime(detail.get("raw_event_time"))
+        if raw_event is None:
+            return False
+        raw_times.append(raw_event)
+        detail_sums["up_count"] += detail_up
+        detail_sums["down_count"] += detail_down
+        detail_sums["flat_count"] += detail_flat
+    if detail_sums != {
+        "up_count": up,
+        "down_count": down,
+        "flat_count": flat,
+    }:
+        return False
+    benchmark_event = parse_cn_datetime(payload.get("raw_benchmark_event_time"))
+    raw_latest = parse_cn_datetime(payload.get("raw_latest_event_time"))
+    cutoff = parse_cn_datetime(record.get("decision_cutoff"))
+    formal_event = parse_cn_datetime(record.get("event_time"))
+    if None in (benchmark_event, raw_latest, cutoff, formal_event):
+        return False
+    if raw_latest != max([*raw_times, benchmark_event]):
+        return False
+    try:
+        expected_event = _minute_event_label(
+            raw_latest, cutoff, "MARKET_EVENT_AFTER_CUTOFF"
+        )
+    except MarketSourceContractError:
+        return False
+    return formal_event == expected_event
 
 
-def _valid_industry_payload(payload: Mapping[str, Any]) -> bool:
+def _valid_industry_record(record: Mapping[str, Any]) -> bool:
+    payload = record.get("payload") or {}
     up = payload.get("up_count")
     down = payload.get("down_count")
     flat = payload.get("flat_count")
     total = payload.get("total_count")
-    return (
+    if not (
         bool(str(payload.get("industry_name") or "").strip())
         and bool(str(payload.get("board_code") or "").strip())
         and all(type(value) is int and value >= 0 for value in (up, down, flat, total))
@@ -578,6 +683,27 @@ def _valid_industry_payload(payload: Mapping[str, Any]) -> bool:
         and _ratio(payload.get("breadth_ratio"))
         and abs(float(payload["breadth_ratio"]) - up / total) <= 1e-12
         and _optional_number(payload.get("change_pct")) is not None
+        and payload.get("event_time_granularity") == "minute"
+        and payload.get("mapping_time_semantics")
+        == "static_classification_observed_before_deadline"
+    ):
+        return False
+    board_event = parse_cn_datetime(payload.get("raw_board_event_time"))
+    mapping_event = parse_cn_datetime(payload.get("raw_mapping_event_time"))
+    formal_event = parse_cn_datetime(record.get("event_time"))
+    cutoff = parse_cn_datetime(record.get("decision_cutoff"))
+    available = parse_cn_datetime(record.get("available_at"))
+    if None in (board_event, mapping_event, formal_event, cutoff, available):
+        return False
+    try:
+        expected_event = _minute_event_label(
+            board_event, cutoff, "INDUSTRY_EVENT_AFTER_CUTOFF"
+        )
+    except MarketSourceContractError:
+        return False
+    return (
+        formal_event == expected_event
+        and mapping_event <= cutoff + timedelta(seconds=65)
     )
 
 
@@ -636,6 +762,18 @@ def _timestamp(value: Any) -> datetime | None:
         return datetime.fromtimestamp(number, tz=CN_TZ)
     except (TypeError, ValueError, OverflowError):
         return parse_cn_datetime(value)
+
+
+def _minute_event_label(
+    value: datetime,
+    cutoff: datetime,
+    error: str,
+) -> datetime:
+    """Normalize second-level Eastmoney push2 updates to the decision minute."""
+    label = value.replace(second=0, microsecond=0)
+    if label.date() != cutoff.date() or label > cutoff:
+        raise MarketSourceContractError(error)
+    return label
 
 
 def _optional_number(value: Any) -> float | None:

@@ -292,8 +292,8 @@ def test_combined_candidates_keep_announcements_outside_s2_gate():
     } <= identities
     s2 = {identity for identity in identities if identity[0] != "announcement"}
     assert s2 == {
-        ("market_breadth", "eastmoney", "push2_all_a_breadth+sse_index_v2026-09-18"),
-        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_v2026-09-18"),
+        ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_v2026-09-21"),
+        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_v2026-09-23"),
         ("fund_flow", "eastmoney", "push2_fflow_kline_v2026-09-18"),
     }
 

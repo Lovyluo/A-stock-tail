@@ -7,7 +7,7 @@ readiness, strategy weights, or trading behavior.
 
 | Capability | Provider | Production state | Qualification |
 | --- | --- | --- | --- |
-| market breadth | Eastmoney all-A clist plus Eastmoney SSE index | candidate | unqualified, 0/3 |
+| market breadth | Eastmoney SSE/SZSE/BSE index breadth plus Eastmoney SSE index | candidate | unqualified, 0/3 |
 | industry mapping and breadth | Eastmoney stock industry plus industry board clist | candidate | unqualified, 0/3 |
 | minute fund flow | Eastmoney push2 fflow kline | candidate | unqualified, 0/3 |
 
@@ -19,9 +19,12 @@ days.
 ## Field contracts
 
 The market record uses `origin_source=eastmoney` for both components. The fixed
-benchmark is SSE Composite (`secid=1.000001`). The all-A stock pool is
-`m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23` and is versioned as
-`eastmoney_all_a_m0t6_80_m1t2_23_v1`.
+benchmark is SSE Composite (`secid=1.000001`). Market breadth uses Eastmoney
+index breadth counters for SSE Composite, SZSE Component, and BSE 50
+(`secids=1.000001,0.399001,0.899050`), versioned as
+`eastmoney_index_breadth_sh_sz_bj_v2026-09-21`. The clist endpoint currently
+caps returned rows even when a larger `pz` is requested, so it is not used to
+pretend a first page is the full stock pool.
 
 ```text
 valid_count = up_count + down_count + flat_count
@@ -36,7 +39,13 @@ with Eastmoney breadth.
 Industry mapping and industry breadth both use the Eastmoney industry
 classification `eastmoney_industry_m90t2_v1`. Every fixed stock must map by an
 exact industry name to one board row. Industry breadth uses the same count
-formula as market breadth.
+formula as market breadth. The industry board update time is the formal event
+time for breadth. The stock-to-industry mapping is a static classification
+observed before the collection deadline; its quote update timestamp is retained
+for audit, but it cannot move a valid 14:50 board breadth record into a later
+decision minute. This timing contract is identified as
+`push2_stock_industry+board_breadth_v2026-09-23`; the previous 2026-09-18
+identity is not interchangeable with it.
 
 Fund-flow values are denominated in CNY. Each row describes one minute interval
 (`value_semantics=minute_interval_net_flow`,
@@ -55,7 +64,12 @@ Raw responses and evidence are written only to ignored cache using exclusive,
 atomic UTF-8 creation. Verification requires an externally supplied file
 SHA-256 and reconstructs all normalized records from captured raw bytes.
 Failure evidence can pass integrity verification, but cannot become a qualified
-day.
+day. `market_source_evidence_v2` is bound to
+`market_source_verifier_v2` (`220cdd293f64f91b6fb726bccf36cbc51633ccfae6f8cdbdaffb918f6e85cea4`).
+The verifier recomputes the three-market breadth counts, event-minute labels,
+industry board timing, request identities, and raw response hashes. Legacy v1
+evidence remains externally anchored audit evidence only and always reports
+`provider_validation_passed=false` and `qualification_eligible=false`.
 
 ## Independent Go/No-Go evidence
 
@@ -102,9 +116,9 @@ started. Current state remains:
 
 ```text
 capability_registry_schema=source_capability_registry_v4
-capability_registry_hash=92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7
-adapter_registry_schema=source_capability_adapter_registry_v6
-adapter_registry_hash=7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0
+capability_registry_hash=eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed
+adapter_registry_schema=source_capability_adapter_registry_v7
+adapter_registry_hash=3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a
 bound_count=8
 candidate_count=7
 consecutive_count=0/3
