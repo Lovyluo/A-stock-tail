@@ -370,7 +370,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "industry_snapshot",
-        "push2_stock_industry+board_breadth_v2026-09-18",
+        "push2_stock_industry+board_breadth_v2026-09-23",
         True,
         "unqualified",
         "0/3",

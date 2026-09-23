@@ -55,7 +55,7 @@ implementation_status
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v6`；
+- `source_capability_adapter_registry_v7`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 32 项适配绑定。
@@ -158,11 +158,11 @@ S2 candidate 独立登记时的历史 Schema v6 哈希为：
 公告与 S2 合并后的当前生产 Schema v6 哈希为：
 
 ```text
-7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0
+3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a
 ```
 
 当前 capability registry v4 hash 为
-`92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7`。
+`eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed`。
 
 ## 4. 失效关闭执行链
 

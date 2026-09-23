@@ -74,10 +74,10 @@ and evidence hash, and produces a new non-overwriting derived evidence file.
 - Capability registry schema: `source_capability_registry_v4`
 - Capability entries: 32
 - Capability registry hash:
-  `92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7`
-- Adapter registry schema: `source_capability_adapter_registry_v6`
+  `eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed`
+- Adapter registry schema: `source_capability_adapter_registry_v7`
 - Adapter registry hash:
-  `7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0`
+  `3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a`
 - `bound_count=8`
 - `candidate_count=7` (CNINFO, SSE, SZSE, BSE, and the three S2 market candidates)
 

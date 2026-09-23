@@ -16,12 +16,14 @@ from overnight_quant.data.market_source_providers import (
     EASTMONEY_ULIST_URL,
     FIXED_CODES,
     INDUSTRY_CLASSIFICATION_VERSION,
+    LEGACY_EVIDENCE_SCHEMA_VERSION,
     MARKET_STOCK_POOL_VERSION,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
     MarketSourceContractError,
+    compute_legacy_market_source_verifier_contract_hash,
     validate_market_source_records,
 )
 from overnight_quant.data.point_in_time import stable_hash
@@ -106,7 +108,13 @@ def market_responses(*, incomplete=False, invalid_total=False):
     ]
 
 
-def industry_responses(*, missing_mapping=False, mapping_after_cutoff=False, board_after_cutoff=False):
+def industry_responses(
+    *,
+    missing_mapping=False,
+    mapping_after_cutoff=False,
+    mapping_after_deadline=False,
+    board_after_cutoff=False,
+):
     industries = ["银行", "家电", "银行", "白酒", "保险"]
     boards = []
     for index, name in enumerate(sorted(set(industries)), 1):
@@ -121,7 +129,11 @@ def industry_responses(*, missing_mapping=False, mapping_after_cutoff=False, boa
             "f57": code,
             "f58": code,
             "f127": "不存在行业" if missing_mapping and code == FIXED_CODES[0] else name,
-            "f86": EVENT_TS_PLUS_SECONDS if mapping_after_cutoff else EVENT_TS,
+            "f86": (
+                "2026-09-18T14:51:05.001+08:00"
+                if mapping_after_deadline
+                else EVENT_TS_PLUS_SECONDS if mapping_after_cutoff else EVENT_TS
+            ),
         }}, EASTMONEY_STOCK_URL))
     return values
 
@@ -145,6 +157,54 @@ def provider(responses, *, late=False):
         transport=FakeTransport(responses),
         clock=Clock(late=late),
     )
+
+
+def successful_runner(task, deadline_ms, worker_command):
+    capability = task["capability"]
+    responses = {
+        "market_breadth": market_responses(),
+        "industry_snapshot": industry_responses(),
+        "fund_flow": fund_responses(),
+    }[capability]
+    instance = provider(responses)
+    batch = {
+        "market_breadth": instance.collect_market_breadth_batch,
+        "industry_snapshot": instance.collect_industry_batch,
+        "fund_flow": instance.collect_fund_flow_batch,
+    }[capability]()
+    serialized = []
+    for item in batch.responses:
+        raw = item["raw_bytes"]
+        serialized.append({
+            **{key: value for key, value in item.items() if key != "raw_bytes"},
+            "encoding": "base64",
+            "content_base64": base64.b64encode(raw).decode("ascii"),
+            "byte_count": len(raw),
+        })
+    return {
+        "ok": True,
+        "payload": {
+            "records": list(batch.records),
+            "responses": serialized,
+            "batch_status": batch.status,
+        },
+        "elapsed_ms": 25,
+    }
+
+
+def complete_evidence(tmp_path, monkeypatch, name="complete.json"):
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    return run_market_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output=tmp_path / name,
+        worker_runner=successful_runner,
+    )
+
+
+def resign_evidence(evidence):
+    evidence["evidence_hash"] = validation.compute_evidence_hash(evidence)
+    return evidence
 
 
 def test_registry_adds_three_unqualified_candidates_without_binding():
@@ -201,6 +261,10 @@ def test_market_breadth_uses_full_pool_counts_and_eastmoney_index():
     assert payload["valid_count"] == 10
     assert payload["breadth_ratio"] == pytest.approx(6 / 10)
     assert payload["index_change_pct"] == 0.42
+    assert set(payload["index_breadth"]) == {"000001", "399001", "899050"}
+    assert payload["raw_benchmark_event_time"] == datetime.fromtimestamp(
+        EVENT_TS, tz=CN_TZ
+    ).isoformat()
     assert batch.records[0]["event_time"] == CUTOFF
     assert batch.records[0]["origin_source"] == "eastmoney"
     assert validate_market_source_records("market_breadth", batch.records)["valid"]
@@ -227,6 +291,11 @@ def test_industry_mapping_and_breadth_share_one_classification():
 def test_industry_board_event_after_cutoff_minute_fails_closed():
     with pytest.raises(MarketSourceContractError, match="INDUSTRY_EVENT_AFTER_CUTOFF"):
         provider(industry_responses(board_after_cutoff=True)).collect_industry_batch()
+
+
+def test_industry_mapping_after_collection_deadline_fails_closed():
+    with pytest.raises(MarketSourceContractError, match="INDUSTRY_MAPPING_AFTER_DEADLINE"):
+        provider(industry_responses(mapping_after_deadline=True)).collect_industry_batch()
 
 
 def test_industry_mapping_mismatch_rejects_whole_batch():
@@ -293,47 +362,8 @@ def test_timeout_failure_evidence_is_safe_and_non_qualifying(tmp_path, monkeypat
 
 
 def test_immutable_evidence_external_anchor_and_double_replay(tmp_path, monkeypatch):
-    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
-
-    def runner(task, deadline_ms, worker_command):
-        capability = task["capability"]
-        responses = {
-            "market_breadth": market_responses(),
-            "industry_snapshot": industry_responses(),
-            "fund_flow": fund_responses(),
-        }[capability]
-        instance = provider(responses)
-        batch = {
-            "market_breadth": instance.collect_market_breadth_batch,
-            "industry_snapshot": instance.collect_industry_batch,
-            "fund_flow": instance.collect_fund_flow_batch,
-        }[capability]()
-        serialized = []
-        for item in batch.responses:
-            raw = item["raw_bytes"]
-            serialized.append({
-                **{key: value for key, value in item.items() if key != "raw_bytes"},
-                "encoding": "base64",
-                "content_base64": base64.b64encode(raw).decode("ascii"),
-                "byte_count": len(raw),
-            })
-        return {
-            "ok": True,
-            "payload": {
-                "records": list(batch.records),
-                "responses": serialized,
-                "batch_status": batch.status,
-            },
-            "elapsed_ms": 25,
-        }
-
     output = tmp_path / "complete.json"
-    result = run_market_source_validation(
-        network=True,
-        trade_date=TRADE_DATE,
-        output=output,
-        worker_runner=runner,
-    )
+    result = complete_evidence(tmp_path, monkeypatch)
     anchor = file_sha256(output)
     first = verify_file(output, expected_file_sha256=anchor)
     second = verify_file(output, expected_file_sha256=anchor)
@@ -347,7 +377,7 @@ def test_immutable_evidence_external_anchor_and_double_replay(tmp_path, monkeypa
 
 def test_resigned_hash_tamper_remains_invalid():
     evidence = {
-        "evidence_schema_version": "market_source_evidence_v1",
+        "evidence_schema_version": "market_source_evidence_v2",
         "evidence_hash": "",
         "provider_keys": PROVIDER_KEYS,
         "requested_codes": list(FIXED_CODES),
@@ -372,6 +402,107 @@ def test_resigned_hash_tamper_remains_invalid():
     assert result["status"] == EVIDENCE_INVALID
     assert result["data_ready"] is False
     assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
+def test_resigned_market_internal_detail_tamper_is_rejected(tmp_path, monkeypatch):
+    evidence = deepcopy(complete_evidence(tmp_path, monkeypatch))
+    record = evidence["records_by_capability"]["market_breadth"][0]
+    record["payload"]["index_breadth"]["000001"]["up_count"] += 1
+    contract = validate_market_source_records("market_breadth", [record])
+    evidence["capability_results"]["market_breadth"]["records_hash"] = contract[
+        "records_hash"
+    ]
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="a" * 64
+    )
+    assert result["status"] == EVIDENCE_INVALID
+    assert any(
+        "market_breadth:records_replay_mismatch" in error
+        or "market_breadth:market_payload_invalid" in error
+        for error in result["errors"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("mapping_as_formal_event", "industry_snapshot:industry_payload_invalid"),
+        ("missing_time_semantics", "industry_snapshot:industry_payload_invalid"),
+        ("board_raw_time_changed", "industry_snapshot:industry_payload_invalid"),
+        ("source_version_changed", "industry_snapshot:source_identity_mismatch"),
+        ("mapping_changed_surface_consistent", "industry_snapshot:records_replay_mismatch"),
+    ],
+)
+def test_resigned_industry_timing_tamper_is_rejected(
+    tmp_path, monkeypatch, mutation, expected_error
+):
+    evidence = deepcopy(complete_evidence(tmp_path, monkeypatch, f"{mutation}.json"))
+    record = evidence["records_by_capability"]["industry_snapshot"][0]
+    payload = record["payload"]
+    if mutation == "mapping_as_formal_event":
+        payload["raw_mapping_event_time"] = "2026-09-18T14:49:30+08:00"
+        record["event_time"] = "2026-09-18T14:49:00+08:00"
+    elif mutation == "missing_time_semantics":
+        payload.pop("mapping_time_semantics")
+    elif mutation == "board_raw_time_changed":
+        payload["raw_board_event_time"] = "2026-09-18T14:49:30+08:00"
+    elif mutation == "source_version_changed":
+        record["source_version"] = "push2_stock_industry+board_breadth_v2099-01-01"
+    else:
+        response_item = evidence["raw_responses"]["industry_snapshot"][1]
+        raw = base64.b64decode(response_item["content_base64"])
+        raw_payload = json.loads(raw.decode("utf-8"))
+        raw_payload["data"]["f127"] = "家电"
+        changed = json.dumps(
+            raw_payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        response_item["content_base64"] = base64.b64encode(changed).decode("ascii")
+        response_item["byte_count"] = len(changed)
+        response_item["raw_hash"] = hashlib.sha256(changed).hexdigest()
+    contract = validate_market_source_records(
+        "industry_snapshot", evidence["records_by_capability"]["industry_snapshot"]
+    )
+    evidence["capability_results"]["industry_snapshot"]["records_hash"] = contract[
+        "records_hash"
+    ]
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="b" * 64
+    )
+    assert result["status"] == EVIDENCE_INVALID
+    assert any(expected_error in error for error in result["errors"])
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
+def test_legacy_v1_evidence_is_verified_for_audit_only():
+    evidence = {
+        "evidence_schema_version": LEGACY_EVIDENCE_SCHEMA_VERSION,
+        "evidence_hash": "",
+        "provider_keys": PROVIDER_KEYS,
+        "requested_codes": list(FIXED_CODES),
+        "provider_verifier_contract_hash": (
+            compute_legacy_market_source_verifier_contract_hash()
+        ),
+        "capability_registry_hash": (
+            "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
+        ),
+        "provider_validation_passed": True,
+        "automatic_configuration_change": False,
+        "automatic_qualification_change": False,
+        "data_ready": False,
+        "hard_gate_authorized": False,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="c" * 64
+    )
+    assert result["status"] == EVIDENCE_VERIFIED
+    assert result["evidence_integrity_verified"] is True
+    assert result["provider_validation_passed"] is False
+    assert result["audit_only"] is True
+    assert result["qualification_eligible"] is False
 
 
 def test_record_order_does_not_change_contract_hash():

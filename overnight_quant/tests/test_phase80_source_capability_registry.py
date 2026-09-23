@@ -80,7 +80,7 @@ def test_registry_order_does_not_change_hash():
     assert all(REQUIRED_FIELDS <= set(row) for row in registry)
     assert REGISTRY_SCHEMA_VERSION == "source_capability_registry_v4"
     assert forward == (
-        "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
+        "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
     )
 
 
@@ -865,7 +865,7 @@ def _assert_safe(result):
 def _assert_provenance_registry_contract(result):
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
+        "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
     )
 
 
@@ -883,7 +883,7 @@ def _assert_invalid_route_request(result):
     assert result["selected_source"] is None
     assert result["registry_schema_version"] == REGISTRY_SCHEMA_VERSION
     assert result["registry_hash"] == (
-        "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
+        "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
     )
     _assert_safe(result)
 

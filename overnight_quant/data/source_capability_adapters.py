@@ -23,19 +23,19 @@ from overnight_quant.data.market_source_providers import (
 )
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v6"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v7"
 PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = (
-    "source_capability_adapter_registry_v5"
+    "source_capability_adapter_registry_v6"
 )
 PREVIOUS_ADAPTER_REGISTRY_HASH = (
-    "05adafdb3e3a70ddcdc16644673b299b66d8c09367d2ef3259b7fc97b7adb369"
+    "c37bea0068fa1f9d8a448307d8aac360bab9ddc23d30bf0f708d50479d93878d"
 )
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "upgrade_s2_market_breadth_to_eastmoney_index_breadth_contract"
+    "upgrade_s2_industry_timing_identity_and_market_verifier_v2"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 32
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
+    "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -233,7 +233,7 @@ _LEGACY_PROVIDER_KEYS = {
         "industry_snapshot",
         "eastmoney",
         "direct_http",
-        "push2_stock_industry+board_breadth_v2026-09-18",
+        "push2_stock_industry+board_breadth_v2026-09-23",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_industry"
