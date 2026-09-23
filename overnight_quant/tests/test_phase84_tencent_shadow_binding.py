@@ -23,7 +23,7 @@ VALUATION_PROVIDER_KEY = (
 )
 LEGACY_PROVIDER_KEY = "astock_client.AStockClient._tencent_quotes"
 EXPECTED_REGISTRY_HASH = (
-    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
+    "c37bea0068fa1f9d8a448307d8aac360bab9ddc23d30bf0f708d50479d93878d"
 )
 
 

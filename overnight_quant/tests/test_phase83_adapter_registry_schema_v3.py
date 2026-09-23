@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "92cba3139097f7356210e0ee2416c371b5e409c83fcfcdb2bd7e5c2620a3e1f7"
+    "f4e91460aa67674ce536b70184d85b05cfc6fedc8526fa27f16e3f3f616fd833"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "7e0fb8072434be301f5a6a904071fe48cd57ed130f6e1bd54555c57b907318c0"
+    "c37bea0068fa1f9d8a448307d8aac360bab9ddc23d30bf0f708d50479d93878d"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
