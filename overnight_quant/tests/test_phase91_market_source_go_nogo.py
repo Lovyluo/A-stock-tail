@@ -9,9 +9,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import overnight_quant.data.market_source_go_nogo as go_nogo
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_go_nogo import (
     NO_GO,
@@ -271,6 +273,94 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
     assert result["sampling_authorized"] is True
     assert result["qualification_result"] == "NOT_EVALUATED"
     _assert_safe(result)
+
+
+def test_task_inventory_allows_windows_cold_start_beyond_three_seconds(monkeypatch):
+    observed = {}
+
+    def fake_check_output(command, *, text, timeout):
+        observed.update(command=command, text=text, timeout=timeout)
+        return "AStockMarketSource-Zeta\nAStockMarketSource-Alpha\n"
+
+    monkeypatch.setattr(go_nogo.os, "name", "nt")
+    monkeypatch.setattr(go_nogo.subprocess, "check_output", fake_check_output)
+
+    assert go_nogo._matching_tasks() == [
+        "AStockMarketSource-Alpha",
+        "AStockMarketSource-Zeta",
+    ]
+    assert observed["timeout"] == go_nogo.TASK_INVENTORY_TIMEOUT_SECONDS
+    assert observed["timeout"] > 3
+    assert "State -ne 'Disabled'" in observed["command"][-1]
+
+
+def test_task_inventory_ignores_disabled_historical_tasks_on_windows():
+    if os.name != "nt":
+        pytest.skip("Windows scheduled-task behavior")
+    task_name = "AStockMarketSource-Historical-Disabled-Test"
+    create = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            (
+                "$a=New-ScheduledTaskAction -Execute 'cmd.exe' "
+                "-Argument '/c exit 0'; "
+                f"Register-ScheduledTask -TaskName '{task_name}' -Action $a "
+                "-Description 'phase91 disabled task audit' -Force | Out-Null; "
+                f"Disable-ScheduledTask -TaskName '{task_name}' | Out-Null"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert create.returncode == 0, create.stderr
+    try:
+        assert task_name not in go_nogo._matching_tasks()
+    finally:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_go_nogo_endpoints_match_formal_provider_request_shapes():
+    market = urlparse(go_nogo.OFFICIAL_ENDPOINTS["market_breadth"])
+    industry = urlparse(go_nogo.OFFICIAL_ENDPOINTS["industry_snapshot"])
+    fund = urlparse(go_nogo.OFFICIAL_ENDPOINTS["fund_flow"])
+
+    assert market.path == "/api/qt/ulist.np/get"
+    assert parse_qs(market.query) == {
+        "fields": ["f3,f12,f14,f104,f105,f106,f124"],
+        "fltt": ["2"],
+        "invt": ["2"],
+        "secids": ["1.000001,0.399001,0.899050"],
+    }
+    assert industry.path == "/api/qt/clist/get"
+    assert parse_qs(industry.query) == {
+        "fields": ["f3,f12,f14,f104,f105,f106,f124"],
+        "fltt": ["2"],
+        "fs": ["m:90+t:2"],
+        "invt": ["2"],
+        "np": ["1"],
+        "pn": ["1"],
+        "po": ["1"],
+        "pz": ["500"],
+    }
+    assert fund.path == "/api/qt/stock/fflow/kline/get"
+    assert parse_qs(fund.query) == {
+        "fields1": ["f1,f2,f3,f7"],
+        "fields2": ["f51,f52,f53,f54,f55,f56,f57"],
+        "klt": ["1"],
+        "secid": ["0.000001"],
+    }
+    assert "Chrome/126.0" in go_nogo.OFFICIAL_USER_AGENT
 
 
 def test_combined_candidates_keep_announcements_outside_s2_gate():
