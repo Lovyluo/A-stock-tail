@@ -291,6 +291,43 @@ def test_task_inventory_allows_windows_cold_start_beyond_three_seconds(monkeypat
     ]
     assert observed["timeout"] == go_nogo.TASK_INVENTORY_TIMEOUT_SECONDS
     assert observed["timeout"] > 3
+    assert "State -ne 'Disabled'" in observed["command"][-1]
+
+
+def test_task_inventory_ignores_disabled_historical_tasks_on_windows():
+    if os.name != "nt":
+        pytest.skip("Windows scheduled-task behavior")
+    task_name = "AStockMarketSource-Historical-Disabled-Test"
+    create = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            (
+                "$a=New-ScheduledTaskAction -Execute 'cmd.exe' "
+                "-Argument '/c exit 0'; "
+                f"Register-ScheduledTask -TaskName '{task_name}' -Action $a "
+                "-Description 'phase91 disabled task audit' -Force | Out-Null; "
+                f"Disable-ScheduledTask -TaskName '{task_name}' | Out-Null"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert create.returncode == 0, create.stderr
+    try:
+        assert task_name not in go_nogo._matching_tasks()
+    finally:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false",
+            ],
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_go_nogo_endpoints_match_formal_provider_request_shapes():

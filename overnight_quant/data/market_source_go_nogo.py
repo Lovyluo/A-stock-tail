@@ -745,7 +745,12 @@ def _matching_processes() -> list[str]:
 def _matching_tasks() -> list[str]:
     if os.name != "nt":
         return []
-    script = "Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'AStockMarketSource*' } | Select-Object -ExpandProperty TaskName"
+    script = (
+        "Get-ScheduledTask -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.TaskName -like 'AStockMarketSource*' "
+        "-and $_.State -ne 'Disabled' } | "
+        "Select-Object -ExpandProperty TaskName"
+    )
     try:
         raw = subprocess.check_output(
             ["powershell.exe", "-NoProfile", "-Command", script],
