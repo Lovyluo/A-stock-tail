@@ -55,7 +55,7 @@ implementation_status
 
 适配注册表哈希同时绑定：
 
-- `source_capability_adapter_registry_v7`；
+- `source_capability_adapter_registry_v8`；
 - B1 registry schema；
 - B1 registry hash；
 - 规范排序后的 32 项适配绑定。
@@ -155,14 +155,20 @@ S2 candidate 独立登记时的历史 Schema v6 哈希为：
 对应 capability registry v4 hash 为
 `6e6403689be62f1676d6def518e810fd36af8650ca86e2fac3961bf18e078585`。
 
-公告与 S2 合并后的当前生产 Schema v6 哈希为：
+公告与 S2 合并后的历史生产 Schema v7 哈希为：
 
 ```text
 3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a
 ```
 
-当前 capability registry v4 hash 为
+该历史 capability registry v4 hash 为
 `eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed`。
+
+Eastmoney requests transport 与 `f170` 市场基准合同升级后的当前生产
+Schema v8 hash 为
+`00acaa2ccec9cacee6957ebb75973e26b66e6fe1b62812a5e7650adf87e62f2e`；
+对应 capability registry v5 hash 为
+`500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e`。
 
 ## 4. 失效关闭执行链
 

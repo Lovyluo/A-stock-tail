@@ -11,6 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
+import requests
+
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
@@ -25,27 +27,59 @@ EASTMONEY_FUND_FLOW_URL = (
 MARKET_BENCHMARK_SECID = "1.000001"
 MARKET_STOCK_POOL_VERSION = "eastmoney_index_breadth_sh_sz_bj_v2026-09-21"
 INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_industry_m90t2_v1"
-EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
+EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v3"
+PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
 LEGACY_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
-VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
+VERIFIER_CONTRACT_VERSION = "market_source_verifier_v3"
+PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
 LEGACY_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
+MARKET_REQUESTS_TRANSPORT_VERSION = "eastmoney_requests_v1"
+MAX_RESPONSE_BYTES = 5_000_000
+MARKET_BREADTH_PARAMS = {
+    "fltt": "2",
+    "invt": "2",
+    "secids": "1.000001,0.399001,0.899050",
+    "fields": "f12,f14,f104,f105,f106,f124",
+}
+MARKET_INDEX_PARAMS = {
+    "secid": "1.000001",
+    "fltt": "2",
+    "invt": "2",
+    "fields": "f57,f58,f86,f170",
+}
+INDUSTRY_BOARD_PARAMS = {
+    "pn": "1",
+    "pz": "500",
+    "po": "1",
+    "np": "1",
+    "fltt": "2",
+    "invt": "2",
+    "fs": "m:90+t:2",
+    "fields": "f3,f12,f14,f104,f105,f106,f124",
+}
+FUND_FLOW_PREFLIGHT_PARAMS = {
+    "secid": "0.000001",
+    "klt": "1",
+    "fields1": "f1,f2,f3,f7",
+    "fields2": "f51,f52,f53,f54,f55,f56,f57",
+}
 DEFAULT_BATCH_DEADLINE_MS = 10_000
 
 SOURCE_IDENTITIES = {
     "market_breadth": (
         "eastmoney",
         "direct_http",
-        "push2_index_breadth+sse_index_v2026-09-21",
+        "push2_index_breadth+sse_index_f170_requests_v2026-09-28",
     ),
     "industry_snapshot": (
         "eastmoney",
         "direct_http",
-        "push2_stock_industry+board_breadth_v2026-09-23",
+        "push2_stock_industry+board_breadth_requests_v2026-09-28",
     ),
     "fund_flow": (
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_v2026-09-18",
+        "push2_fflow_kline_requests_v2026-09-28",
     ),
 }
 
@@ -83,6 +117,9 @@ class MarketHttpResponse:
     status_code: int
     url: str
     headers: Mapping[str, str] = field(default_factory=dict)
+    request_started_at: str = ""
+    request_completed_at: str = ""
+    transport_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +184,117 @@ class MarketUrllibTransport:
             raise MarketSourceContractError("MARKET_SOURCE_REQUEST_FAILED") from exc
 
 
+class MarketRequestsTransport:
+    """Single-attempt production transport for Eastmoney qualification data."""
+
+    def __init__(
+        self,
+        *,
+        request_callable: Callable[..., Any] | None = None,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+    ) -> None:
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise ValueError("market_source_response_limit_invalid")
+        self.request_count = 0
+        self._request = request_callable or requests.request
+        self.max_response_bytes = max_response_bytes
+        self.transport_version = MARKET_REQUESTS_TRANSPORT_VERSION
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> MarketHttpResponse:
+        self.request_count += 1
+        started = datetime.now(CN_TZ)
+        response = None
+        try:
+            requested = urlparse(str(url))
+            if (
+                requested.scheme != "https"
+                or requested.hostname not in _ALLOWED_HOSTS
+                or requested.port not in (None, 443)
+            ):
+                raise MarketSourceContractError(
+                    "MARKET_SOURCE_REQUEST_URL_INVALID"
+                )
+            response = self._request(
+                method,
+                url,
+                params=_canonical_pairs(params),
+                headers=dict(headers),
+                timeout=float(timeout_seconds),
+                allow_redirects=True,
+                verify=True,
+                stream=True,
+            )
+            final = urlparse(str(response.url))
+            if (
+                final.scheme != "https"
+                or final.hostname not in _ALLOWED_HOSTS
+                or final.port not in (None, 443)
+            ):
+                raise MarketSourceContractError(
+                    "MARKET_SOURCE_RESPONSE_URL_INVALID"
+                )
+            status_code = int(response.status_code)
+            if status_code != 200:
+                raise MarketSourceContractError(
+                    f"MARKET_SOURCE_HTTP_{status_code}"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > self.max_response_bytes:
+                        raise MarketSourceContractError(
+                            "MARKET_SOURCE_RESPONSE_TOO_LARGE"
+                        )
+                except ValueError as exc:
+                    raise MarketSourceContractError(
+                        "MARKET_SOURCE_CONTENT_LENGTH_INVALID"
+                    ) from exc
+            chunks: list[bytes] = []
+            size = 0
+            iterator = response.iter_content(chunk_size=65_536)
+            for chunk in iterator:
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > self.max_response_bytes:
+                    raise MarketSourceContractError(
+                        "MARKET_SOURCE_RESPONSE_TOO_LARGE"
+                    )
+                chunks.append(bytes(chunk))
+            raw = b"".join(chunks)
+            if not raw:
+                raise MarketSourceContractError("MARKET_SOURCE_EMPTY_RESPONSE")
+            completed = datetime.now(CN_TZ)
+            return MarketHttpResponse(
+                raw,
+                status_code,
+                str(response.url),
+                dict(response.headers),
+                started.isoformat(timespec="microseconds"),
+                completed.isoformat(timespec="microseconds"),
+                MARKET_REQUESTS_TRANSPORT_VERSION,
+            )
+        except requests.Timeout as exc:
+            raise MarketSourceContractError("MARKET_SOURCE_TIMEOUT") from exc
+        except requests.TooManyRedirects as exc:
+            raise MarketSourceContractError(
+                "MARKET_SOURCE_RESPONSE_URL_INVALID"
+            ) from exc
+        except requests.RequestException as exc:
+            raise MarketSourceContractError("MARKET_SOURCE_REQUEST_FAILED") from exc
+        finally:
+            if response is not None:
+                response.close()
+
+
 class EastmoneyMarketSourceProviders:
     def __init__(
         self,
@@ -184,22 +332,12 @@ class EastmoneyMarketSourceProviders:
         breadth = self._request(
             "market_breadth",
             EASTMONEY_ULIST_URL,
-            {
-                "fltt": "2",
-                "invt": "2",
-                "secids": "1.000001,0.399001,0.899050",
-                "fields": "f3,f12,f14,f104,f105,f106,f124",
-            },
+            MARKET_BREADTH_PARAMS,
         )
         index = self._request(
             "market_breadth",
             EASTMONEY_STOCK_URL,
-            {
-                "secid": MARKET_BENCHMARK_SECID,
-                "fltt": "2",
-                "invt": "2",
-                "fields": "f3,f57,f58,f86",
-            },
+            MARKET_INDEX_PARAMS,
         )
         breadth_payload = _json_payload(breadth["raw_bytes"])
         rows = (breadth_payload.get("data") or {}).get("diff") or []
@@ -242,7 +380,7 @@ class EastmoneyMarketSourceProviders:
             raise MarketSourceContractError("MARKET_BREADTH_COUNTS_INVALID")
         index_data = (_json_payload(index["raw_bytes"]).get("data") or {})
         index_change_pct = _required_number(
-            index_data.get("f3"), "MARKET_INDEX_CHANGE_INVALID"
+            index_data.get("f170"), "MARKET_INDEX_CHANGE_INVALID"
         )
         index_event = _timestamp(index_data.get("f86"))
         if index_event is None:
@@ -271,6 +409,7 @@ class EastmoneyMarketSourceProviders:
             "event_time_granularity": "minute",
             "benchmark_secid": MARKET_BENCHMARK_SECID,
             "benchmark_name": str(index_data.get("f58") or ""),
+            "benchmark_change_field": "f170",
             "field_units": {
                 "index_change_pct": "percent",
                 "breadth_ratio": "ratio_0_1",
@@ -298,11 +437,7 @@ class EastmoneyMarketSourceProviders:
         board_response = self._request(
             "industry_snapshot",
             EASTMONEY_CLIST_URL,
-            {
-                "pn": "1", "pz": "500", "po": "1", "np": "1",
-                "fltt": "2", "invt": "2", "fs": "m:90+t:2",
-                "fields": "f3,f12,f14,f104,f105,f106,f124",
-            },
+            INDUSTRY_BOARD_PARAMS,
         )
         board_data = (_json_payload(board_response["raw_bytes"]).get("data") or {})
         board_rows = board_data.get("diff") or []
@@ -459,9 +594,31 @@ class EastmoneyMarketSourceProviders:
             "GET", url, params=params, headers={"User-Agent": _UA},
             timeout_seconds=timeout,
         )
+        transport_version = (
+            response.transport_version
+            or getattr(self.transport, "transport_version", "")
+        )
+        if transport_version != MARKET_REQUESTS_TRANSPORT_VERSION:
+            raise MarketSourceContractError(
+                "MARKET_SOURCE_TRANSPORT_VERSION_INVALID"
+            )
+        request_started = parse_cn_datetime(response.request_started_at)
+        request_completed = parse_cn_datetime(response.request_completed_at)
+        if (
+            request_started is None
+            or request_completed is None
+            or request_started < observed
+            or request_completed < request_started
+            or request_completed > self.collection_deadline
+        ):
+            raise MarketSourceContractError(
+                "MARKET_SOURCE_REQUEST_TIME_INVALID"
+            )
         available = _as_cn(self.clock())
         if available > self.collection_deadline:
             raise MarketSourceContractError("MARKET_SOURCE_COLLECTION_DEADLINE_EXCEEDED")
+        if request_completed > available:
+            raise MarketSourceContractError("MARKET_SOURCE_REQUEST_TIME_INVALID")
         if response.status_code != 200:
             raise MarketSourceContractError(f"MARKET_SOURCE_HTTP_{response.status_code}")
         parsed = urlparse(response.url)
@@ -475,6 +632,13 @@ class EastmoneyMarketSourceProviders:
             "params": _canonical_pairs(params),
             "observed_at": observed.isoformat(timespec="microseconds"),
             "available_at": available.isoformat(timespec="microseconds"),
+            "request_started_at": request_started.isoformat(
+                timespec="microseconds"
+            ),
+            "request_completed_at": request_completed.isoformat(
+                timespec="microseconds"
+            ),
+            "transport_version": transport_version,
             "request_hash": stable_hash({"method": "GET", "url": url, "params": _canonical_pairs(params)}),
             "raw_hash": hashlib.sha256(raw).hexdigest(),
             "raw_bytes": raw,
@@ -576,16 +740,49 @@ def compute_market_source_verifier_contract_hash() -> str:
         "fixed_codes": FIXED_CODES,
         "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
         "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "market_index_change_field": "f170",
+    })
+
+
+def compute_previous_market_source_verifier_contract_hash() -> str:
+    return stable_hash({
+        "version": PREVIOUS_VERIFIER_CONTRACT_VERSION,
+        "source_identities": {
+            "market_breadth": (
+                "eastmoney", "direct_http",
+                "push2_index_breadth+sse_index_v2026-09-21",
+            ),
+            "industry_snapshot": (
+                "eastmoney", "direct_http",
+                "push2_stock_industry+board_breadth_v2026-09-23",
+            ),
+            "fund_flow": (
+                "eastmoney", "direct_http",
+                "push2_fflow_kline_v2026-09-18",
+            ),
+        },
+        "provider_keys": PROVIDER_KEYS,
+        "fixed_codes": FIXED_CODES,
+        "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
+        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
     })
 
 
 def compute_legacy_market_source_verifier_contract_hash() -> str:
     legacy_identities = {
-        **SOURCE_IDENTITIES,
+        "market_breadth": (
+            "eastmoney", "direct_http",
+            "push2_index_breadth+sse_index_v2026-09-21",
+        ),
         "industry_snapshot": (
             "eastmoney",
             "direct_http",
             "push2_stock_industry+board_breadth_v2026-09-18",
+        ),
+        "fund_flow": (
+            "eastmoney", "direct_http",
+            "push2_fflow_kline_v2026-09-18",
         ),
     }
     return stable_hash({
@@ -613,6 +810,7 @@ def _valid_market_record(record: Mapping[str, Any]) -> bool:
         == "sse+szse+bse_index_breadth_counts"
         and payload.get("event_time_granularity") == "minute"
         and payload.get("benchmark_secid") == MARKET_BENCHMARK_SECID
+        and payload.get("benchmark_change_field") == "f170"
         and _optional_number(payload.get("index_change_pct")) is not None
         and _ratio(payload.get("breadth_ratio"))
         and abs(float(payload["breadth_ratio"]) - up / valid) <= 1e-12

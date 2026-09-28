@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timedelta
 import hashlib
 import json
 
 import pytest
+import requests
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import (
@@ -17,13 +19,18 @@ from overnight_quant.data.market_source_providers import (
     FIXED_CODES,
     INDUSTRY_CLASSIFICATION_VERSION,
     LEGACY_EVIDENCE_SCHEMA_VERSION,
+    MARKET_REQUESTS_TRANSPORT_VERSION,
     MARKET_STOCK_POOL_VERSION,
+    MAX_RESPONSE_BYTES,
+    PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
+    MarketRequestsTransport,
     MarketSourceContractError,
     compute_legacy_market_source_verifier_contract_hash,
+    compute_previous_market_source_verifier_contract_hash,
     validate_market_source_records,
 )
 from overnight_quant.data.point_in_time import stable_hash
@@ -61,13 +68,22 @@ class FakeTransport:
     def __init__(self, responses):
         self.responses = list(responses)
         self.request_count = 0
+        self.transport_version = MARKET_REQUESTS_TRANSPORT_VERSION
 
     def request(self, method, url, *, params, headers, timeout_seconds):
         self.request_count += 1
         value = self.responses.pop(0)
         if isinstance(value, Exception):
             raise value
-        return value
+        base = datetime(2026, 9, 18, 14, 50, 1, tzinfo=CN_TZ)
+        offset = timedelta(milliseconds=(self.request_count - 1) * 2)
+        return replace(
+            value,
+            request_started_at=(base + offset).isoformat(timespec="microseconds"),
+            request_completed_at=(
+                base + offset + timedelta(microseconds=500)
+            ).isoformat(timespec="microseconds"),
+        )
 
 
 class Clock:
@@ -86,14 +102,18 @@ def response(payload, url=EASTMONEY_CLIST_URL):
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
         200,
         url,
+        {},
+        "2026-09-18T14:50:01.000000+08:00",
+        "2026-09-18T14:50:01.000500+08:00",
+        MARKET_REQUESTS_TRANSPORT_VERSION,
     )
 
 
 def market_responses(*, incomplete=False, invalid_total=False):
     rows = [
-        {"f12": "000001", "f14": "上证指数", "f3": 1.2, "f104": 2, "f105": 1, "f106": 0, "f124": EVENT_TS_PLUS_SECONDS},
-        {"f12": "399001", "f14": "深证成指", "f3": 0.8, "f104": 3, "f105": 1, "f106": 1, "f124": EVENT_TS},
-        {"f12": "899050", "f14": "北证50", "f3": 0.5, "f104": 1, "f105": 1, "f106": 0, "f124": EVENT_TS},
+        {"f12": "000001", "f14": "上证指数", "f104": 2, "f105": 1, "f106": 0, "f124": EVENT_TS_PLUS_SECONDS},
+        {"f12": "399001", "f14": "深证成指", "f104": 3, "f105": 1, "f106": 1, "f124": EVENT_TS},
+        {"f12": "899050", "f14": "北证50", "f104": 1, "f105": 1, "f106": 0, "f124": EVENT_TS},
     ]
     if incomplete:
         rows = rows[:-1]
@@ -102,7 +122,7 @@ def market_responses(*, incomplete=False, invalid_total=False):
     return [
         response({"data": {"diff": rows}}, EASTMONEY_ULIST_URL),
         response(
-            {"data": {"f3": 0.42, "f57": "000001", "f58": "上证指数", "f86": EVENT_TS}},
+            {"data": {"f170": 0.42, "f57": "000001", "f58": "上证指数", "f86": EVENT_TS}},
             EASTMONEY_STOCK_URL,
         ),
     ]
@@ -157,6 +177,116 @@ def provider(responses, *, late=False):
         transport=FakeTransport(responses),
         clock=Clock(late=late),
     )
+
+
+class RequestsResponse:
+    def __init__(
+        self,
+        body=b'{"data":{}}',
+        *,
+        status_code=200,
+        url=EASTMONEY_ULIST_URL,
+        headers=None,
+    ):
+        self.body = body
+        self.status_code = status_code
+        self.url = url
+        self.headers = dict(headers or {})
+        self.closed = False
+
+    def iter_content(self, chunk_size):
+        assert chunk_size > 0
+        yield self.body
+
+    def close(self):
+        self.closed = True
+
+
+def test_requests_transport_single_success_uses_tls_and_environment_proxy():
+    observed = []
+    upstream = RequestsResponse()
+
+    def request_callable(*args, **kwargs):
+        observed.append((args, kwargs))
+        return upstream
+
+    transport = MarketRequestsTransport(request_callable=request_callable)
+    result = transport.request(
+        "GET",
+        EASTMONEY_ULIST_URL,
+        params={"b": "2", "a": "1"},
+        headers={"User-Agent": "test"},
+        timeout_seconds=2,
+    )
+    assert transport.request_count == 1
+    assert result.transport_version == MARKET_REQUESTS_TRANSPORT_VERSION
+    assert result.content == b'{"data":{}}'
+    assert upstream.closed is True
+    assert observed[0][1]["verify"] is True
+    assert observed[0][1]["allow_redirects"] is True
+    assert "proxies" not in observed[0][1]
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_code"),
+    [
+        (requests.Timeout("timeout"), "MARKET_SOURCE_TIMEOUT"),
+        (requests.ConnectionError("disconnect"), "MARKET_SOURCE_REQUEST_FAILED"),
+    ],
+)
+def test_requests_transport_failure_is_single_attempt_without_fallback(
+    failure, error_code
+):
+    calls = 0
+
+    def request_callable(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    transport = MarketRequestsTransport(request_callable=request_callable)
+    with pytest.raises(MarketSourceContractError, match=error_code):
+        transport.request(
+            "GET",
+            EASTMONEY_ULIST_URL,
+            params={},
+            headers={},
+            timeout_seconds=2,
+        )
+    assert calls == transport.request_count == 1
+
+
+@pytest.mark.parametrize(
+    ("upstream", "error_code"),
+    [
+        (RequestsResponse(status_code=503), "MARKET_SOURCE_HTTP_503"),
+        (
+            RequestsResponse(url="https://push2his.eastmoney.com/api/qt/test"),
+            "MARKET_SOURCE_RESPONSE_URL_INVALID",
+        ),
+        (
+            RequestsResponse(url="http://push2.eastmoney.com/api/qt/test"),
+            "MARKET_SOURCE_RESPONSE_URL_INVALID",
+        ),
+        (RequestsResponse(body=b""), "MARKET_SOURCE_EMPTY_RESPONSE"),
+        (
+            RequestsResponse(body=b"x" * (MAX_RESPONSE_BYTES + 1)),
+            "MARKET_SOURCE_RESPONSE_TOO_LARGE",
+        ),
+    ],
+)
+def test_requests_transport_rejects_invalid_response(upstream, error_code):
+    transport = MarketRequestsTransport(request_callable=lambda *args, **kwargs: upstream)
+    with pytest.raises(MarketSourceContractError, match=error_code):
+        transport.request(
+            "GET",
+            EASTMONEY_ULIST_URL,
+            params={},
+            headers={},
+            timeout_seconds=2,
+        )
+    assert transport.request_count == 1
+    assert upstream.closed is True
 
 
 def successful_runner(task, deadline_ms, worker_command):
@@ -261,6 +391,7 @@ def test_market_breadth_uses_full_pool_counts_and_eastmoney_index():
     assert payload["valid_count"] == 10
     assert payload["breadth_ratio"] == pytest.approx(6 / 10)
     assert payload["index_change_pct"] == 0.42
+    assert payload["benchmark_change_field"] == "f170"
     assert set(payload["index_breadth"]) == {"000001", "399001", "899050"}
     assert payload["raw_benchmark_event_time"] == datetime.fromtimestamp(
         EVENT_TS, tz=CN_TZ
@@ -268,6 +399,26 @@ def test_market_breadth_uses_full_pool_counts_and_eastmoney_index():
     assert batch.records[0]["event_time"] == CUTOFF
     assert batch.records[0]["origin_source"] == "eastmoney"
     assert validate_market_source_records("market_breadth", batch.records)["valid"]
+
+
+def test_market_breadth_rejects_f3_when_stock_f170_is_missing():
+    responses = market_responses()
+    responses[-1] = response(
+        {"data": {"f3": 0.42, "f57": "000001", "f58": "上证指数", "f86": EVENT_TS}},
+        EASTMONEY_STOCK_URL,
+    )
+    with pytest.raises(MarketSourceContractError, match="MARKET_INDEX_CHANGE_INVALID"):
+        provider(responses).collect_market_breadth_batch()
+
+
+def test_ulist_f170_never_changes_stock_get_benchmark_change():
+    responses = market_responses()
+    payload = json.loads(responses[0].content.decode("utf-8"))
+    for row in payload["data"]["diff"]:
+        row["f170"] = 9999
+    responses[0] = response(payload, EASTMONEY_ULIST_URL)
+    batch = provider(responses).collect_market_breadth_batch()
+    assert batch.records[0]["payload"]["index_change_pct"] == 0.42
 
 
 def test_market_stock_pool_incomplete_fails_closed():
@@ -503,6 +654,66 @@ def test_legacy_v1_evidence_is_verified_for_audit_only():
     assert result["provider_validation_passed"] is False
     assert result["audit_only"] is True
     assert result["qualification_eligible"] is False
+
+
+def test_previous_v2_evidence_is_verified_for_audit_only():
+    evidence = {
+        "evidence_schema_version": PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+        "evidence_hash": "",
+        "provider_keys": PROVIDER_KEYS,
+        "requested_codes": list(FIXED_CODES),
+        "provider_verifier_contract_hash": (
+            compute_previous_market_source_verifier_contract_hash()
+        ),
+        "capability_registry_hash": (
+            "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
+        ),
+        "provider_validation_passed": True,
+        "automatic_configuration_change": False,
+        "automatic_qualification_change": False,
+        "data_ready": False,
+        "hard_gate_authorized": False,
+        "candidates": [],
+        "tickets": [],
+        "orders": [],
+    }
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="d" * 64
+    )
+    assert result["status"] == EVIDENCE_VERIFIED
+    assert result["evidence_integrity_verified"] is True
+    assert result["provider_validation_passed"] is False
+    assert result["audit_only"] is True
+    assert result["qualification_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("transport_version", "eastmoney_requests_v999"),
+        ("source_version", "push2_fflow_kline_requests_v2099-01-01"),
+    ],
+)
+def test_resigned_v3_transport_or_source_version_tamper_is_rejected(
+    tmp_path, monkeypatch, field, value
+):
+    evidence = deepcopy(complete_evidence(tmp_path, monkeypatch, f"{field}.json"))
+    if field == "transport_version":
+        evidence[field] = value
+    else:
+        evidence["records_by_capability"]["fund_flow"][0][field] = value
+        contract = validate_market_source_records(
+            "fund_flow", evidence["records_by_capability"]["fund_flow"]
+        )
+        evidence["capability_results"]["fund_flow"]["records_hash"] = contract[
+            "records_hash"
+        ]
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="e" * 64
+    )
+    assert result["status"] == EVIDENCE_INVALID
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
 
 
 def test_record_order_does_not_change_contract_hash():

@@ -3,23 +3,32 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
 import ssl
 import subprocess
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlencode, urlparse
-from urllib.request import Request, build_opener, getproxies
+from urllib.parse import urlparse
+from urllib.request import getproxies
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import (
     EASTMONEY_CLIST_URL,
     EASTMONEY_FUND_FLOW_URL,
+    EASTMONEY_STOCK_URL,
     EASTMONEY_ULIST_URL,
+    FUND_FLOW_PREFLIGHT_PARAMS,
     FIXED_CODES,
+    INDUSTRY_BOARD_PARAMS,
+    MARKET_BREADTH_PARAMS,
+    MARKET_INDEX_PARAMS,
+    MARKET_REQUESTS_TRANSPORT_VERSION,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
+    MarketRequestsTransport,
+    MarketSourceContractError,
 )
 from overnight_quant.data.market_session_confirmation import (
     SESSION_CONFIRMED,
@@ -38,9 +47,11 @@ from overnight_quant.data.static_source_qualification import (
 
 
 GO_NOGO_EVIDENCE_SCHEMA_V1 = "market_source_go_nogo_evidence_v1"
-GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v2"
+GO_NOGO_EVIDENCE_SCHEMA_V2 = "market_source_go_nogo_evidence_v2"
+GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v3"
 GO_NOGO_VERIFIER_CONTRACT_V1 = "market_source_go_nogo_verifier_v1"
-GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v2"
+GO_NOGO_VERIFIER_CONTRACT_V2 = "market_source_go_nogo_verifier_v2"
+GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v3"
 SAMPLING_GO = "SAMPLING_GO"
 NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
@@ -52,45 +63,20 @@ OFFICIAL_USER_AGENT = (
     "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 )
 OFFICIAL_ENDPOINTS = {
-    "market_breadth": EASTMONEY_ULIST_URL
-    + "?"
-    + urlencode(
-        sorted(
-            {
-                "fltt": "2",
-                "invt": "2",
-                "secids": "1.000001,0.399001,0.899050",
-                "fields": "f3,f12,f14,f104,f105,f106,f124",
-            }.items()
-        )
+    "market_breadth": EASTMONEY_ULIST_URL,
+    "industry_snapshot": EASTMONEY_CLIST_URL,
+    "fund_flow": EASTMONEY_FUND_FLOW_URL,
+}
+OFFICIAL_ENDPOINT_REQUESTS = {
+    "market_breadth": (
+        ("market_breadth_counts", EASTMONEY_ULIST_URL, MARKET_BREADTH_PARAMS),
+        ("market_benchmark_change", EASTMONEY_STOCK_URL, MARKET_INDEX_PARAMS),
     ),
-    "industry_snapshot": EASTMONEY_CLIST_URL
-    + "?"
-    + urlencode(
-        sorted(
-            {
-                "pn": "1",
-                "pz": "500",
-                "po": "1",
-                "np": "1",
-                "fltt": "2",
-                "invt": "2",
-                "fs": "m:90+t:2",
-                "fields": "f3,f12,f14,f104,f105,f106,f124",
-            }.items()
-        )
+    "industry_snapshot": (
+        ("industry_boards", EASTMONEY_CLIST_URL, INDUSTRY_BOARD_PARAMS),
     ),
-    "fund_flow": EASTMONEY_FUND_FLOW_URL
-    + "?"
-    + urlencode(
-        sorted(
-            {
-                "secid": "0.000001",
-                "klt": "1",
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57",
-            }.items()
-        )
+    "fund_flow": (
+        ("fund_flow_sample", EASTMONEY_FUND_FLOW_URL, FUND_FLOW_PREFLIGHT_PARAMS),
     ),
 }
 
@@ -185,6 +171,12 @@ def run_market_source_go_nogo(
         not identity_errors,
         {"errors": identity_errors, "source_versions": _source_versions()},
     )
+    add(
+        "transport_version",
+        environment.get("transport_version")
+        == MARKET_REQUESTS_TRANSPORT_VERSION,
+        environment.get("transport_version"),
+    )
     for name in ("dns", "tls"):
         add(f"official_{name}", environment.get(name) is True, environment.get(name))
     endpoint_reachability = dict(environment.get("endpoint_reachability") or {})
@@ -226,6 +218,9 @@ def run_market_source_go_nogo(
         {
             "evidence_schema_version": GO_NOGO_EVIDENCE_SCHEMA_VERSION,
             "verifier_contract_version": GO_NOGO_VERIFIER_CONTRACT_VERSION,
+            "verifier_contract_hash": (
+                compute_market_source_go_nogo_verifier_contract_hash()
+            ),
             "status": SAMPLING_GO if go else NO_GO,
             "execution_ok": True,
             "evidence_integrity_verified": False,
@@ -278,8 +273,11 @@ def verify_market_source_go_nogo_evidence(
     current_session_actual_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload = dict(evidence)
-    if payload.get("evidence_schema_version") == GO_NOGO_EVIDENCE_SCHEMA_V1:
-        return _verify_v1_evidence(
+    if payload.get("evidence_schema_version") in {
+        GO_NOGO_EVIDENCE_SCHEMA_V1,
+        GO_NOGO_EVIDENCE_SCHEMA_V2,
+    }:
+        return _verify_legacy_evidence(
             payload,
             expected_file_sha256=expected_file_sha256,
             actual_file_sha256=actual_file_sha256,
@@ -289,6 +287,11 @@ def verify_market_source_go_nogo_evidence(
         errors.append("schema_version_invalid")
     if payload.get("verifier_contract_version") != GO_NOGO_VERIFIER_CONTRACT_VERSION:
         errors.append("verifier_contract_version_invalid")
+    if (
+        payload.get("verifier_contract_hash")
+        != compute_market_source_go_nogo_verifier_contract_hash()
+    ):
+        errors.append("verifier_contract_hash_mismatch")
     if payload.get("execution_ok") is not True:
         errors.append("execution_ok_invalid")
     if payload.get("go_nogo_evidence_hash") != compute_go_nogo_evidence_hash(payload):
@@ -349,6 +352,18 @@ def verify_market_source_go_nogo_evidence(
     names = [row.get("name") for row in checks if isinstance(row, Mapping)]
     if len(names) != len(set(names)) or not names:
         errors.append("environment_checks_invalid")
+    transport_checks = [
+        row
+        for row in checks
+        if isinstance(row, Mapping) and row.get("name") == "transport_version"
+    ]
+    if (
+        len(transport_checks) != 1
+        or transport_checks[0].get("passed") is not True
+        or transport_checks[0].get("detail")
+        != MARKET_REQUESTS_TRANSPORT_VERSION
+    ):
+        errors.append("transport_version_check_invalid")
     _validate_contract_check(
         checks,
         "completed_calendar_contract",
@@ -391,14 +406,18 @@ def verify_market_source_go_nogo_evidence(
     )
 
 
-def _verify_v1_evidence(
+def _verify_legacy_evidence(
     payload: Mapping[str, Any],
     *,
     expected_file_sha256: str | None,
     actual_file_sha256: str | None,
 ) -> dict[str, Any]:
     errors: list[str] = []
-    if payload.get("verifier_contract_version") != GO_NOGO_VERIFIER_CONTRACT_V1:
+    expected_version = {
+        GO_NOGO_EVIDENCE_SCHEMA_V1: GO_NOGO_VERIFIER_CONTRACT_V1,
+        GO_NOGO_EVIDENCE_SCHEMA_V2: GO_NOGO_VERIFIER_CONTRACT_V2,
+    }.get(payload.get("evidence_schema_version"))
+    if payload.get("verifier_contract_version") != expected_version:
         errors.append("verifier_contract_version_invalid")
     if payload.get("go_nogo_evidence_hash") != compute_go_nogo_evidence_hash(payload):
         errors.append("evidence_hash_mismatch")
@@ -408,8 +427,8 @@ def _verify_v1_evidence(
         errors.append("external_sha256_anchor_mismatch")
     if payload.get("fixed_codes") != list(FIXED_CODES):
         errors.append("fixed_codes_mismatch")
-    if payload.get("source_versions") != _source_versions():
-        errors.append("source_versions_mismatch")
+    if not isinstance(payload.get("source_versions"), Mapping):
+        errors.append("source_versions_invalid")
     evidence_scope = payload.get("evidence_scope")
     if evidence_scope not in {"production", "test_only"}:
         errors.append("evidence_scope_invalid")
@@ -431,7 +450,7 @@ def _verify_v1_evidence(
     return _safe(
         {
             "status": (
-                "MARKET_SOURCE_GO_NOGO_V1_EVIDENCE_VERIFIED_AUDIT_ONLY"
+                "MARKET_SOURCE_GO_NOGO_LEGACY_EVIDENCE_VERIFIED_AUDIT_ONLY"
                 if verified
                 else "MARKET_SOURCE_GO_NOGO_EVIDENCE_INVALID"
             ),
@@ -497,6 +516,32 @@ def compute_go_nogo_evidence_hash(evidence: Mapping[str, Any]) -> str:
     return stable_hash(material)
 
 
+def compute_market_source_go_nogo_verifier_contract_hash() -> str:
+    return stable_hash({
+        "version": GO_NOGO_VERIFIER_CONTRACT_VERSION,
+        "evidence_schema_version": GO_NOGO_EVIDENCE_SCHEMA_VERSION,
+        "source_identities": SOURCE_IDENTITIES,
+        "provider_keys": PROVIDER_KEYS,
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "preflight_endpoints": {
+            capability: [
+                {
+                    "label": label,
+                    "url": url,
+                    "params": sorted(
+                        (str(key), str(value))
+                        for key, value in params.items()
+                    ),
+                }
+                for label, url, params in specs
+            ]
+            for capability, specs in sorted(
+                OFFICIAL_ENDPOINT_REQUESTS.items()
+            )
+        },
+    })
+
+
 def write_go_nogo_json_atomic(path: str | Path, payload: Mapping[str, Any]) -> Path:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -534,30 +579,39 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
                 tls_ok = True
     except OSError:
         pass
-    opener = build_opener()
-    for capability, url in sorted(OFFICIAL_ENDPOINTS.items()):
-        request_hashes[capability] = stable_hash({"method": "GET", "url": url})
-        try:
-            request = Request(
-                url,
-                headers={"User-Agent": OFFICIAL_USER_AGENT},
-                method="GET",
-            )
-            before = datetime.now(timezone.utc)
-            with opener.open(request, timeout=2.0) as response:
-                response.read(1)
-                final = urlparse(response.geturl())
-                endpoint_reachability[capability] = int(response.status) == 200 and final.scheme == "https" and final.hostname == OFFICIAL_HOST
-                if endpoint_reachability[capability]:
-                    tls_ok = True
+    transport = MarketRequestsTransport()
+    for capability, requests_spec in sorted(OFFICIAL_ENDPOINT_REQUESTS.items()):
+        sub_hashes: list[str] = []
+        endpoint_ok = True
+        for label, url, params in requests_spec:
+            sub_hashes.append(stable_hash({
+                "method": "GET",
+                "url": url,
+                "params": sorted((str(key), str(value)) for key, value in params.items()),
+                "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+            }))
+            try:
+                response = transport.request(
+                    "GET",
+                    url,
+                    params=params,
+                    headers={"User-Agent": OFFICIAL_USER_AGENT},
+                    timeout_seconds=2.0,
+                )
+                if not _preflight_response_valid(label, response.content):
+                    endpoint_ok = False
                 header = response.headers.get("Date")
                 if header:
                     from email.utils import parsedate_to_datetime
-                    date_samples.append(parsedate_to_datetime(header).astimezone(timezone.utc))
-            after = datetime.now(timezone.utc)
-        except Exception:
-            endpoint_reachability[capability] = False
-            continue
+                    date_samples.append(
+                        parsedate_to_datetime(header).astimezone(timezone.utc)
+                    )
+            except (MarketSourceContractError, ValueError, TypeError):
+                endpoint_ok = False
+        endpoint_reachability[capability] = endpoint_ok
+        request_hashes[capability] = stable_hash(sub_hashes)
+        if endpoint_ok:
+            tls_ok = True
     if date_samples:
         local = datetime.now(timezone.utc)
         clock_skew_ms = min(abs((local - value).total_seconds() * 1000) for value in date_samples)
@@ -579,7 +633,80 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
         "residual_workers": _matching_processes(),
         "duplicate_tasks": _matching_tasks(),
         "similar_collectors": [],
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
     }
+
+
+def _preflight_response_valid(label: str, raw: bytes) -> bool:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Mapping):
+        return False
+    if label == "market_breadth_counts":
+        rows = data.get("diff")
+        if not isinstance(rows, list):
+            return False
+        by_code = {
+            str(row.get("f12") or "").zfill(6): row
+            for row in rows
+            if isinstance(row, Mapping)
+        }
+        if set(by_code) != {"000001", "399001", "899050"}:
+            return False
+        return all(
+            all(_preflight_nonnegative_int(row.get(field)) for field in ("f104", "f105", "f106"))
+            and _preflight_timestamp(row.get("f124"))
+            for row in by_code.values()
+        )
+    if label == "market_benchmark_change":
+        return (
+            str(data.get("f57") or "").zfill(6) == "000001"
+            and bool(str(data.get("f58") or "").strip())
+            and _preflight_number(data.get("f170"))
+            and _preflight_timestamp(data.get("f86"))
+        )
+    if label == "industry_boards":
+        rows = data.get("diff")
+        return isinstance(rows, list) and bool(rows) and all(
+            isinstance(row, Mapping)
+            and bool(str(row.get("f12") or "").strip())
+            and bool(str(row.get("f14") or "").strip())
+            and _preflight_number(row.get("f3"))
+            and all(_preflight_nonnegative_int(row.get(field)) for field in ("f104", "f105", "f106"))
+            and _preflight_timestamp(row.get("f124"))
+            for row in rows
+        )
+    if label == "fund_flow_sample":
+        rows = data.get("klines")
+        return isinstance(rows, list) and bool(rows)
+    return False
+
+
+def _preflight_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _preflight_nonnegative_int(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False
+    return number >= 0 and str(value).strip() in {str(number), f"{number}.0"}
+
+
+def _preflight_timestamp(value: Any) -> bool:
+    try:
+        return int(float(value)) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _completed_calendar_errors(
@@ -772,6 +899,8 @@ def _safe(payload: dict[str, Any]) -> dict[str, Any]:
         "candidates": [],
         "tickets": [],
         "orders": [],
+        "task_actions": [],
+        "enabled_tasks": [],
     }
 
 

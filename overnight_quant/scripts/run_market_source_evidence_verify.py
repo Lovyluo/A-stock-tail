@@ -19,10 +19,13 @@ from overnight_quant.data.market_source_providers import (
     EVIDENCE_SCHEMA_VERSION,
     FIXED_CODES,
     LEGACY_EVIDENCE_SCHEMA_VERSION,
+    MARKET_REQUESTS_TRANSPORT_VERSION,
+    PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     PROVIDER_KEYS,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
     compute_legacy_market_source_verifier_contract_hash,
+    compute_previous_market_source_verifier_contract_hash,
     compute_market_source_verifier_contract_hash,
     validate_market_source_records,
 )
@@ -69,10 +72,28 @@ class ReplayTransport:
             raise ValueError("replay_request_mismatch")
         if item.get("request_hash") != expected_request_hash:
             raise ValueError("replay_request_hash_mismatch")
+        if item.get("transport_version") != MARKET_REQUESTS_TRANSPORT_VERSION:
+            raise ValueError("replay_transport_version_mismatch")
+        request_started = parse_cn_datetime(item.get("request_started_at"))
+        request_completed = parse_cn_datetime(item.get("request_completed_at"))
+        if (
+            request_started is None
+            or request_completed is None
+            or request_completed < request_started
+        ):
+            raise ValueError("replay_request_time_invalid")
         raw = base64.b64decode(item.get("content_base64") or "", validate=True)
         if len(raw) != item.get("byte_count") or hashlib.sha256(raw).hexdigest() != item.get("raw_hash"):
             raise ValueError("replay_raw_hash_mismatch")
-        return MarketHttpResponse(raw, item.get("http_status_code"), item.get("response_url"))
+        return MarketHttpResponse(
+            raw,
+            item.get("http_status_code"),
+            item.get("response_url"),
+            {},
+            item.get("request_started_at"),
+            item.get("request_completed_at"),
+            item.get("transport_version"),
+        )
 
 
 class ReplayClock:
@@ -94,8 +115,11 @@ def verify_market_source_evidence(
     expected_file_sha256: str | None,
 ) -> dict[str, Any]:
     payload = dict(evidence)
-    if payload.get("evidence_schema_version") == LEGACY_EVIDENCE_SCHEMA_VERSION:
-        return _verify_legacy_v1_evidence(
+    if payload.get("evidence_schema_version") in {
+        LEGACY_EVIDENCE_SCHEMA_VERSION,
+        PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+    }:
+        return _verify_legacy_evidence(
             payload,
             expected_file_sha256=expected_file_sha256,
         )
@@ -106,6 +130,8 @@ def verify_market_source_evidence(
         errors.append("evidence_hash_mismatch")
     if payload.get("provider_keys") != PROVIDER_KEYS:
         errors.append("provider_keys_mismatch")
+    if payload.get("transport_version") != MARKET_REQUESTS_TRANSPORT_VERSION:
+        errors.append("transport_version_mismatch")
     if payload.get("requested_codes") != list(FIXED_CODES):
         errors.append("fixed_codes_mismatch")
     if payload.get("provider_verifier_contract_hash") != compute_market_source_verifier_contract_hash():
@@ -231,7 +257,7 @@ def verify_market_source_evidence(
     }
 
 
-def _verify_legacy_v1_evidence(
+def _verify_legacy_evidence(
     payload: Mapping[str, Any],
     *,
     expected_file_sha256: str | None,
@@ -243,12 +269,21 @@ def _verify_legacy_v1_evidence(
         errors.append("provider_keys_mismatch")
     if payload.get("requested_codes") != list(FIXED_CODES):
         errors.append("fixed_codes_mismatch")
-    if (
-        payload.get("provider_verifier_contract_hash")
-        != compute_legacy_market_source_verifier_contract_hash()
-    ):
+    expected_contract_hash = (
+        compute_legacy_market_source_verifier_contract_hash()
+        if payload.get("evidence_schema_version")
+        == LEGACY_EVIDENCE_SCHEMA_VERSION
+        else compute_previous_market_source_verifier_contract_hash()
+    )
+    if payload.get("provider_verifier_contract_hash") != expected_contract_hash:
         errors.append("legacy_verifier_contract_hash_mismatch")
-    if payload.get("capability_registry_hash") != LEGACY_CAPABILITY_REGISTRY_HASH:
+    expected_registry_hash = (
+        LEGACY_CAPABILITY_REGISTRY_HASH
+        if payload.get("evidence_schema_version")
+        == LEGACY_EVIDENCE_SCHEMA_VERSION
+        else "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
+    )
+    if payload.get("capability_registry_hash") != expected_registry_hash:
         errors.append("legacy_capability_registry_hash_mismatch")
     for key in (
         "data_ready",
