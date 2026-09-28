@@ -146,3 +146,39 @@ combined production matrix was rebuilt from its actual entries and contains
 exactly 32 entries, 8 bound providers, and 7 inactive candidates. The three S2
 candidates remain unqualified at 0/3; announcement candidates do not satisfy
 any S2 readiness gate.
+
+## Transport qualification diagnostics
+
+Eastmoney transport selection is a separate audit-only process. It does not
+authorize a source, create a qualification day, or call the formal 14:50
+collector. `run_market_transport_diagnostic.py` executes exactly one selected
+path per invocation:
+
+- `python_requests_current_v1`: current requests headers and environment proxy;
+- `python_requests_fixed_headers_v1`: requests plus fixed public `Accept` and
+  `Referer` headers;
+- `dotnet_httpclient_diagnostic_v1`: independent Windows .NET HttpClient path.
+
+Each invocation makes one request for the market breadth counters, one request
+for `stock/get.f170`, one industry-board request, one mapping request per fixed
+stock, and one fund-flow request per fixed stock. It never retries, falls back,
+or switches transport after a failure. TLS verification remains enabled and a
+redirect is recorded and rejected rather than followed. Proxy audit output is
+limited to scheme, host, port, and listener state; credentials are neither
+persisted nor logged.
+
+Evidence is exclusive-create UTF-8 JSON under ignored cache. It contains raw
+response bytes, request/header/raw hashes, DNS/TLS/proxy observations, request
+times, redirect information, and exception-chain types. Integrity verification
+is separate from transport qualification: a faithfully captured timeout or
+field failure can be `MARKET_TRANSPORT_DIAGNOSTIC_VERIFIED` while
+`candidate_round_passed=false`.
+
+A transport can be selected only after at least three independently anchored
+rounds, each separated by at least 60 seconds, with at least one round during a
+confirmed trading day from 14:40 through 14:48. Every one of the 13 request
+units must return HTTP 200 from `https://push2.eastmoney.com`, finish within the
+existing 2000 ms deadline, satisfy the v3 fields, and replay deterministically.
+Exactly one transport must pass the full matrix. No winner produces
+`EASTMONEY_TRANSPORT_UNQUALIFIED`; multiple winners produce an ambiguous result.
+Neither result changes production transport configuration automatically.
