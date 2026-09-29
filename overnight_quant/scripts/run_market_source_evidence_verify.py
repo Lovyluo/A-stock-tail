@@ -227,6 +227,18 @@ def verify_market_source_evidence(
         if result.get("status") == "MARKET_SOURCE_CAPABILITY_FAILED":
             if original:
                 errors.append(f"{capability}:failed_batch_records_not_empty")
+            if responses:
+                errors.append(f"{capability}:failed_batch_responses_not_empty")
+            attempts = list(
+                (payload.get("transport_attempts") or {}).get(capability) or []
+            )
+            if (
+                result.get("transport_qualified") is not False
+                or not str(result.get("error_code") or "")
+                or not attempts
+                or not any(item.get("ok") is False for item in attempts)
+            ):
+                errors.append(f"{capability}:transport_failure_audit_invalid")
             replayed_by_capability[capability] = []
             continue
         try:

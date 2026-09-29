@@ -968,6 +968,9 @@ def compute_market_source_verifier_contract_hash() -> str:
             "qualification": "all_capabilities_equal_14_50",
             "audit_only": "market_and_industry_explicit_fund_flow_pinned",
         },
+        "transport_failure_evidence": (
+            "external_anchor_attempt_only_unqualified"
+        ),
     })
 
 

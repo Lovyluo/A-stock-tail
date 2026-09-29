@@ -108,6 +108,8 @@ def _serialize_response(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     try:
         task = json.loads(sys.stdin.read())
         payload = run_task(task)

@@ -476,6 +476,54 @@ def test_transport_qualified_provider_incomplete_is_replayable_failure(
     assert result["candidates"] == result["tickets"] == result["orders"] == []
 
 
+def test_no_response_transport_failure_is_integrity_verified_but_unqualified(
+    tmp_path, monkeypatch
+):
+    def runner(task, deadline_ms, worker_command):
+        if task["capability"] != "industry_snapshot":
+            return successful_runner(task, deadline_ms, worker_command)
+        return {
+            "ok": True,
+            "payload": {
+                "records": [],
+                "responses": [],
+                "transport_attempts": [
+                    {
+                        "ok": False,
+                        "error_code": "MARKET_SOURCE_REQUEST_FAILED",
+                        "worker_terminated": False,
+                    }
+                ],
+                "transport_qualified": False,
+                "provider_contract_complete": False,
+                "error_code": "MARKET_SOURCE_REQUEST_FAILED",
+                "provider_error_code": "MARKET_SOURCE_REQUEST_FAILED",
+                "batch_status": "MARKET_SOURCE_CAPABILITY_FAILED",
+            },
+            "elapsed_ms": 25,
+        }
+
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    path = tmp_path / "transport-failure.json"
+    evidence = run_market_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output=path,
+        evidence_scope="audit_only",
+        worker_runner=runner,
+    )
+    assert evidence["capability_results"]["industry_snapshot"]["status"] == (
+        "MARKET_SOURCE_CAPABILITY_FAILED"
+    )
+    result = verify_file(path, expected_file_sha256=file_sha256(path))
+    assert result["status"] == EVIDENCE_VERIFIED
+    assert result["evidence_integrity_verified"] is True
+    assert result["provider_validation_passed"] is False
+    assert result["qualification_eligible"] is False
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
 def resign_evidence(evidence):
     evidence["evidence_hash"] = validation.compute_evidence_hash(evidence)
     return evidence

@@ -133,7 +133,12 @@ def run_market_source_validation(
             results[capability] = {
                 "status": (
                     "MARKET_SOURCE_CAPABILITY_VALIDATED"
-                    if provider_complete else "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+                    if provider_complete
+                    else (
+                        "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+                        if payload.get("transport_qualified") is True
+                        else "MARKET_SOURCE_CAPABILITY_FAILED"
+                    )
                 ),
                 "error_code": str(payload.get("error_code") or ""),
                 "provider_error_code": str(payload.get("provider_error_code") or ""),

@@ -86,7 +86,7 @@ atomic UTF-8 creation. Verification requires an externally supplied file
 SHA-256 and reconstructs all normalized records from captured raw bytes.
 Failure evidence can pass integrity verification, but cannot become a qualified
 day. `market_source_evidence_v4` is bound to
-`market_source_verifier_v4` (`77ed6f4934e1281521e7b0d03a4d15a7929b650a4c3dc7fe16974b52e0c9c5b1`).
+`market_source_verifier_v4` (`34c4162259187ba6e182763bcd338c9dfae342cb7cf66f6115975ac6d1957f76`).
 The verifier recomputes the three-market breadth counts, event-minute labels,
 industry board timing, transport identity, request identities, and raw response
 hashes. Legacy v1, v2, and v3 evidence remain externally anchored audit evidence only and always report
