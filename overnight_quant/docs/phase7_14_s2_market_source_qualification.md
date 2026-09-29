@@ -19,7 +19,9 @@ days.
 ## Field contracts
 
 The market record uses `origin_source=eastmoney` for both components. The fixed
-benchmark is SSE Composite (`secid=1.000001`). Market breadth uses Eastmoney
+benchmark is SSE Composite (`secid=1.000001`). Its change is read only from
+`stock/get.f170` under `fltt=2`; `f3` is not a substitute and `ulist.f170` is
+not part of the breadth calculation. Market breadth uses Eastmoney
 index breadth counters for SSE Composite, SZSE Component, and BSE 50
 (`secids=1.000001,0.399001,0.899050`), versioned as
 `eastmoney_index_breadth_sh_sz_bj_v2026-09-21`. The clist endpoint currently
@@ -43,9 +45,9 @@ formula as market breadth. The industry board update time is the formal event
 time for breadth. The stock-to-industry mapping is a static classification
 observed before the collection deadline; its quote update timestamp is retained
 for audit, but it cannot move a valid 14:50 board breadth record into a later
-decision minute. This timing contract is identified as
-`push2_stock_industry+board_breadth_v2026-09-23`; the previous 2026-09-18
-identity is not interchangeable with it.
+decision minute. This timing and transport contract is identified as
+`push2_stock_industry+board_breadth_requests_v2026-09-28`; earlier identities
+are not interchangeable with it.
 
 Fund-flow values are denominated in CNY. Each row describes one minute interval
 (`value_semantics=minute_interval_net_flow`,
@@ -57,24 +59,30 @@ provider batch.
 
 Providers have no default network construction in the adapter registry. The
 validation command requires `--network`, runs each provider batch in a killable
-child process, and enforces an absolute collection deadline. There is one
-attempt only: no retry, fallback, demo data, or cross-source stitching.
+child process, and enforces an absolute collection deadline. The only
+production transport is `MarketRequestsTransport`, version
+`eastmoney_requests_v1`, using the existing `requests` dependency with TLS
+verification enabled. It permits the process environment's configured proxy,
+but does not select or start one. Every request is a single attempt: no retry,
+urllib fallback, demo data, or cross-source stitching. Redirects that leave
+HTTPS `push2.eastmoney.com`, HTTP errors, timeout, empty or oversized responses,
+and connection failures are rejected.
 
 Raw responses and evidence are written only to ignored cache using exclusive,
 atomic UTF-8 creation. Verification requires an externally supplied file
 SHA-256 and reconstructs all normalized records from captured raw bytes.
 Failure evidence can pass integrity verification, but cannot become a qualified
-day. `market_source_evidence_v2` is bound to
-`market_source_verifier_v2` (`220cdd293f64f91b6fb726bccf36cbc51633ccfae6f8cdbdaffb918f6e85cea4`).
+day. `market_source_evidence_v3` is bound to
+`market_source_verifier_v3` (`743eaa46214a508bd8f212412f27d47a4fad3e835419e9f89d9eaf6ed44618f6`).
 The verifier recomputes the three-market breadth counts, event-minute labels,
-industry board timing, request identities, and raw response hashes. Legacy v1
-evidence remains externally anchored audit evidence only and always reports
+industry board timing, transport identity, request identities, and raw response
+hashes. Legacy v1 and v2 evidence remain externally anchored audit evidence only and always report
 `provider_validation_passed=false` and `qualification_eligible=false`.
 
 ## Independent Go/No-Go evidence
 
 `run_market_source_go_nogo.ps1` is a pre-sampling environment gate. It does not
-request or require 14:50 formal records. Evidence v2 requires two independently
+request or require 14:50 formal records. Evidence v3 requires two independently
 anchored contracts: the S1 Tencent calendar still contains completed dates
 strictly before the target day, while a separate Tencent quote confirmation
 proves that all five fixed stocks have current-day events after the morning
@@ -97,9 +105,13 @@ guard. Their evidence is marked `test_only` and cannot authorize a production
 sample. Production calendar checks must also reference the approved S1 partial
 qualification record. The current-session confirmation must use the bound
 Tencent quote provider and exact production envelope. Both input files require
-external SHA-256 anchors; self-signed files are not sufficient. Legacy v1
-Go/No-Go evidence remains verifiable for audit, but can never authorize a new
-sample.
+external SHA-256 anchors; self-signed files are not sufficient. The preflight
+uses the same requests transport as the formal worker and requires both the
+`ulist.np/get` breadth fields and the `stock/get.f170` benchmark fields before
+`official_endpoint:market_breadth` can pass. Legacy v1 and v2 Go/No-Go evidence
+remain verifiable for audit, but can never authorize a new sample. The v3
+Go/No-Go verifier contract hash is
+`a26f3ede03d7ceb10a30bdb3c35ebff5615cc3f1f681b9684294a2212862ab1a`.
 
 ## Qualification gate
 
@@ -115,10 +127,10 @@ sufficient evidence for an intraday Go/No-Go, and no hurried sampling was
 started. Current state remains:
 
 ```text
-capability_registry_schema=source_capability_registry_v4
-capability_registry_hash=eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed
-adapter_registry_schema=source_capability_adapter_registry_v7
-adapter_registry_hash=3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a
+capability_registry_schema=source_capability_registry_v5
+capability_registry_hash=500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e
+adapter_registry_schema=source_capability_adapter_registry_v8
+adapter_registry_hash=00acaa2ccec9cacee6957ebb75973e26b66e6fe1b62812a5e7650adf87e62f2e
 bound_count=8
 candidate_count=7
 consecutive_count=0/3

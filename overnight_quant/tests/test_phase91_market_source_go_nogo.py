@@ -9,16 +9,26 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 import pytest
 
+import overnight_quant.data.market_source_go_nogo as go_nogo
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_go_nogo import (
+    GO_NOGO_EVIDENCE_SCHEMA_V1,
+    GO_NOGO_EVIDENCE_SCHEMA_V2,
+    GO_NOGO_VERIFIER_CONTRACT_V1,
+    GO_NOGO_VERIFIER_CONTRACT_V2,
     NO_GO,
     SAMPLING_GO,
+    compute_go_nogo_evidence_hash,
     file_sha256,
     run_market_source_go_nogo,
     verify_market_source_go_nogo_evidence,
+)
+from overnight_quant.data.market_source_providers import (
+    MARKET_REQUESTS_TRANSPORT_VERSION,
 )
 from overnight_quant.data.market_session_confirmation import (
     build_market_session_confirmation,
@@ -121,6 +131,7 @@ def _environment(**changes) -> dict:
         "now": f"{TRADE_DATE}T12:30:00+08:00",
         "timezone_id": "China Standard Time",
         "clock_skew_ms": 250,
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
         "dns": True,
         "tls": True,
         "proxy": {"in_use": False, "local": False, "listening": None},
@@ -273,6 +284,174 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
     _assert_safe(result)
 
 
+@pytest.mark.parametrize(
+    ("schema_version", "verifier_version"),
+    [
+        (GO_NOGO_EVIDENCE_SCHEMA_V1, GO_NOGO_VERIFIER_CONTRACT_V1),
+        (GO_NOGO_EVIDENCE_SCHEMA_V2, GO_NOGO_VERIFIER_CONTRACT_V2),
+    ],
+)
+def test_legacy_go_nogo_evidence_is_audit_only(
+    schema_version, verifier_version
+):
+    payload = run_market_source_go_nogo(
+        trade_date=TRADE_DATE,
+        codes=FIXED_CODES.split(","),
+        calendar_contract=_calendar(),
+        calendar_expected_file_sha256=_json_sha(_calendar()),
+        calendar_actual_file_sha256=_json_sha(_calendar()),
+        session_confirmation_contract=_confirmation(),
+        session_expected_file_sha256=_json_sha(_confirmation()),
+        session_actual_file_sha256=_json_sha(_confirmation()),
+        environment=_environment(),
+        started_at=f"{TRADE_DATE}T12:29:59+08:00",
+        completed_at=f"{TRADE_DATE}T12:30:01+08:00",
+        evidence_scope="production",
+    )
+    payload["evidence_schema_version"] = schema_version
+    payload["verifier_contract_version"] = verifier_version
+    payload["go_nogo_evidence_hash"] = compute_go_nogo_evidence_hash(payload)
+    result = verify_market_source_go_nogo_evidence(
+        payload,
+        expected_file_sha256="f" * 64,
+        actual_file_sha256="f" * 64,
+    )
+    assert result["evidence_integrity_verified"] is True
+    assert result["audit_only"] is True
+    assert result["sampling_authorized"] is False
+    _assert_safe(result)
+
+
+def test_task_inventory_allows_windows_cold_start_beyond_three_seconds(monkeypatch):
+    observed = {}
+
+    def fake_check_output(command, *, text, timeout):
+        observed.update(command=command, text=text, timeout=timeout)
+        return "AStockMarketSource-Zeta\nAStockMarketSource-Alpha\n"
+
+    monkeypatch.setattr(go_nogo.os, "name", "nt")
+    monkeypatch.setattr(go_nogo.subprocess, "check_output", fake_check_output)
+
+    assert go_nogo._matching_tasks() == [
+        "AStockMarketSource-Alpha",
+        "AStockMarketSource-Zeta",
+    ]
+    assert observed["timeout"] == go_nogo.TASK_INVENTORY_TIMEOUT_SECONDS
+    assert observed["timeout"] > 3
+    assert "State -ne 'Disabled'" in observed["command"][-1]
+
+
+def test_task_inventory_ignores_disabled_historical_tasks_on_windows():
+    if os.name != "nt":
+        pytest.skip("Windows scheduled-task behavior")
+    task_name = "AStockMarketSource-Historical-Disabled-Test"
+    create = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            (
+                "$a=New-ScheduledTaskAction -Execute 'cmd.exe' "
+                "-Argument '/c exit 0'; "
+                f"Register-ScheduledTask -TaskName '{task_name}' -Action $a "
+                "-Description 'phase91 disabled task audit' -Force | Out-Null; "
+                f"Disable-ScheduledTask -TaskName '{task_name}' | Out-Null"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert create.returncode == 0, create.stderr
+    try:
+        assert task_name not in go_nogo._matching_tasks()
+    finally:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_go_nogo_endpoints_match_formal_provider_request_shapes():
+    market_requests = go_nogo.OFFICIAL_ENDPOINT_REQUESTS["market_breadth"]
+    industry_requests = go_nogo.OFFICIAL_ENDPOINT_REQUESTS["industry_snapshot"]
+    fund_requests = go_nogo.OFFICIAL_ENDPOINT_REQUESTS["fund_flow"]
+
+    assert [item[0] for item in market_requests] == [
+        "market_breadth_counts",
+        "market_benchmark_change",
+    ]
+    assert urlparse(market_requests[0][1]).path == "/api/qt/ulist.np/get"
+    assert market_requests[0][2]["fields"] == "f12,f14,f104,f105,f106,f124"
+    assert "f170" not in market_requests[0][2]["fields"]
+    assert urlparse(market_requests[1][1]).path == "/api/qt/stock/get"
+    assert market_requests[1][2]["fields"] == "f57,f58,f86,f170"
+    assert "f3" not in market_requests[1][2]["fields"]
+    assert urlparse(industry_requests[0][1]).path == "/api/qt/clist/get"
+    assert industry_requests[0][2]["fields"] == "f3,f12,f14,f104,f105,f106,f124"
+    assert urlparse(fund_requests[0][1]).path == "/api/qt/stock/fflow/kline/get"
+    assert fund_requests[0][2]["fields1"] == "f1,f2,f3,f7"
+    assert fund_requests[0][2]["fields2"] == "f51,f52,f53,f54,f55,f56,f57"
+    assert "Chrome/126.0" in go_nogo.OFFICIAL_USER_AGENT
+
+
+def test_market_breadth_preflight_requires_counts_and_f170_endpoints():
+    counts = json.dumps({
+        "data": {"diff": [
+            {"f12": "000001", "f14": "上证指数", "f104": 1, "f105": 1, "f106": 0, "f124": 1_790_000_000},
+            {"f12": "399001", "f14": "深证成指", "f104": 1, "f105": 1, "f106": 0, "f124": 1_790_000_000},
+            {"f12": "899050", "f14": "北证50", "f104": 1, "f105": 1, "f106": 0, "f124": 1_790_000_000},
+        ]}
+    }).encode("utf-8")
+    benchmark = json.dumps({
+        "data": {"f57": "000001", "f58": "上证指数", "f86": 1_790_000_000, "f170": 0.25}
+    }).encode("utf-8")
+    f3_only = json.dumps({
+        "data": {"f57": "000001", "f58": "上证指数", "f86": 1_790_000_000, "f3": 0.25}
+    }).encode("utf-8")
+
+    assert go_nogo._preflight_response_valid("market_breadth_counts", counts)
+    assert go_nogo._preflight_response_valid("market_benchmark_change", benchmark)
+    assert not go_nogo._preflight_response_valid("market_benchmark_change", f3_only)
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"clock_skew_ms": None, "endpoint_reachability": {
+            "market_breadth": False,
+            "industry_snapshot": False,
+            "fund_flow": False,
+        }}, "clock_skew_within_limit"),
+        ({"transport_version": "eastmoney_requests_v999"}, "transport_version"),
+    ],
+)
+def test_go_nogo_rejects_unverifiable_clock_or_transport(changes, reason):
+    result = run_market_source_go_nogo(
+        trade_date=TRADE_DATE,
+        codes=FIXED_CODES.split(","),
+        calendar_contract=_calendar(),
+        calendar_expected_file_sha256=_json_sha(_calendar()),
+        calendar_actual_file_sha256=_json_sha(_calendar()),
+        session_confirmation_contract=_confirmation(),
+        session_expected_file_sha256=_json_sha(_confirmation()),
+        session_actual_file_sha256=_json_sha(_confirmation()),
+        environment=_environment(**changes),
+        started_at=f"{TRADE_DATE}T12:29:59+08:00",
+        completed_at=f"{TRADE_DATE}T12:30:01+08:00",
+        evidence_scope="production",
+    )
+    assert result["status"] == NO_GO
+    assert result["sampling_authorized"] is False
+    assert reason in result["failure_reasons"]
+    _assert_safe(result)
+
+
 def test_combined_candidates_keep_announcements_outside_s2_gate():
     candidates = [
         row
@@ -292,9 +471,9 @@ def test_combined_candidates_keep_announcements_outside_s2_gate():
     } <= identities
     s2 = {identity for identity in identities if identity[0] != "announcement"}
     assert s2 == {
-        ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_v2026-09-21"),
-        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_v2026-09-23"),
-        ("fund_flow", "eastmoney", "push2_fflow_kline_v2026-09-18"),
+        ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_f170_requests_v2026-09-28"),
+        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_requests_v2026-09-28"),
+        ("fund_flow", "eastmoney", "push2_fflow_kline_requests_v2026-09-28"),
     }
 
 

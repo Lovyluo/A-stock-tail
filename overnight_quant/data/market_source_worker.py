@@ -9,8 +9,8 @@ from typing import Any
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import (
     EastmoneyMarketSourceProviders,
+    MarketRequestsTransport,
     MarketSourceContractError,
-    MarketUrllibTransport,
 )
 
 
@@ -20,7 +20,7 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
         trade_date=str(task.get("trade_date") or ""),
         feature_cutoff=str(task.get("feature_cutoff") or ""),
         collection_deadline=str(task.get("collection_deadline") or ""),
-        transport=MarketUrllibTransport(),
+        transport=MarketRequestsTransport(),
         clock=lambda: datetime.now(CN_TZ),
         timeout_seconds=float(task.get("request_timeout_seconds") or 2.0),
     )

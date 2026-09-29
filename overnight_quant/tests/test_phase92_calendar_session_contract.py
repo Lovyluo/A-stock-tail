@@ -32,6 +32,7 @@ from overnight_quant.data.market_source_go_nogo import (
 )
 from overnight_quant.data.market_source_providers import (
     FIXED_CODES,
+    MARKET_REQUESTS_TRANSPORT_VERSION,
     SOURCE_IDENTITIES,
 )
 from overnight_quant.data.source_capability_adapters import (
@@ -141,6 +142,7 @@ def _environment() -> dict:
         "now": f"{TRADE_DATE}T12:30:00+08:00",
         "timezone_id": "China Standard Time",
         "clock_skew_ms": 100,
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
         "dns": True,
         "tls": True,
         "proxy": {"in_use": False, "local": False, "listening": None},

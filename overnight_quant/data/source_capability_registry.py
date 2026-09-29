@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
-REGISTRY_SCHEMA_VERSION = "source_capability_registry_v4"
+REGISTRY_SCHEMA_VERSION = "source_capability_registry_v5"
 QUALIFICATION_PROGRESS_MOOTDX = "3/3"
 QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED = "0/3"
 QUALIFIED_MOOTDX_ENDPOINT_ID = "mootdx_locked@59.36.5.11:7709"
@@ -354,7 +354,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "market_breadth",
-        "push2_index_breadth+sse_index_v2026-09-21",
+        "push2_index_breadth+sse_index_f170_requests_v2026-09-28",
         True,
         "unqualified",
         "0/3",
@@ -370,7 +370,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "industry_snapshot",
-        "push2_stock_industry+board_breadth_v2026-09-23",
+        "push2_stock_industry+board_breadth_requests_v2026-09-28",
         True,
         "unqualified",
         "0/3",
@@ -386,7 +386,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "fund_flow",
-        "push2_fflow_kline_v2026-09-18",
+        "push2_fflow_kline_requests_v2026-09-28",
         True,
         "unqualified",
         "0/3",
