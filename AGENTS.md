@@ -5,6 +5,16 @@ origin: custom
 version: 3.1
 ---
 
+## 项目进度与工作区治理
+
+- 每次实质操作后必须同步更新仓库根目录的 `项目进度说明.md`。
+- 实质操作包括 commit、push、PR、merge、Release、资格采样、资格裁决、计划任务和 worktree 变更。
+- 普通只读检查不需要写入进度文档。
+- 状态不确定时必须写 `UNKNOWN`，不得推测、补造或把预期状态写成已完成状态。
+- 进度文档超过 400 行、超过 30KB、完成一个 Release、跨月或最近操作超过 10 条时必须压缩。
+- 压缩时将历史内容移动到 `docs/project-history/YYYY-QN.md`；必须保留资格裁决、关键 SHA、Release、失败原因和安全边界。
+- 重复测试明细可压缩为最终结果、CI 链接和 SHA，不得删除失败原因。
+
 > 📦 项目主页：https://github.com/simonlin1212/a-stock-data — 更新、反馈、支持作者
 > 
 > 作者：Simon 林 · 抖音「Simon林」· 公众号「硅基世纪」
