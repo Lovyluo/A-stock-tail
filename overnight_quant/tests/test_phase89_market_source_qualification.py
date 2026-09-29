@@ -20,6 +20,7 @@ from overnight_quant.data.market_source_providers import (
     INDUSTRY_CLASSIFICATION_VERSION,
     LEGACY_EVIDENCE_SCHEMA_VERSION,
     MARKET_REQUESTS_TRANSPORT_VERSION,
+    PRODUCTION_TRANSPORT_VERSION,
     MARKET_STOCK_POOL_VERSION,
     MAX_RESPONSE_BYTES,
     PREVIOUS_EVIDENCE_SCHEMA_VERSION,
@@ -68,7 +69,7 @@ class FakeTransport:
     def __init__(self, responses):
         self.responses = list(responses)
         self.request_count = 0
-        self.transport_version = MARKET_REQUESTS_TRANSPORT_VERSION
+        self.transport_version = PRODUCTION_TRANSPORT_VERSION
 
     def request(self, method, url, *, params, headers, timeout_seconds):
         self.request_count += 1
@@ -105,7 +106,7 @@ def response(payload, url=EASTMONEY_CLIST_URL):
         {},
         "2026-09-18T14:50:01.000000+08:00",
         "2026-09-18T14:50:01.000500+08:00",
-        MARKET_REQUESTS_TRANSPORT_VERSION,
+        PRODUCTION_TRANSPORT_VERSION,
     )
 
 
@@ -168,12 +169,12 @@ def fund_responses(*, missing_code=False):
     return values
 
 
-def provider(responses, *, late=False):
+def provider(responses, *, late=False, feature_cutoff=CUTOFF, collection_deadline=DEADLINE):
     return EastmoneyMarketSourceProviders(
         FIXED_CODES,
         trade_date=TRADE_DATE,
-        feature_cutoff=CUTOFF,
-        collection_deadline=DEADLINE,
+        feature_cutoff=feature_cutoff,
+        collection_deadline=collection_deadline,
         transport=FakeTransport(responses),
         clock=Clock(late=late),
     )
@@ -296,7 +297,11 @@ def successful_runner(task, deadline_ms, worker_command):
         "industry_snapshot": industry_responses(),
         "fund_flow": fund_responses(),
     }[capability]
-    instance = provider(responses)
+    instance = provider(
+        responses,
+        feature_cutoff=task["feature_cutoff"],
+        collection_deadline=task["collection_deadline"],
+    )
     batch = {
         "market_breadth": instance.collect_market_breadth_batch,
         "industry_snapshot": instance.collect_industry_batch,
@@ -316,6 +321,17 @@ def successful_runner(task, deadline_ms, worker_command):
         "payload": {
             "records": list(batch.records),
             "responses": serialized,
+            "transport_attempts": [
+                {
+                    "ok": True,
+                    "error_code": "",
+                    "process_elapsed_ms": 25,
+                    "worker_terminated": False,
+                }
+                for _ in serialized
+            ],
+            "transport_qualified": True,
+            "provider_contract_complete": True,
             "batch_status": batch.status,
         },
         "elapsed_ms": 25,
@@ -330,6 +346,134 @@ def complete_evidence(tmp_path, monkeypatch, name="complete.json"):
         output=tmp_path / name,
         worker_runner=successful_runner,
     )
+
+
+def test_audit_only_uses_explicit_market_cutoff_without_changing_fund_cutoff(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def runner(task, deadline_ms, worker_command):
+        seen[task["capability"]] = task["feature_cutoff"]
+        return successful_runner(task, deadline_ms, worker_command)
+
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    audit_cutoff = f"{TRADE_DATE}T16:30:00+08:00"
+    evidence = run_market_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output=tmp_path / "audit-cutoffs.json",
+        evidence_scope="audit_only",
+        audit_market_feature_cutoff=audit_cutoff,
+        collection_deadline=f"{TRADE_DATE}T16:31:00+08:00",
+        worker_runner=runner,
+    )
+    assert seen == {
+        "market_breadth": audit_cutoff,
+        "industry_snapshot": audit_cutoff,
+        "fund_flow": CUTOFF,
+    }
+    assert evidence["capability_feature_cutoffs"] == seen
+    result = verify_file(
+        tmp_path / "audit-cutoffs.json",
+        expected_file_sha256=file_sha256(tmp_path / "audit-cutoffs.json"),
+    )
+    assert result["status"] == EVIDENCE_VERIFIED
+    assert result["audit_only"] is True
+    assert result["qualification_eligible"] is False
+
+
+def test_resigned_capability_cutoff_tampering_is_rejected(tmp_path, monkeypatch):
+    evidence = deepcopy(complete_evidence(tmp_path, monkeypatch, "cutoff-tamper.json"))
+    evidence["capability_feature_cutoffs"]["industry_snapshot"] = (
+        f"{TRADE_DATE}T14:49:00+08:00"
+    )
+    result = verify_market_source_evidence(
+        resign_evidence(evidence), expected_file_sha256="e" * 64
+    )
+    assert result["status"] == EVIDENCE_INVALID
+    assert "qualification_capability_cutoff_mismatch" in result["errors"]
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
+
+
+def test_transport_qualified_provider_incomplete_is_replayable_failure(
+    tmp_path, monkeypatch
+):
+    def runner(task, deadline_ms, worker_command):
+        capability = task["capability"]
+        responses = {
+            "market_breadth": market_responses(),
+            "industry_snapshot": industry_responses(missing_mapping=True),
+            "fund_flow": fund_responses(),
+        }[capability]
+        instance = provider(responses)
+        method = {
+            "market_breadth": instance.collect_market_breadth_batch,
+            "industry_snapshot": instance.collect_industry_batch,
+            "fund_flow": instance.collect_fund_flow_batch,
+        }[capability]
+        error = ""
+        try:
+            batch = method()
+            records = list(batch.records)
+            captured = list(batch.responses)
+            complete = True
+        except MarketSourceContractError as exc:
+            error = exc.code
+            records = []
+            captured = list(instance.captured_responses)
+            complete = False
+        serialized = []
+        for item in captured:
+            raw = item["raw_bytes"]
+            serialized.append({
+                **{key: value for key, value in item.items() if key != "raw_bytes"},
+                "encoding": "base64",
+                "content_base64": base64.b64encode(raw).decode("ascii"),
+                "byte_count": len(raw),
+            })
+        return {
+            "ok": True,
+            "payload": {
+                "records": records,
+                "responses": serialized,
+                "transport_attempts": [
+                    {"ok": True, "worker_terminated": False}
+                    for _ in serialized
+                ],
+                "transport_qualified": True,
+                "provider_contract_complete": complete,
+                "error_code": (
+                    "" if complete else "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+                ),
+                "provider_error_code": error,
+                "batch_status": (
+                    "AVAILABLE"
+                    if complete
+                    else "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+                ),
+            },
+            "elapsed_ms": 25,
+        }
+
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    path = tmp_path / "provider-incomplete.json"
+    evidence = run_market_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output=path,
+        worker_runner=runner,
+    )
+    assert evidence["status"] == "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+    assert evidence["transport_qualified"] is True
+    assert evidence["provider_contract_complete"] is False
+    result = verify_file(path, expected_file_sha256=file_sha256(path))
+    assert result["status"] == EVIDENCE_VERIFIED
+    assert result["provider_validation_passed"] is False
+    assert result["qualification_eligible"] is False
+    assert result["data_ready"] is False
+    assert result["candidates"] == result["tickets"] == result["orders"] == []
 
 
 def resign_evidence(evidence):
@@ -666,7 +810,7 @@ def test_previous_v2_evidence_is_verified_for_audit_only():
             compute_previous_market_source_verifier_contract_hash()
         ),
         "capability_registry_hash": (
-            "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
+            "500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e"
         ),
         "provider_validation_passed": True,
         "automatic_configuration_change": False,

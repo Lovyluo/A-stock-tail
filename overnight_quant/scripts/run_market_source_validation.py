@@ -20,7 +20,7 @@ from overnight_quant.data.market_source_providers import (
     DEFAULT_BATCH_DEADLINE_MS,
     EVIDENCE_SCHEMA_VERSION,
     FIXED_CODES,
-    MARKET_REQUESTS_TRANSPORT_VERSION,
+    PRODUCTION_TRANSPORT_VERSION,
     PROVIDER_KEYS,
     compute_market_source_verifier_contract_hash,
     validate_market_source_records,
@@ -46,6 +46,8 @@ def run_market_source_validation(
     feature_cutoff: str | None = None,
     collection_deadline: str | None = None,
     batch_deadline_ms: int = DEFAULT_BATCH_DEADLINE_MS,
+    evidence_scope: str = "qualification",
+    audit_market_feature_cutoff: str | None = None,
     worker_runner: Any = run_probe_worker_process,
 ) -> dict[str, Any]:
     if not network:
@@ -66,28 +68,43 @@ def run_market_source_validation(
             "provider_validation_passed": False,
             "evidence_hash": "",
         })
+    if evidence_scope not in {"qualification", "audit_only"}:
+        raise ValueError("market_source_evidence_scope_invalid")
     target = _resolve_cache_output(output)
     if target.exists():
         raise FileExistsError(f"market_source_output_exists:{target}")
     normalized_codes = tuple(sorted(str(code).zfill(6) for code in codes))
     cutoff = feature_cutoff or f"{trade_date}T14:50:00+08:00"
     deadline = collection_deadline or f"{trade_date}T14:51:05+08:00"
+    if audit_market_feature_cutoff and evidence_scope != "audit_only":
+        raise ValueError("audit_market_feature_cutoff_requires_audit_only")
+    capability_feature_cutoffs = {
+        capability: (
+            audit_market_feature_cutoff
+            if evidence_scope == "audit_only"
+            and audit_market_feature_cutoff
+            and capability in {"market_breadth", "industry_snapshot"}
+            else cutoff
+        )
+        for capability in CAPABILITIES
+    }
     results: dict[str, dict[str, Any]] = {}
     records_by_capability: dict[str, list[dict[str, Any]]] = {}
     raw_responses: dict[str, list[dict[str, Any]]] = {}
+    transport_attempts: dict[str, list[dict[str, Any]]] = {}
     for capability in CAPABILITIES:
         task = {
             "capability": capability,
             "codes": normalized_codes,
             "trade_date": trade_date,
-            "feature_cutoff": cutoff,
+            "feature_cutoff": capability_feature_cutoffs[capability],
             "collection_deadline": deadline,
             "request_timeout_seconds": 2.0,
         }
         started = datetime.now(CN_TZ)
         worker = worker_runner(
             task,
-            int(batch_deadline_ms),
+            int(batch_deadline_ms) * _batch_request_budget(capability),
             worker_command=[
                 sys.executable,
                 "-m",
@@ -107,15 +124,21 @@ def run_market_source_validation(
                 require_hard_gate=False,
                 environ={},
             )
-            passed = (
+            provider_complete = (
+                payload.get("provider_contract_complete") is True
+                and
                 contract["valid"]
                 and provenance["status"] == "SOURCE_PROVENANCE_ACCEPTED"
             )
             results[capability] = {
                 "status": (
                     "MARKET_SOURCE_CAPABILITY_VALIDATED"
-                    if passed else "MARKET_SOURCE_CAPABILITY_REJECTED"
+                    if provider_complete else "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
                 ),
+                "error_code": str(payload.get("error_code") or ""),
+                "provider_error_code": str(payload.get("provider_error_code") or ""),
+                "transport_qualified": payload.get("transport_qualified") is True,
+                "provider_contract_complete": provider_complete,
                 "record_count": len(records),
                 "records_hash": contract["records_hash"],
                 "provenance_status": provenance["status"],
@@ -133,8 +156,9 @@ def run_market_source_validation(
                 "request_timed_out": False,
                 "worker_terminated": False,
             }
-            records_by_capability[capability] = records if passed else []
+            records_by_capability[capability] = records if provider_complete else []
             raw_responses[capability] = list(payload.get("responses") or [])
+            transport_attempts[capability] = list(payload.get("transport_attempts") or [])
         else:
             results[capability] = {
                 "status": "MARKET_SOURCE_CAPABILITY_FAILED",
@@ -145,40 +169,61 @@ def run_market_source_validation(
                 "request_timed_out": bool(worker.get("request_timed_out")),
                 "worker_terminated": bool(worker.get("worker_terminated")),
                 "record_count": 0,
+                "transport_qualified": False,
+                "provider_contract_complete": False,
             }
             records_by_capability[capability] = []
             raw_responses[capability] = []
-    passed = all(
+            transport_attempts[capability] = list(worker.get("transport_attempts") or [])
+    provider_complete = all(
         result.get("status") == "MARKET_SOURCE_CAPABILITY_VALIDATED"
         for result in results.values()
+    )
+    transport_qualified = all(
+        result.get("transport_qualified") is True for result in results.values()
     )
     evidence = _safe({
         "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "status": (
             "MARKET_SOURCE_NETWORK_VALIDATED"
-            if passed else "MARKET_SOURCE_NETWORK_VALIDATION_FAILED"
+            if provider_complete
+            else (
+                "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE"
+                if transport_qualified
+                else "MARKET_SOURCE_NETWORK_VALIDATION_FAILED"
+            )
         ),
         "execution_ok": True,
         "network_mode": True,
+        "evidence_scope": evidence_scope,
         "trade_date": trade_date,
         "feature_cutoff": cutoff,
+        "capability_feature_cutoffs": capability_feature_cutoffs,
         "collection_deadline": deadline,
         "requested_codes": list(normalized_codes),
         "provider_keys": dict(PROVIDER_KEYS),
-        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "transport_version": PRODUCTION_TRANSPORT_VERSION,
         "producer_commit_sha": _git_head(),
         "provider_verifier_contract_hash": compute_market_source_verifier_contract_hash(),
         "capability_registry_hash": compute_source_capability_registry_hash(),
         "capability_results": results,
         "records_by_capability": records_by_capability,
         "raw_responses": raw_responses,
+        "transport_attempts": transport_attempts,
         "network_requests_made": None,
         "upstream_network_activity": "isolated_workers",
-        "provider_validation_passed": passed,
+        "transport_qualified": transport_qualified,
+        "provider_contract_complete": provider_complete,
+        "provider_validation_passed": provider_complete,
         "evidence_integrity_verified": False,
-        "qualification_status": "PM_REVIEW_REQUIRED" if passed else "UNQUALIFIED",
+        "qualification_status": (
+            "PM_REVIEW_REQUIRED"
+            if provider_complete and evidence_scope == "qualification"
+            else "UNQUALIFIED"
+        ),
         "automatic_qualification_change": False,
         "consecutive_qualified_days": 0,
+        "source_qualification_count": 0,
         "evidence_hash": "",
     })
     evidence["evidence_hash"] = compute_evidence_hash(evidence)
@@ -190,6 +235,12 @@ def compute_evidence_hash(evidence: Mapping[str, Any]) -> str:
     material = dict(evidence)
     material.pop("evidence_hash", None)
     return stable_hash(material)
+
+
+def _batch_request_budget(capability: str) -> int:
+    return {"market_breadth": 2, "industry_snapshot": 10, "fund_flow": 5}[
+        capability
+    ]
 
 
 def file_sha256(path: str | Path) -> str:
@@ -241,11 +292,17 @@ def _git_head() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Validate S2 market source candidates")
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--date", required=True)
     parser.add_argument("--output")
     parser.add_argument("--batch-deadline-ms", type=int, default=DEFAULT_BATCH_DEADLINE_MS)
+    parser.add_argument("--feature-cutoff")
+    parser.add_argument("--collection-deadline")
+    parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--audit-market-feature-cutoff")
     args = parser.parse_args(argv)
     try:
         result = run_market_source_validation(
@@ -253,6 +310,10 @@ def main(argv: list[str] | None = None) -> int:
             trade_date=args.date,
             output=args.output,
             batch_deadline_ms=args.batch_deadline_ms,
+            feature_cutoff=args.feature_cutoff,
+            collection_deadline=args.collection_deadline,
+            evidence_scope="audit_only" if args.audit_only else "qualification",
+            audit_market_feature_cutoff=args.audit_market_feature_cutoff,
         )
     except (FileExistsError, ValueError) as exc:
         print(json.dumps(_safe({

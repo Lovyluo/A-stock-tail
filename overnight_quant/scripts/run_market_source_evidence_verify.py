@@ -19,13 +19,16 @@ from overnight_quant.data.market_source_providers import (
     EVIDENCE_SCHEMA_VERSION,
     FIXED_CODES,
     LEGACY_EVIDENCE_SCHEMA_VERSION,
-    MARKET_REQUESTS_TRANSPORT_VERSION,
+    PRODUCTION_TRANSPORT_VERSION,
     PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+    SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     PROVIDER_KEYS,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
+    MarketSourceContractError,
     compute_legacy_market_source_verifier_contract_hash,
     compute_previous_market_source_verifier_contract_hash,
+    compute_v2_market_source_verifier_contract_hash,
     compute_market_source_verifier_contract_hash,
     validate_market_source_records,
 )
@@ -72,7 +75,7 @@ class ReplayTransport:
             raise ValueError("replay_request_mismatch")
         if item.get("request_hash") != expected_request_hash:
             raise ValueError("replay_request_hash_mismatch")
-        if item.get("transport_version") != MARKET_REQUESTS_TRANSPORT_VERSION:
+        if item.get("transport_version") != PRODUCTION_TRANSPORT_VERSION:
             raise ValueError("replay_transport_version_mismatch")
         request_started = parse_cn_datetime(item.get("request_started_at"))
         request_completed = parse_cn_datetime(item.get("request_completed_at"))
@@ -93,6 +96,10 @@ class ReplayTransport:
             item.get("request_started_at"),
             item.get("request_completed_at"),
             item.get("transport_version"),
+            item.get("process_started_at") or "",
+            item.get("process_completed_at") or "",
+            item.get("process_elapsed_ms"),
+            item.get("worker_terminated") is True,
         )
 
 
@@ -118,6 +125,7 @@ def verify_market_source_evidence(
     if payload.get("evidence_schema_version") in {
         LEGACY_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+        SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -130,7 +138,7 @@ def verify_market_source_evidence(
         errors.append("evidence_hash_mismatch")
     if payload.get("provider_keys") != PROVIDER_KEYS:
         errors.append("provider_keys_mismatch")
-    if payload.get("transport_version") != MARKET_REQUESTS_TRANSPORT_VERSION:
+    if payload.get("transport_version") != PRODUCTION_TRANSPORT_VERSION:
         errors.append("transport_version_mismatch")
     if payload.get("requested_codes") != list(FIXED_CODES):
         errors.append("fixed_codes_mismatch")
@@ -139,8 +147,19 @@ def verify_market_source_evidence(
     if payload.get("capability_registry_hash") != compute_source_capability_registry_hash():
         errors.append("capability_registry_hash_mismatch")
     trade_date = str(payload.get("trade_date") or "")
-    expected_cutoff = parse_cn_datetime(f"{trade_date}T14:50:00+08:00")
-    expected_deadline = parse_cn_datetime(f"{trade_date}T14:51:05+08:00")
+    evidence_scope = payload.get("evidence_scope")
+    if evidence_scope not in {"qualification", "audit_only"}:
+        errors.append("evidence_scope_invalid")
+    expected_cutoff = parse_cn_datetime(
+        f"{trade_date}T14:50:00+08:00"
+        if evidence_scope == "qualification"
+        else payload.get("feature_cutoff")
+    )
+    expected_deadline = parse_cn_datetime(
+        f"{trade_date}T14:51:05+08:00"
+        if evidence_scope == "qualification"
+        else payload.get("collection_deadline")
+    )
     if (
         expected_cutoff is None
         or parse_cn_datetime(payload.get("feature_cutoff")) != expected_cutoff
@@ -152,8 +171,40 @@ def verify_market_source_evidence(
         != expected_deadline
     ):
         errors.append("collection_deadline_contract_mismatch")
+    capability_feature_cutoffs = payload.get("capability_feature_cutoffs")
     expected_capabilities = {"market_breadth", "industry_snapshot", "fund_flow"}
-    for field in ("capability_results", "records_by_capability", "raw_responses"):
+    if (
+        not isinstance(capability_feature_cutoffs, Mapping)
+        or set(capability_feature_cutoffs) != expected_capabilities
+    ):
+        errors.append("capability_feature_cutoffs_mismatch")
+        capability_feature_cutoffs = {
+            capability: payload.get("feature_cutoff")
+            for capability in expected_capabilities
+        }
+    else:
+        parsed_capability_cutoffs = {
+            capability: parse_cn_datetime(value)
+            for capability, value in capability_feature_cutoffs.items()
+        }
+        if any(value is None for value in parsed_capability_cutoffs.values()):
+            errors.append("capability_feature_cutoff_invalid")
+        if evidence_scope == "qualification" and any(
+            value != expected_cutoff
+            for value in parsed_capability_cutoffs.values()
+        ):
+            errors.append("qualification_capability_cutoff_mismatch")
+        if (
+            evidence_scope == "audit_only"
+            and parsed_capability_cutoffs.get("fund_flow") != expected_cutoff
+        ):
+            errors.append("audit_fund_flow_cutoff_mismatch")
+    for field in (
+        "capability_results",
+        "records_by_capability",
+        "raw_responses",
+        "transport_attempts",
+    ):
         value = payload.get(field)
         if not isinstance(value, Mapping) or set(value) != expected_capabilities:
             errors.append(f"{field}_capabilities_mismatch")
@@ -174,8 +225,8 @@ def verify_market_source_evidence(
         original = list((payload.get("records_by_capability") or {}).get(capability) or [])
         responses = list((payload.get("raw_responses") or {}).get(capability) or [])
         if result.get("status") == "MARKET_SOURCE_CAPABILITY_FAILED":
-            if original or responses:
-                errors.append(f"{capability}:failed_batch_not_empty")
+            if original:
+                errors.append(f"{capability}:failed_batch_records_not_empty")
             replayed_by_capability[capability] = []
             continue
         try:
@@ -183,12 +234,24 @@ def verify_market_source_evidence(
             provider = EastmoneyMarketSourceProviders(
                 payload.get("requested_codes") or [],
                 trade_date=payload.get("trade_date"),
-                feature_cutoff=payload.get("feature_cutoff"),
+                feature_cutoff=capability_feature_cutoffs.get(capability),
                 collection_deadline=payload.get("collection_deadline"),
                 transport=transport,
                 clock=ReplayClock(responses),
             )
-            batch = getattr(provider, method_name)()
+            try:
+                batch = getattr(provider, method_name)()
+            except MarketSourceContractError as exc:
+                if result.get("status") != "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE":
+                    raise
+                if result.get("provider_error_code") != exc.code:
+                    errors.append(f"{capability}:provider_error_code_mismatch")
+                if original:
+                    errors.append(f"{capability}:incomplete_batch_records_not_empty")
+                if transport.responses:
+                    errors.append(f"{capability}:unused_responses")
+                replayed_by_capability[capability] = []
+                continue
             replayed = list(batch.records)
             replayed_by_capability[capability] = replayed
             contract = validate_market_source_records(capability, replayed)
@@ -231,6 +294,19 @@ def verify_market_source_evidence(
     expected_provider_passed = validated_capabilities == expected_capabilities
     if payload.get("provider_validation_passed") is not expected_provider_passed:
         errors.append("provider_validation_summary_mismatch")
+    if payload.get("provider_contract_complete") is not expected_provider_passed:
+        errors.append("provider_contract_summary_mismatch")
+    expected_transport_qualified = all(
+        ((payload.get("capability_results") or {}).get(capability) or {}).get(
+            "transport_qualified"
+        )
+        is True
+        for capability in expected_capabilities
+    )
+    if payload.get("transport_qualified") is not expected_transport_qualified:
+        errors.append("transport_qualification_summary_mismatch")
+    if payload.get("source_qualification_count") != 0:
+        errors.append("source_qualification_count_changed")
     verified = not errors and bool(expected_file_sha256)
     replay_hash = stable_hash({
         "evidence_hash": payload.get("evidence_hash"),
@@ -242,9 +318,11 @@ def verify_market_source_evidence(
         "execution_ok": True,
         "evidence_integrity_verified": verified,
         "provider_validation_passed": bool(payload.get("provider_validation_passed")) if verified else False,
-        "audit_only": False,
+        "audit_only": evidence_scope == "audit_only",
         "qualification_eligible": bool(
-            verified and payload.get("provider_validation_passed") is True
+            verified
+            and evidence_scope == "qualification"
+            and payload.get("provider_validation_passed") is True
         ),
         "expected_file_sha256": expected_file_sha256 or "",
         "evidence_hash": payload.get("evidence_hash") or "",
@@ -269,20 +347,29 @@ def _verify_legacy_evidence(
         errors.append("provider_keys_mismatch")
     if payload.get("requested_codes") != list(FIXED_CODES):
         errors.append("fixed_codes_mismatch")
-    expected_contract_hash = (
-        compute_legacy_market_source_verifier_contract_hash()
-        if payload.get("evidence_schema_version")
-        == LEGACY_EVIDENCE_SCHEMA_VERSION
-        else compute_previous_market_source_verifier_contract_hash()
-    )
+    schema = payload.get("evidence_schema_version")
+    expected_contract_hash = {
+        LEGACY_EVIDENCE_SCHEMA_VERSION: (
+            compute_legacy_market_source_verifier_contract_hash()
+        ),
+        SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
+            compute_v2_market_source_verifier_contract_hash()
+        ),
+        PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
+            compute_previous_market_source_verifier_contract_hash()
+        ),
+    }.get(schema)
     if payload.get("provider_verifier_contract_hash") != expected_contract_hash:
         errors.append("legacy_verifier_contract_hash_mismatch")
-    expected_registry_hash = (
-        LEGACY_CAPABILITY_REGISTRY_HASH
-        if payload.get("evidence_schema_version")
-        == LEGACY_EVIDENCE_SCHEMA_VERSION
-        else "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
-    )
+    expected_registry_hash = {
+        LEGACY_EVIDENCE_SCHEMA_VERSION: LEGACY_CAPABILITY_REGISTRY_HASH,
+        SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
+            "eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed"
+        ),
+        PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
+            "500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e"
+        ),
+    }.get(schema)
     if payload.get("capability_registry_hash") != expected_registry_hash:
         errors.append("legacy_capability_registry_hash_mismatch")
     for key in (

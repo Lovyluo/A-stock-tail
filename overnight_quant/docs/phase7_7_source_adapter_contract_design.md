@@ -170,6 +170,12 @@ Schema v8 hash 为
 对应 capability registry v5 hash 为
 `500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e`。
 
+Eastmoney T2 将唯一候选生产传输切换为可终止的 .NET HttpClient worker，
+并为行业板块启用确定性完整分页。当前生产 Schema v9 hash 为
+`bd34f63782685c276717793aeb52bbccee2e57c959058bcf0adc6fcfe8e3029d`；
+对应 capability registry v6 hash 为
+`09b82c2b542628c3eb920fb0c91dc50bcc5bdb3b601060c4c8edac1f15d5a79d`。
+
 ## 4. 失效关闭执行链
 
 `execute_source_adapter()` 的顺序固定为：

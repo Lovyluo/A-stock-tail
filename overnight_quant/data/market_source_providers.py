@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
+import shutil
 import socket
+import subprocess
+import sys
+import time
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -27,13 +34,17 @@ EASTMONEY_FUND_FLOW_URL = (
 MARKET_BENCHMARK_SECID = "1.000001"
 MARKET_STOCK_POOL_VERSION = "eastmoney_index_breadth_sh_sz_bj_v2026-09-21"
 INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_industry_m90t2_v1"
-EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v3"
-PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
+EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v4"
+PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v3"
+SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
 LEGACY_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
-VERIFIER_CONTRACT_VERSION = "market_source_verifier_v3"
-PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
+VERIFIER_CONTRACT_VERSION = "market_source_verifier_v4"
+PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v3"
+SECONDARY_PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
 LEGACY_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
 MARKET_REQUESTS_TRANSPORT_VERSION = "eastmoney_requests_v1"
+MARKET_DOTNET_TRANSPORT_VERSION = "eastmoney_dotnet_httpclient_v1"
+PRODUCTION_TRANSPORT_VERSION = MARKET_DOTNET_TRANSPORT_VERSION
 MAX_RESPONSE_BYTES = 5_000_000
 MARKET_BREADTH_PARAMS = {
     "fltt": "2",
@@ -49,7 +60,7 @@ MARKET_INDEX_PARAMS = {
 }
 INDUSTRY_BOARD_PARAMS = {
     "pn": "1",
-    "pz": "500",
+    "pz": "100",
     "po": "1",
     "np": "1",
     "fltt": "2",
@@ -63,23 +74,23 @@ FUND_FLOW_PREFLIGHT_PARAMS = {
     "fields1": "f1,f2,f3,f7",
     "fields2": "f51,f52,f53,f54,f55,f56,f57",
 }
-DEFAULT_BATCH_DEADLINE_MS = 10_000
+DEFAULT_BATCH_DEADLINE_MS = 2_000
 
 SOURCE_IDENTITIES = {
     "market_breadth": (
         "eastmoney",
         "direct_http",
-        "push2_index_breadth+sse_index_f170_requests_v2026-09-28",
+        "push2_index_breadth+sse_index_f170_dotnet_v2026-09-29",
     ),
     "industry_snapshot": (
         "eastmoney",
         "direct_http",
-        "push2_stock_industry+board_breadth_requests_v2026-09-28",
+        "push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29",
     ),
     "fund_flow": (
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_requests_v2026-09-28",
+        "push2_fflow_kline_dotnet_v2026-09-29",
     ),
 }
 
@@ -103,6 +114,11 @@ _UA = (
     "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 )
 _ALLOWED_HOSTS = {"push2.eastmoney.com"}
+_PRODUCTION_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://quote.eastmoney.com/",
+}
 
 
 class MarketSourceContractError(RuntimeError):
@@ -120,6 +136,10 @@ class MarketHttpResponse:
     request_started_at: str = ""
     request_completed_at: str = ""
     transport_version: str = ""
+    process_started_at: str = ""
+    process_completed_at: str = ""
+    process_elapsed_ms: float | None = None
+    worker_terminated: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,7 +205,7 @@ class MarketUrllibTransport:
 
 
 class MarketRequestsTransport:
-    """Single-attempt production transport for Eastmoney qualification data."""
+    """Historical audit-only requests transport; never used for qualification."""
 
     def __init__(
         self,
@@ -295,6 +315,147 @@ class MarketRequestsTransport:
                 response.close()
 
 
+class MarketDotNetHttpClientTransport:
+    """Single-attempt, killable production candidate transport."""
+
+    def __init__(
+        self,
+        *,
+        worker_runner: Callable[[Mapping[str, Any], float, list[str]], Mapping[str, Any]] | None = None,
+        worker_command: Iterable[str] | None = None,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+    ) -> None:
+        if type(max_response_bytes) is not int or not 0 < max_response_bytes <= MAX_RESPONSE_BYTES:
+            raise ValueError("market_source_response_limit_invalid")
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "market_httpclient_worker.ps1"
+        )
+        self.worker_command = list(worker_command or [
+            shutil.which("pwsh.exe") or "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ])
+        self._worker_runner = worker_runner or _run_dotnet_http_worker
+        self.max_response_bytes = max_response_bytes
+        self.request_count = 0
+        self.transport_version = MARKET_DOTNET_TRANSPORT_VERSION
+        self.attempts: list[dict[str, Any]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> MarketHttpResponse:
+        if str(method).upper() != "GET":
+            raise MarketSourceContractError("MARKET_SOURCE_METHOD_INVALID")
+        requested = urlparse(str(url))
+        if (
+            requested.scheme != "https"
+            or requested.hostname not in _ALLOWED_HOSTS
+            or requested.port not in (None, 443)
+        ):
+            raise MarketSourceContractError("MARKET_SOURCE_REQUEST_URL_INVALID")
+        if not math.isfinite(float(timeout_seconds)) or not 0 < float(timeout_seconds) <= 2.0:
+            raise MarketSourceContractError("MARKET_SOURCE_TIMEOUT_INVALID")
+        request_headers = dict(_PRODUCTION_HEADERS)
+        request_headers.update({str(key): str(value) for key, value in headers.items()})
+        payload = {
+            "method": "GET",
+            "url": str(url),
+            "params": _canonical_pairs(params),
+            "headers": request_headers,
+            "request_deadline_ms": int(round(float(timeout_seconds) * 1000)),
+            "max_response_bytes": self.max_response_bytes,
+            "allowed_hosts": sorted(_ALLOWED_HOSTS),
+            "transport_version": MARKET_DOTNET_TRANSPORT_VERSION,
+        }
+        self.request_count += 1
+        try:
+            result = dict(self._worker_runner(
+                payload,
+                float(timeout_seconds),
+                list(self.worker_command),
+            ))
+        except TimeoutError as exc:
+            self.attempts.append({
+                "ok": False,
+                "error_code": "MARKET_SOURCE_TIMEOUT",
+                "worker_terminated": True,
+            })
+            raise MarketSourceContractError("MARKET_SOURCE_TIMEOUT") from exc
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.attempts.append({
+                "ok": False,
+                "error_code": "MARKET_SOURCE_WORKER_FAILED",
+                "worker_terminated": False,
+            })
+            raise MarketSourceContractError("MARKET_SOURCE_WORKER_FAILED") from exc
+        self.attempts.append(dict(result))
+        if result.get("ok") is not True:
+            code = str(result.get("error_code") or "MARKET_SOURCE_WORKER_FAILED")
+            raise MarketSourceContractError(code)
+        if result.get("transport_version") != MARKET_DOTNET_TRANSPORT_VERSION:
+            raise MarketSourceContractError("MARKET_SOURCE_TRANSPORT_VERSION_INVALID")
+        response = result.get("response")
+        if not isinstance(response, Mapping):
+            raise MarketSourceContractError("MARKET_SOURCE_WORKER_OUTPUT_INVALID")
+        final = urlparse(str(response.get("url") or ""))
+        if (
+            final.scheme != "https"
+            or final.hostname not in _ALLOWED_HOSTS
+            or final.port not in (None, 443)
+            or response.get("redirect_chain") not in ([], ())
+        ):
+            raise MarketSourceContractError("MARKET_SOURCE_RESPONSE_URL_INVALID")
+        if type(response.get("status_code")) is not int or response["status_code"] != 200:
+            status = response.get("status_code")
+            raise MarketSourceContractError(
+                f"MARKET_SOURCE_HTTP_{status}"
+                if type(status) is int
+                else "MARKET_SOURCE_HTTP_STATUS_INVALID"
+            )
+        try:
+            raw = base64.b64decode(
+                str(response.get("content_base64") or ""), validate=True
+            )
+        except (ValueError, TypeError) as exc:
+            raise MarketSourceContractError("MARKET_SOURCE_RESPONSE_ENCODING_INVALID") from exc
+        if not raw:
+            raise MarketSourceContractError("MARKET_SOURCE_EMPTY_RESPONSE")
+        if len(raw) > self.max_response_bytes:
+            raise MarketSourceContractError("MARKET_SOURCE_RESPONSE_TOO_LARGE")
+        if response.get("byte_count") != len(raw):
+            raise MarketSourceContractError("MARKET_SOURCE_RESPONSE_SIZE_INVALID")
+        if response.get("raw_hash") != hashlib.sha256(raw).hexdigest():
+            raise MarketSourceContractError("MARKET_SOURCE_RAW_HASH_INVALID")
+        elapsed = _optional_number(result.get("process_elapsed_ms"))
+        if elapsed is None or elapsed > float(timeout_seconds) * 1000:
+            raise MarketSourceContractError("MARKET_SOURCE_TIMEOUT")
+        return MarketHttpResponse(
+            raw,
+            200,
+            str(response["url"]),
+            dict(response.get("headers") or {}),
+            str(response.get("request_started_at") or ""),
+            str(response.get("request_completed_at") or ""),
+            MARKET_DOTNET_TRANSPORT_VERSION,
+            str(result.get("process_started_at") or ""),
+            str(result.get("process_completed_at") or ""),
+            float(elapsed),
+            bool(result.get("worker_terminated")),
+        )
+
+
 class EastmoneyMarketSourceProviders:
     def __init__(
         self,
@@ -324,6 +485,7 @@ class EastmoneyMarketSourceProviders:
         self.transport = transport
         self.clock = clock
         self.timeout_seconds = float(timeout_seconds)
+        self.captured_responses: list[dict[str, Any]] = []
 
     def collect_market_breadth_records(self) -> list[dict[str, Any]]:
         return list(self.collect_market_breadth_batch().records)
@@ -434,21 +596,57 @@ class EastmoneyMarketSourceProviders:
         return list(self.collect_industry_batch().records)
 
     def collect_industry_batch(self) -> MarketProviderBatch:
-        board_response = self._request(
-            "industry_snapshot",
-            EASTMONEY_CLIST_URL,
-            INDUSTRY_BOARD_PARAMS,
-        )
-        board_data = (_json_payload(board_response["raw_bytes"]).get("data") or {})
-        board_rows = board_data.get("diff") or []
+        board_responses: list[dict[str, Any]] = []
+        board_rows: list[Mapping[str, Any]] = []
+        expected_total: int | None = None
+        expected_pages: int | None = None
+        page = 1
+        while expected_pages is None or page <= expected_pages:
+            page_params = {**INDUSTRY_BOARD_PARAMS, "pn": str(page)}
+            board_response = self._request(
+                "industry_snapshot",
+                EASTMONEY_CLIST_URL,
+                page_params,
+            )
+            board_responses.append(board_response)
+            board_data = (
+                _json_payload(board_response["raw_bytes"]).get("data") or {}
+            )
+            total = _strict_int(
+                board_data.get("total"), "INDUSTRY_TOTAL_INVALID"
+            )
+            if total <= 0:
+                raise MarketSourceContractError("INDUSTRY_TOTAL_INVALID")
+            if expected_total is None:
+                expected_total = total
+                expected_pages = math.ceil(total / int(INDUSTRY_BOARD_PARAMS["pz"]))
+            elif total != expected_total:
+                raise MarketSourceContractError("INDUSTRY_TOTAL_DRIFT")
+            rows = board_data.get("diff")
+            if not isinstance(rows, list) or not rows:
+                raise MarketSourceContractError(f"INDUSTRY_PAGE_MISSING:{page}")
+            if page < expected_pages and len(rows) != int(INDUSTRY_BOARD_PARAMS["pz"]):
+                raise MarketSourceContractError(f"INDUSTRY_PAGE_INCOMPLETE:{page}")
+            board_rows.extend(rows)
+            page += 1
+        if expected_total is None or len(board_rows) != expected_total:
+            raise MarketSourceContractError("INDUSTRY_TOTAL_COUNT_MISMATCH")
         by_name: dict[str, dict[str, Any]] = {}
+        board_codes: set[str] = set()
         for item in board_rows:
             name = str(item.get("f14") or "").strip()
-            if not name or name in by_name:
+            board_code = str(item.get("f12") or "").strip()
+            if (
+                not name
+                or not board_code
+                or name in by_name
+                or board_code in board_codes
+            ):
                 raise MarketSourceContractError("INDUSTRY_BOARD_IDENTITY_INVALID")
             by_name[name] = item
+            board_codes.add(board_code)
         records: list[dict[str, Any]] = []
-        responses = [board_response]
+        responses = list(board_responses)
         for code in self.codes:
             mapping = self._request(
                 "industry_snapshot",
@@ -490,10 +688,16 @@ class EastmoneyMarketSourceProviders:
                 "industry_snapshot",
                 "industry",
                 event_time,
-                max(_as_cn(board_response["observed_at"]), _as_cn(mapping["observed_at"])),
-                max(_as_cn(board_response["available_at"]), _as_cn(mapping["available_at"])),
-                stable_hash([board_response["request_hash"], mapping["request_hash"]]),
-                stable_hash([board_response["raw_hash"], mapping["raw_hash"]]),
+                max(*(_as_cn(item["observed_at"]) for item in board_responses), _as_cn(mapping["observed_at"])),
+                max(*(_as_cn(item["available_at"]) for item in board_responses), _as_cn(mapping["available_at"])),
+                stable_hash([
+                    *(item["request_hash"] for item in board_responses),
+                    mapping["request_hash"],
+                ]),
+                stable_hash([
+                    *(item["raw_hash"] for item in board_responses),
+                    mapping["raw_hash"],
+                ]),
                 {
                     "code": code,
                     "name": industry_name,
@@ -501,6 +705,12 @@ class EastmoneyMarketSourceProviders:
                     "industry_name": industry_name,
                     "board_code": str(board.get("f12") or ""),
                     "classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+                    "board_page_size": int(INDUSTRY_BOARD_PARAMS["pz"]),
+                    "board_page_count": expected_pages,
+                    "board_total_count": expected_total,
+                    "board_page_raw_hashes": [
+                        item["raw_hash"] for item in board_responses
+                    ],
                     "change_pct": change,
                     "breadth_ratio": up / total,
                     "raw_board_event_time": board_event.isoformat(),
@@ -591,14 +801,14 @@ class EastmoneyMarketSourceProviders:
         remaining = (self.collection_deadline - observed).total_seconds()
         timeout = min(self.timeout_seconds, remaining)
         response = self.transport.request(
-            "GET", url, params=params, headers={"User-Agent": _UA},
+            "GET", url, params=params, headers=_PRODUCTION_HEADERS,
             timeout_seconds=timeout,
         )
         transport_version = (
             response.transport_version
             or getattr(self.transport, "transport_version", "")
         )
-        if transport_version != MARKET_REQUESTS_TRANSPORT_VERSION:
+        if transport_version != PRODUCTION_TRANSPORT_VERSION:
             raise MarketSourceContractError(
                 "MARKET_SOURCE_TRANSPORT_VERSION_INVALID"
             )
@@ -625,7 +835,7 @@ class EastmoneyMarketSourceProviders:
         if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_HOSTS:
             raise MarketSourceContractError("MARKET_SOURCE_RESPONSE_URL_INVALID")
         raw = bytes(response.content)
-        return {
+        audit = {
             "capability": capability,
             "method": "GET",
             "url": url,
@@ -639,12 +849,18 @@ class EastmoneyMarketSourceProviders:
                 timespec="microseconds"
             ),
             "transport_version": transport_version,
+            "process_started_at": response.process_started_at,
+            "process_completed_at": response.process_completed_at,
+            "process_elapsed_ms": response.process_elapsed_ms,
+            "worker_terminated": response.worker_terminated,
             "request_hash": stable_hash({"method": "GET", "url": url, "params": _canonical_pairs(params)}),
             "raw_hash": hashlib.sha256(raw).hexdigest(),
             "raw_bytes": raw,
             "http_status_code": 200,
             "response_url": response.url,
         }
+        self.captured_responses.append(audit)
+        return audit
 
     def _record(
         self,
@@ -740,14 +956,50 @@ def compute_market_source_verifier_contract_hash() -> str:
         "fixed_codes": FIXED_CODES,
         "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
         "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
-        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "transport_version": PRODUCTION_TRANSPORT_VERSION,
         "market_index_change_field": "f170",
+        "industry_pagination": {
+            "page_size": int(INDUSTRY_BOARD_PARAMS["pz"]),
+            "total_required": True,
+            "continuous_pages": True,
+            "per_page_raw_hash": True,
+        },
+        "capability_cutoff_contract": {
+            "qualification": "all_capabilities_equal_14_50",
+            "audit_only": "market_and_industry_explicit_fund_flow_pinned",
+        },
     })
 
 
 def compute_previous_market_source_verifier_contract_hash() -> str:
     return stable_hash({
         "version": PREVIOUS_VERIFIER_CONTRACT_VERSION,
+        "source_identities": {
+            "market_breadth": (
+                "eastmoney", "direct_http",
+                "push2_index_breadth+sse_index_f170_requests_v2026-09-28",
+            ),
+            "industry_snapshot": (
+                "eastmoney", "direct_http",
+                "push2_stock_industry+board_breadth_requests_v2026-09-28",
+            ),
+            "fund_flow": (
+                "eastmoney", "direct_http",
+                "push2_fflow_kline_requests_v2026-09-28",
+            ),
+        },
+        "provider_keys": PROVIDER_KEYS,
+        "fixed_codes": FIXED_CODES,
+        "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
+        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "market_index_change_field": "f170",
+    })
+
+
+def compute_v2_market_source_verifier_contract_hash() -> str:
+    return stable_hash({
+        "version": SECONDARY_PREVIOUS_VERIFIER_CONTRACT_VERSION,
         "source_identities": {
             "market_breadth": (
                 "eastmoney", "direct_http",
@@ -884,6 +1136,20 @@ def _valid_industry_record(record: Mapping[str, Any]) -> bool:
         and payload.get("event_time_granularity") == "minute"
         and payload.get("mapping_time_semantics")
         == "static_classification_observed_before_deadline"
+        and payload.get("board_page_size") == int(INDUSTRY_BOARD_PARAMS["pz"])
+        and type(payload.get("board_page_count")) is int
+        and payload.get("board_page_count") > 0
+        and type(payload.get("board_total_count")) is int
+        and payload.get("board_total_count") > 0
+        and payload.get("board_page_count")
+        == math.ceil(
+            payload.get("board_total_count")
+            / int(INDUSTRY_BOARD_PARAMS["pz"])
+        )
+        and isinstance(payload.get("board_page_raw_hashes"), list)
+        and len(payload.get("board_page_raw_hashes"))
+        == payload.get("board_page_count")
+        and all(_sha(value) for value in payload.get("board_page_raw_hashes"))
     ):
         return False
     board_event = parse_cn_datetime(payload.get("raw_board_event_time"))
@@ -914,6 +1180,92 @@ def _valid_fund_payload(payload: Mapping[str, Any]) -> bool:
         and payload.get("eligible_for_hard_gate") is True
         and any(_optional_number(payload.get(field)) is not None for field in ("main_net", "large_net", "super_net"))
     )
+
+
+def _run_dotnet_http_worker(
+    payload: Mapping[str, Any],
+    timeout_seconds: float,
+    command: list[str],
+) -> dict[str, Any]:
+    process_started = datetime.now(CN_TZ)
+    monotonic_started = time.perf_counter()
+    creation_flags = (
+        subprocess.CREATE_NO_WINDOW
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
+        else 0
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=creation_flags,
+    )
+    spawn_elapsed = time.perf_counter() - monotonic_started
+    remaining = float(timeout_seconds) - spawn_elapsed
+    if remaining <= 0:
+        _terminate_process_tree(process)
+        raise TimeoutError("dotnet_worker_startup_deadline_exceeded")
+    try:
+        stdout, stderr = process.communicate(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        raise TimeoutError("dotnet_worker_deadline_exceeded") from exc
+    process_completed = datetime.now(CN_TZ)
+    elapsed_ms = (time.perf_counter() - monotonic_started) * 1000
+    if elapsed_ms > float(timeout_seconds) * 1000:
+        raise TimeoutError("dotnet_worker_deadline_exceeded")
+    try:
+        result = json.loads(stdout.lstrip("\ufeff"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("dotnet_worker_output_invalid") from exc
+    if not isinstance(result, dict):
+        raise ValueError("dotnet_worker_output_invalid")
+    result["process_started_at"] = process_started.isoformat(
+        timespec="microseconds"
+    )
+    result["process_completed_at"] = process_completed.isoformat(
+        timespec="microseconds"
+    )
+    result["process_elapsed_ms"] = round(elapsed_ms, 3)
+    result["worker_terminated"] = False
+    if process.returncode not in (0, 2):
+        result = {
+            **result,
+            "ok": False,
+            "error_code": "MARKET_SOURCE_WORKER_FAILED",
+            "stderr": str(stderr or "")[:500],
+        }
+    return result
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if hasattr(subprocess, "CREATE_NO_WINDOW")
+                else 0
+            ),
+        )
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def _normalize_codes(values: Iterable[str]) -> tuple[str, ...]:

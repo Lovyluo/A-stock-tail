@@ -53,7 +53,7 @@ def run_probe_worker_process(
         )
     except subprocess.TimeoutExpired:
         worker_terminated = True
-        process.terminate()
+        _terminate_process_tree(process)
         try:
             stdout, stderr = process.communicate(
                 timeout=max(0.05, float(termination_grace_seconds))
@@ -115,6 +115,25 @@ def run_probe_worker_process(
         "elapsed_ms": elapsed_ms,
         "returncode": process.returncode,
     }
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if hasattr(subprocess, "CREATE_NO_WINDOW")
+                else 0
+            ),
+        )
+    else:
+        process.terminate()
 
 
 def _decode_worker_output(value: str) -> dict[str, Any] | None:

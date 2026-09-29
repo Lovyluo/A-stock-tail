@@ -24,10 +24,10 @@ from overnight_quant.data.market_source_providers import (
     INDUSTRY_BOARD_PARAMS,
     MARKET_BREADTH_PARAMS,
     MARKET_INDEX_PARAMS,
-    MARKET_REQUESTS_TRANSPORT_VERSION,
+    PRODUCTION_TRANSPORT_VERSION,
     PROVIDER_KEYS,
     SOURCE_IDENTITIES,
-    MarketRequestsTransport,
+    MarketDotNetHttpClientTransport,
     MarketSourceContractError,
 )
 from overnight_quant.data.market_session_confirmation import (
@@ -48,10 +48,12 @@ from overnight_quant.data.static_source_qualification import (
 
 GO_NOGO_EVIDENCE_SCHEMA_V1 = "market_source_go_nogo_evidence_v1"
 GO_NOGO_EVIDENCE_SCHEMA_V2 = "market_source_go_nogo_evidence_v2"
-GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v3"
+GO_NOGO_EVIDENCE_SCHEMA_V3 = "market_source_go_nogo_evidence_v3"
+GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v4"
 GO_NOGO_VERIFIER_CONTRACT_V1 = "market_source_go_nogo_verifier_v1"
 GO_NOGO_VERIFIER_CONTRACT_V2 = "market_source_go_nogo_verifier_v2"
-GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v3"
+GO_NOGO_VERIFIER_CONTRACT_V3 = "market_source_go_nogo_verifier_v3"
+GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v4"
 SAMPLING_GO = "SAMPLING_GO"
 NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
@@ -174,7 +176,7 @@ def run_market_source_go_nogo(
     add(
         "transport_version",
         environment.get("transport_version")
-        == MARKET_REQUESTS_TRANSPORT_VERSION,
+        == PRODUCTION_TRANSPORT_VERSION,
         environment.get("transport_version"),
     )
     for name in ("dns", "tls"):
@@ -276,6 +278,7 @@ def verify_market_source_go_nogo_evidence(
     if payload.get("evidence_schema_version") in {
         GO_NOGO_EVIDENCE_SCHEMA_V1,
         GO_NOGO_EVIDENCE_SCHEMA_V2,
+        GO_NOGO_EVIDENCE_SCHEMA_V3,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -361,7 +364,7 @@ def verify_market_source_go_nogo_evidence(
         len(transport_checks) != 1
         or transport_checks[0].get("passed") is not True
         or transport_checks[0].get("detail")
-        != MARKET_REQUESTS_TRANSPORT_VERSION
+        != PRODUCTION_TRANSPORT_VERSION
     ):
         errors.append("transport_version_check_invalid")
     _validate_contract_check(
@@ -416,6 +419,7 @@ def _verify_legacy_evidence(
     expected_version = {
         GO_NOGO_EVIDENCE_SCHEMA_V1: GO_NOGO_VERIFIER_CONTRACT_V1,
         GO_NOGO_EVIDENCE_SCHEMA_V2: GO_NOGO_VERIFIER_CONTRACT_V2,
+        GO_NOGO_EVIDENCE_SCHEMA_V3: GO_NOGO_VERIFIER_CONTRACT_V3,
     }.get(payload.get("evidence_schema_version"))
     if payload.get("verifier_contract_version") != expected_version:
         errors.append("verifier_contract_version_invalid")
@@ -522,7 +526,7 @@ def compute_market_source_go_nogo_verifier_contract_hash() -> str:
         "evidence_schema_version": GO_NOGO_EVIDENCE_SCHEMA_VERSION,
         "source_identities": SOURCE_IDENTITIES,
         "provider_keys": PROVIDER_KEYS,
-        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "transport_version": PRODUCTION_TRANSPORT_VERSION,
         "preflight_endpoints": {
             capability: [
                 {
@@ -579,7 +583,7 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
                 tls_ok = True
     except OSError:
         pass
-    transport = MarketRequestsTransport()
+    transport = MarketDotNetHttpClientTransport()
     for capability, requests_spec in sorted(OFFICIAL_ENDPOINT_REQUESTS.items()):
         sub_hashes: list[str] = []
         endpoint_ok = True
@@ -588,7 +592,7 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
                 "method": "GET",
                 "url": url,
                 "params": sorted((str(key), str(value)) for key, value in params.items()),
-                "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+                "transport_version": PRODUCTION_TRANSPORT_VERSION,
             }))
             try:
                 response = transport.request(
@@ -633,7 +637,7 @@ def collect_live_environment(*, output_path: str | Path, now: datetime | None = 
         "residual_workers": _matching_processes(),
         "duplicate_tasks": _matching_tasks(),
         "similar_collectors": [],
-        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "transport_version": PRODUCTION_TRANSPORT_VERSION,
     }
 
 
@@ -906,8 +910,12 @@ def _safe(payload: dict[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "GO_NOGO_EVIDENCE_SCHEMA_V1",
+    "GO_NOGO_EVIDENCE_SCHEMA_V2",
+    "GO_NOGO_EVIDENCE_SCHEMA_V3",
     "GO_NOGO_EVIDENCE_SCHEMA_VERSION",
     "GO_NOGO_VERIFIER_CONTRACT_V1",
+    "GO_NOGO_VERIFIER_CONTRACT_V2",
+    "GO_NOGO_VERIFIER_CONTRACT_V3",
     "GO_NOGO_VERIFIER_CONTRACT_VERSION",
     "NO_GO",
     "SAMPLING_GO",

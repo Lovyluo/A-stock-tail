@@ -25,13 +25,13 @@ from overnight_quant.data.source_capability_registry import (
 
 
 EXPECTED_B1_HASH = (
-    "500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e"
+    "09b82c2b542628c3eb920fb0c91dc50bcc5bdb3b601060c4c8edac1f15d5a79d"
 )
 EXPECTED_CANDIDATE_V3_HASH = (
     "1eb8114cf3aa68bf85473a67513dfdd7a3ab5b32a464a66d5c4664163a4f8b2d"
 )
 EXPECTED_SHADOW_V3_HASH = (
-    "00acaa2ccec9cacee6957ebb75973e26b66e6fe1b62812a5e7650adf87e62f2e"
+    "bd34f63782685c276717793aeb52bbccee2e57c959058bcf0adc6fcfe8e3029d"
 )
 LEGACY_TENCENT_KEY = "astock_client.AStockClient._tencent_quotes"
 QUOTE_CANDIDATE_KEY = (
@@ -90,7 +90,7 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
     rows = audit["adapter_matrix"]
 
     assert ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v8"
+        "source_capability_adapter_registry_v9"
     )
     assert audit["adapter_entry_count"] == len(rows) == 32
     assert audit["bound_count"] == 8
@@ -101,13 +101,13 @@ def test_schema_v3_audit_has_complete_three_slot_matrix_and_fixed_counts():
         PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION
     )
     assert PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION == (
-        "source_capability_adapter_registry_v7"
+        "source_capability_adapter_registry_v8"
     )
     assert PREVIOUS_ADAPTER_REGISTRY_HASH == (
-        "3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a"
+        "00acaa2ccec9cacee6957ebb75973e26b66e6fe1b62812a5e7650adf87e62f2e"
     )
     assert audit["previous_adapter_registry_hash"] == (
-        "3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a"
+        "00acaa2ccec9cacee6957ebb75973e26b66e6fe1b62812a5e7650adf87e62f2e"
     )
     assert audit["adapter_registry_hash_change_reason"] == (
         ADAPTER_REGISTRY_HASH_CHANGE_REASON

@@ -29,6 +29,7 @@ from overnight_quant.data.market_source_go_nogo import (
 )
 from overnight_quant.data.market_source_providers import (
     MARKET_REQUESTS_TRANSPORT_VERSION,
+    PRODUCTION_TRANSPORT_VERSION,
 )
 from overnight_quant.data.market_session_confirmation import (
     build_market_session_confirmation,
@@ -131,7 +132,7 @@ def _environment(**changes) -> dict:
         "now": f"{TRADE_DATE}T12:30:00+08:00",
         "timezone_id": "China Standard Time",
         "clock_skew_ms": 250,
-        "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
+        "transport_version": PRODUCTION_TRANSPORT_VERSION,
         "dns": True,
         "tls": True,
         "proxy": {"in_use": False, "local": False, "listening": None},
@@ -471,9 +472,9 @@ def test_combined_candidates_keep_announcements_outside_s2_gate():
     } <= identities
     s2 = {identity for identity in identities if identity[0] != "announcement"}
     assert s2 == {
-        ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_f170_requests_v2026-09-28"),
-        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_requests_v2026-09-28"),
-        ("fund_flow", "eastmoney", "push2_fflow_kline_requests_v2026-09-28"),
+        ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_f170_dotnet_v2026-09-29"),
+        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29"),
+        ("fund_flow", "eastmoney", "push2_fflow_kline_dotnet_v2026-09-29"),
     }
 
 
