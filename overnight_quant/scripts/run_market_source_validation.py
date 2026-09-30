@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,7 +25,7 @@ from overnight_quant.data.market_source_providers import (
     compute_market_source_verifier_contract_hash,
     validate_market_source_records,
 )
-from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 from overnight_quant.data.probe_worker_process import run_probe_worker_process
 from overnight_quant.data.source_capability_registry import (
     compute_source_capability_registry_hash,
@@ -49,6 +49,7 @@ def run_market_source_validation(
     evidence_scope: str = "qualification",
     audit_market_feature_cutoff: str | None = None,
     worker_runner: Any = run_probe_worker_process,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     if not network:
         return _safe({
@@ -78,6 +79,39 @@ def run_market_source_validation(
     deadline = collection_deadline or f"{trade_date}T14:51:05+08:00"
     if audit_market_feature_cutoff and evidence_scope != "audit_only":
         raise ValueError("audit_market_feature_cutoff_requires_audit_only")
+    if audit_market_feature_cutoff:
+        parsed_audit_cutoff = parse_cn_datetime(audit_market_feature_cutoff)
+        if parsed_audit_cutoff is None:
+            raise ValueError("audit_market_feature_cutoff_invalid")
+        current = (clock or (lambda: datetime.now(CN_TZ)))()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=CN_TZ)
+        else:
+            current = current.astimezone(CN_TZ)
+        if current >= parsed_audit_cutoff:
+            missed = _safe({
+                "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
+                "status": "AUDIT_WINDOW_MISSED",
+                "execution_ok": False,
+                "network_mode": True,
+                "network_requests_made": 0,
+                "evidence_scope": "audit_only",
+                "trade_date": trade_date,
+                "audit_cutoff": parsed_audit_cutoff.isoformat(),
+                "checked_at": current.isoformat(timespec="microseconds"),
+                "requested_codes": list(normalized_codes),
+                "provider_validation_passed": False,
+                "transport_qualified": False,
+                "provider_contract_complete": False,
+                "qualification_status": "UNQUALIFIED",
+                "automatic_qualification_change": False,
+                "consecutive_qualified_days": 0,
+                "source_qualification_count": 0,
+                "evidence_hash": "",
+            })
+            missed["evidence_hash"] = compute_evidence_hash(missed)
+            write_json_atomic(target, missed)
+            return missed
     capability_feature_cutoffs = {
         capability: (
             audit_market_feature_cutoff

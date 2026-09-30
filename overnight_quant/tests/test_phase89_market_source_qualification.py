@@ -367,6 +367,7 @@ def test_audit_only_uses_explicit_market_cutoff_without_changing_fund_cutoff(
         audit_market_feature_cutoff=audit_cutoff,
         collection_deadline=f"{TRADE_DATE}T16:31:00+08:00",
         worker_runner=runner,
+        clock=lambda: datetime.fromisoformat(audit_cutoff) - timedelta(milliseconds=1),
     )
     assert seen == {
         "market_breadth": audit_cutoff,
@@ -381,6 +382,51 @@ def test_audit_only_uses_explicit_market_cutoff_without_changing_fund_cutoff(
     assert result["status"] == EVIDENCE_VERIFIED
     assert result["audit_only"] is True
     assert result["qualification_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("offset_ms", "expected_status", "expected_calls"),
+    [
+        (-1, "MARKET_SOURCE_NETWORK_VALIDATED", 3),
+        (0, "AUDIT_WINDOW_MISSED", 0),
+        (1, "AUDIT_WINDOW_MISSED", 0),
+    ],
+)
+def test_audit_window_fail_fast_boundaries(
+    tmp_path, monkeypatch, offset_ms, expected_status, expected_calls
+):
+    calls = []
+    audit_cutoff = f"{TRADE_DATE}T16:30:00+08:00"
+
+    def runner(task, deadline_ms, worker_command):
+        calls.append(task["capability"])
+        return successful_runner(task, deadline_ms, worker_command)
+
+    monkeypatch.setattr(validation, "CACHE_ROOT", tmp_path.resolve())
+    target = tmp_path / f"audit-window-{offset_ms}.json"
+    evidence = run_market_source_validation(
+        network=True,
+        trade_date=TRADE_DATE,
+        output=target,
+        evidence_scope="audit_only",
+        audit_market_feature_cutoff=audit_cutoff,
+        collection_deadline=f"{TRADE_DATE}T16:31:00+08:00",
+        worker_runner=runner,
+        clock=lambda: datetime.fromisoformat(audit_cutoff)
+        + timedelta(milliseconds=offset_ms),
+    )
+
+    assert evidence["status"] == expected_status
+    assert len(calls) == expected_calls
+    assert target.exists()
+    assert json.loads(target.read_text(encoding="utf-8"))["status"] == expected_status
+    assert evidence["data_ready"] is False
+    assert evidence["hard_gate_authorized"] is False
+    assert evidence["candidates"] == evidence["tickets"] == evidence["orders"] == []
+    if expected_status == "AUDIT_WINDOW_MISSED":
+        assert evidence["network_requests_made"] == 0
+        assert evidence["execution_ok"] is False
+        assert evidence["consecutive_qualified_days"] == 0
 
 
 def test_resigned_capability_cutoff_tampering_is_rejected(tmp_path, monkeypatch):
