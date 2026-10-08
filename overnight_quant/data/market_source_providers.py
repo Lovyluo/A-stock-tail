@@ -114,6 +114,10 @@ _UA = (
     "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 )
 _ALLOWED_HOSTS = {"push2.eastmoney.com"}
+_APPROVED_EASTMONEY_HOSTS = {
+    "push2.eastmoney.com",
+    "emweb.securities.eastmoney.com",
+}
 _PRODUCTION_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json,text/plain,*/*",
@@ -324,6 +328,7 @@ class MarketDotNetHttpClientTransport:
         worker_runner: Callable[[Mapping[str, Any], float, list[str]], Mapping[str, Any]] | None = None,
         worker_command: Iterable[str] | None = None,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
+        allowed_hosts: Iterable[str] | None = None,
     ) -> None:
         if type(max_response_bytes) is not int or not 0 < max_response_bytes <= MAX_RESPONSE_BYTES:
             raise ValueError("market_source_response_limit_invalid")
@@ -343,6 +348,15 @@ class MarketDotNetHttpClientTransport:
         ])
         self._worker_runner = worker_runner or _run_dotnet_http_worker
         self.max_response_bytes = max_response_bytes
+        normalized_hosts = {
+            str(host).strip().lower() for host in (allowed_hosts or _ALLOWED_HOSTS)
+        }
+        if (
+            not normalized_hosts
+            or not normalized_hosts.issubset(_APPROVED_EASTMONEY_HOSTS)
+        ):
+            raise ValueError("market_source_allowed_hosts_invalid")
+        self.allowed_hosts = frozenset(normalized_hosts)
         self.request_count = 0
         self.transport_version = MARKET_DOTNET_TRANSPORT_VERSION
         self.attempts: list[dict[str, Any]] = []
@@ -361,7 +375,7 @@ class MarketDotNetHttpClientTransport:
         requested = urlparse(str(url))
         if (
             requested.scheme != "https"
-            or requested.hostname not in _ALLOWED_HOSTS
+            or requested.hostname not in self.allowed_hosts
             or requested.port not in (None, 443)
         ):
             raise MarketSourceContractError("MARKET_SOURCE_REQUEST_URL_INVALID")
@@ -376,7 +390,7 @@ class MarketDotNetHttpClientTransport:
             "headers": request_headers,
             "request_deadline_ms": int(round(float(timeout_seconds) * 1000)),
             "max_response_bytes": self.max_response_bytes,
-            "allowed_hosts": sorted(_ALLOWED_HOSTS),
+            "allowed_hosts": sorted(self.allowed_hosts),
             "transport_version": MARKET_DOTNET_TRANSPORT_VERSION,
         }
         self.request_count += 1
@@ -412,7 +426,7 @@ class MarketDotNetHttpClientTransport:
         final = urlparse(str(response.get("url") or ""))
         if (
             final.scheme != "https"
-            or final.hostname not in _ALLOWED_HOSTS
+            or final.hostname not in self.allowed_hosts
             or final.port not in (None, 443)
             or response.get("redirect_chain") not in ([], ())
         ):
