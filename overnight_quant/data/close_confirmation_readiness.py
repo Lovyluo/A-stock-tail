@@ -15,6 +15,12 @@ from overnight_quant.data.point_in_time import (
     records_available_at,
     stable_hash,
 )
+from overnight_quant.data.s2_integration_contract import (
+    RECORD_SCHEMA as S2_RECORD_SCHEMA,
+    apply_industry_associations,
+    security_identity,
+    validate_record as validate_s2_integration_record,
+)
 
 
 SNAPSHOT_CONTRACT_VERSION = "close_confirmation_pit_v4"
@@ -185,12 +191,34 @@ def normalize_point_in_time_records(
     *,
     time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    contract_rejected: list[dict[str, Any]] = []
+    contract_valid: list[dict[str, Any]] = []
+    contract = normalize_close_time_contract(time_contract)
+    expected_times = (
+        {
+            "feature_cutoff": contract.feature_event_cutoff,
+            "collection_deadline": contract.collection_deadline,
+            "decision_time": contract.decision_time,
+            "execution_start": contract.execution_not_before,
+        }
+        if contract else None
+    )
+    for row in records:
+        if str(row.get("record_schema_version") or "").startswith("s2_pit_integration_record_"):
+            errors = validate_s2_integration_record(row, expected_times=expected_times)
+            if expected_times is None:
+                errors.append("integration_snapshot_time_contract_missing")
+            if errors:
+                contract_rejected.append({**deepcopy(row), "pit_reject_reason": errors[0], "integration_errors": errors})
+                continue
+        contract_valid.append(row)
     temporal_valid, rejected = records_available_at(
-        records,
+        contract_valid,
         decision_time,
         require_published_at_for_news=True,
         time_contract=time_contract,
     )
+    rejected.extend(contract_rejected)
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in temporal_valid:
         normalized = deepcopy(row)
@@ -833,6 +861,9 @@ def materialize_point_in_time_records(
         payload = deepcopy(record.get("payload") or {})
         data_type = _normalized_data_type(record)
         code = str(payload.get("code") or record.get("code") or "").zfill(6)
+        if row.get("record_schema_version") == S2_RECORD_SCHEMA and (payload.get("code") or record.get("code")):
+            code = security_identity(str(payload.get("code") or record.get("code"))).split(":")[1]
+            payload["code"] = code
         if data_type == "trading_calendar":
             calendar_records.append(row)
             continue
@@ -903,6 +934,7 @@ def materialize_point_in_time_records(
         if isinstance(stock.get("industry"), dict):
             continue
         stock["industry"] = industries.get(industry_name, {})
+    apply_industry_associations(stocks, industry_records)
     return {
         "stocks": sorted(
             stocks.values(),
@@ -1177,8 +1209,15 @@ def _stock_readiness_errors(
     )
     if not industry:
         errors.append("industry_snapshot_missing")
-    else:
-        expected_name = str(stock.get("industry_name") or "").strip()
+    errors.extend(stock.get("industry_association_errors") or [])
+    if industry:
+        association = (
+            stock.get("industry_association") or {}
+            if stock.get("record_schema_version") == S2_RECORD_SCHEMA
+            and not stock.get("industry_association_errors")
+            else {}
+        )
+        expected_name = str(association.get("board_name") or stock.get("industry_name") or "").strip()
         actual_name = str(
             industry.get("name") or industry.get("industry") or ""
         ).strip()
@@ -1441,6 +1480,9 @@ def _record_logical_key(
     if data_type == "market":
         return data_type, "a_share_market"
     if data_type == "industry":
+        if row.get("record_schema_version") == S2_RECORD_SCHEMA:
+            # Preserve distinct stock mappings and conflicts until association validation.
+            return data_type, code, stable_hash(row)
         return data_type, _industry_name(row)
     if data_type == "minute_bar":
         return data_type, code, _event_minute_text(row.get("event_time"))
@@ -1753,25 +1795,32 @@ def _canonical_data_type(value: str) -> str:
 
 def _temporal_fields(row: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: row.get(key)
-        for key in (
-            "event_time",
-            "published_at",
-            "observed_at",
-            "available_at",
-            "decision_cutoff",
-            "feature_event_cutoff",
-            "collection_deadline",
-            "decision_time",
-            "execution_not_before",
-            "time_contract_version",
-            "minute_label_semantics",
-            "minute_label_validation_status",
-            "source",
-            "source_version",
-            "request_hash",
-            "raw_hash",
-        )
+        **{
+            key: deepcopy(row[key])
+            for key in ("record_schema_version", "temporal_contract", "test_only")
+            if key in row
+        },
+        **{
+            key: row.get(key)
+            for key in (
+                "event_time",
+                "published_at",
+                "observed_at",
+                "available_at",
+                "decision_cutoff",
+                "feature_event_cutoff",
+                "collection_deadline",
+                "decision_time",
+                "execution_not_before",
+                "time_contract_version",
+                "minute_label_semantics",
+                "minute_label_validation_status",
+                "source",
+                "source_version",
+                "request_hash",
+                "raw_hash",
+            )
+        },
     }
 
 
