@@ -30,9 +30,15 @@ from overnight_quant.data.market_source_providers import (
     MARKET_BREADTH_PARAMS,
     MARKET_INDEX_PARAMS,
     MAX_RESPONSE_BYTES,
-    SOURCE_IDENTITIES,
 )
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
+
+# T1's frozen request contract must not follow newer candidate identities.
+SOURCE_IDENTITIES = {
+    "market_breadth": ("eastmoney", "direct_http", "push2_index_breadth+sse_index_f170_requests_v2026-09-28"),
+    "industry_snapshot": ("eastmoney", "direct_http", "push2_stock_industry+board_breadth_requests_v2026-09-28"),
+    "fund_flow": ("eastmoney", "direct_http", "push2_fflow_kline_requests_v2026-09-28"),
+}
 
 
 DIAGNOSTIC_SCHEMA_VERSION = "eastmoney_transport_diagnostic_v1"

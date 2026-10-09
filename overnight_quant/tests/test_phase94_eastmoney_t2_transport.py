@@ -193,7 +193,7 @@ def _industry_provider(transport):
 
 def test_industry_complete_pagination_covers_all_fixed_codes():
     transport = _PagedTransport()
-    batch = _industry_provider(transport).collect_industry_batch()
+    batch = _industry_provider(transport)._collect_legacy_industry_batch()
     assert {row["payload"]["code"] for row in batch.records} == set(FIXED_CODES)
     assert all(row["payload"]["board_page_count"] == 2 for row in batch.records)
     assert all(len(row["payload"]["board_page_raw_hashes"]) == 2 for row in batch.records)
@@ -209,7 +209,7 @@ def test_industry_complete_pagination_covers_all_fixed_codes():
 )
 def test_industry_pagination_failure_rejects_whole_batch(changes, error):
     with pytest.raises(MarketSourceContractError, match=error):
-        _industry_provider(_PagedTransport(**changes)).collect_industry_batch()
+        _industry_provider(_PagedTransport(**changes))._collect_legacy_industry_batch()
 
 
 @pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="PowerShell required")

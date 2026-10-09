@@ -9,6 +9,9 @@ import json
 
 import pytest
 import requests
+from overnight_quant.data.eastmoney_derived_industry_breadth import (
+    CORE_CONCEPTION_URL, EXPECTED_INDUSTRIES,
+)
 
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import (
@@ -82,7 +85,9 @@ class FakeTransport:
             value,
             request_started_at=(base + offset).isoformat(timespec="microseconds"),
             request_completed_at=(
-                base + offset + timedelta(microseconds=500)
+                datetime.fromisoformat(value.request_completed_at)
+                if value.request_completed_at == "2026-09-18T14:51:05.001+08:00"
+                else base + offset + timedelta(microseconds=500)
             ).isoformat(timespec="microseconds"),
         )
 
@@ -136,26 +141,23 @@ def industry_responses(
     mapping_after_deadline=False,
     board_after_cutoff=False,
 ):
-    industries = ["银行", "家电", "银行", "白酒", "保险"]
-    boards = []
-    for index, name in enumerate(sorted(set(industries)), 1):
-        boards.append({
-            "f12": f"BK{index:04d}", "f14": name, "f3": 1.2,
-            "f104": 6, "f105": 3, "f106": 1,
-            "f124": EVENT_TS_AFTER_CUTOFF_MINUTE if board_after_cutoff else EVENT_TS_PLUS_SECONDS,
-        })
-    values = [response({"data": {"total": len(boards), "diff": boards}})]
-    for code, name in zip(FIXED_CODES, industries):
-        values.append(response({"data": {
-            "f57": code,
-            "f58": code,
-            "f127": "不存在行业" if missing_mapping and code == FIXED_CODES[0] else name,
-            "f86": (
-                "2026-09-18T14:51:05.001+08:00"
-                if mapping_after_deadline
-                else EVENT_TS_PLUS_SECONDS if mapping_after_cutoff else EVENT_TS
-            ),
-        }}, EASTMONEY_STOCK_URL))
+    values = []
+    for code in FIXED_CODES:
+        board, name = EXPECTED_INDUSTRIES[code]
+        item = response({"ssbk": [{
+            "SECURITY_CODE": code, "BOARD_CODE": board[2:],
+            "BOARD_NAME": name, "BOARD_RANK": 2,
+        }] if not (missing_mapping and code == FIXED_CODES[0]) else []}, CORE_CONCEPTION_URL)
+        if mapping_after_deadline and code == FIXED_CODES[0]:
+            item = replace(item, request_completed_at="2026-09-18T14:51:05.001+08:00")
+        values.append(item)
+    for board in sorted({value[0] for value in EXPECTED_INDUSTRIES.values()}):
+        members = [code for code in FIXED_CODES if EXPECTED_INDUSTRIES[code][0] == board]
+        rows = [{
+            "f12": code, "f14": code, "f2": 10, "f3": 1,
+            "f124": EVENT_TS_AFTER_CUTOFF_MINUTE if board_after_cutoff else EVENT_TS,
+        } for code in members]
+        values.append(response({"data": {"total": len(rows), "diff": rows}}))
     return values
 
 
@@ -673,7 +675,7 @@ def test_industry_mapping_and_breadth_share_one_classification():
     assert {row["event_time"] for row in batch.records} == {CUTOFF}
     assert {
         row["payload"]["mapping_time_semantics"] for row in batch.records
-    } == {"static_classification_observed_before_deadline"}
+    } == {"static_classification_audit_only"}
     assert validate_market_source_records("industry_snapshot", reversed(batch.records))["valid"]
 
 
@@ -683,12 +685,12 @@ def test_industry_board_event_after_cutoff_minute_fails_closed():
 
 
 def test_industry_mapping_after_collection_deadline_fails_closed():
-    with pytest.raises(MarketSourceContractError, match="INDUSTRY_MAPPING_AFTER_DEADLINE"):
+    with pytest.raises(MarketSourceContractError, match="INDUSTRY_REQUEST_TIME_INVALID"):
         provider(industry_responses(mapping_after_deadline=True)).collect_industry_batch()
 
 
 def test_industry_mapping_mismatch_rejects_whole_batch():
-    with pytest.raises(MarketSourceContractError, match="INDUSTRY_MAPPING_MISSING"):
+    with pytest.raises(MarketSourceContractError, match="INDUSTRY_MAPPING_MISMATCH"):
         provider(industry_responses(missing_mapping=True)).collect_industry_batch()
 
 
@@ -819,7 +821,7 @@ def test_resigned_market_internal_detail_tamper_is_rejected(tmp_path, monkeypatc
         ("missing_time_semantics", "industry_snapshot:industry_payload_invalid"),
         ("board_raw_time_changed", "industry_snapshot:industry_payload_invalid"),
         ("source_version_changed", "industry_snapshot:source_identity_mismatch"),
-        ("mapping_changed_surface_consistent", "industry_snapshot:records_replay_mismatch"),
+        ("mapping_changed_surface_consistent", "industry_snapshot:replay_failed"),
     ],
 )
 def test_resigned_industry_timing_tamper_is_rejected(
@@ -841,7 +843,7 @@ def test_resigned_industry_timing_tamper_is_rejected(
         response_item = evidence["raw_responses"]["industry_snapshot"][1]
         raw = base64.b64decode(response_item["content_base64"])
         raw_payload = json.loads(raw.decode("utf-8"))
-        raw_payload["data"]["f127"] = "家电"
+        raw_payload["ssbk"][0]["BOARD_CODE"] = "9999"
         changed = json.dumps(
             raw_payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")

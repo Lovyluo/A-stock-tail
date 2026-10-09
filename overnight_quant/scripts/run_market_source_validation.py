@@ -277,7 +277,7 @@ def compute_evidence_hash(evidence: Mapping[str, Any]) -> str:
 
 
 def _batch_request_budget(capability: str) -> int:
-    return {"market_breadth": 2, "industry_snapshot": 10, "fund_flow": 5}[
+    return {"market_breadth": 2, "industry_snapshot": 12, "fund_flow": 5}[
         capability
     ]
 

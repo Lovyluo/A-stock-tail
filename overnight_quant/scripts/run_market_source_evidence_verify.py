@@ -22,6 +22,8 @@ from overnight_quant.data.market_source_providers import (
     PRODUCTION_TRANSPORT_VERSION,
     PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+    V4_EVIDENCE_SCHEMA_VERSION,
+    V4_VERIFIER_CONTRACT_HASH,
     PROVIDER_KEYS,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
@@ -126,6 +128,7 @@ def verify_market_source_evidence(
         LEGACY_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_EVIDENCE_SCHEMA_VERSION,
         SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
+        V4_EVIDENCE_SCHEMA_VERSION,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -370,6 +373,7 @@ def _verify_legacy_evidence(
         PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
             compute_previous_market_source_verifier_contract_hash()
         ),
+        V4_EVIDENCE_SCHEMA_VERSION: V4_VERIFIER_CONTRACT_HASH,
     }.get(schema)
     if payload.get("provider_verifier_contract_hash") != expected_contract_hash:
         errors.append("legacy_verifier_contract_hash_mismatch")
@@ -380,6 +384,9 @@ def _verify_legacy_evidence(
         ),
         PREVIOUS_EVIDENCE_SCHEMA_VERSION: (
             "500b99686e856770a340a8319bdb695a05c7e239c0b30256246bf301aace0d1e"
+        ),
+        V4_EVIDENCE_SCHEMA_VERSION: (
+            "09b82c2b542628c3eb920fb0c91dc50bcc5bdb3b601060c4c8edac1f15d5a79d"
         ),
     }.get(schema)
     if payload.get("capability_registry_hash") != expected_registry_hash:

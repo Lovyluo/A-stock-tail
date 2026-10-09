@@ -33,12 +33,14 @@ EASTMONEY_FUND_FLOW_URL = (
 )
 MARKET_BENCHMARK_SECID = "1.000001"
 MARKET_STOCK_POOL_VERSION = "eastmoney_index_breadth_sh_sz_bj_v2026-09-21"
-INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_industry_m90t2_v1"
-EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v4"
+INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_coreconception+board_constituent_breadth_v1"
+EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v5"
+V4_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v4"
+V4_VERIFIER_CONTRACT_HASH = "34c4162259187ba6e182763bcd338c9dfae342cb7cf66f6115975ac6d1957f76"
 PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v3"
 SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
 LEGACY_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
-VERIFIER_CONTRACT_VERSION = "market_source_verifier_v4"
+VERIFIER_CONTRACT_VERSION = "market_source_verifier_v5"
 PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v3"
 SECONDARY_PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
 LEGACY_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
@@ -85,7 +87,7 @@ SOURCE_IDENTITIES = {
     "industry_snapshot": (
         "eastmoney",
         "direct_http",
-        "push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29",
+        "eastmoney_coreconception+board_constituent_breadth_v1",
     ),
     "fund_flow": (
         "eastmoney",
@@ -610,6 +612,35 @@ class EastmoneyMarketSourceProviders:
         return list(self.collect_industry_batch().records)
 
     def collect_industry_batch(self) -> MarketProviderBatch:
+        from overnight_quant.data.eastmoney_derived_industry_breadth import (
+            EastmoneyDerivedIndustryBreadthProvider,
+            request_leaves,
+        )
+
+        provider = EastmoneyDerivedIndustryBreadthProvider(
+            self.codes,
+            trade_date=self.trade_date,
+            cutoff=self.feature_cutoff,
+            decision_time=self.collection_deadline,
+            transport=self.transport,
+            clock=self.clock,
+            timeout_seconds=self.timeout_seconds,
+        )
+        try:
+            records = provider.collect_records()
+        finally:
+            for leaf in request_leaves(provider.request_tree):
+                self.captured_responses.append({
+                    **leaf,
+                    "capability": "industry_snapshot",
+                    "raw_bytes": base64.b64decode(leaf["content_base64"], validate=True),
+                })
+        return MarketProviderBatch(
+            "industry_snapshot", tuple(records), tuple(self.captured_responses)
+        )
+
+    def _collect_legacy_industry_batch(self) -> MarketProviderBatch:
+        # Historical pagination regression only; never selected by the worker.
         board_responses: list[dict[str, Any]] = []
         board_rows: list[Mapping[str, Any]] = []
         expected_total: int | None = None
@@ -742,9 +773,10 @@ class EastmoneyMarketSourceProviders:
                     },
                 },
             ))
-        return MarketProviderBatch(
-            "industry_snapshot", tuple(records), tuple(responses)
-        )
+        for record in records:
+            record["source_version"] = "push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29"
+            record["payload"]["classification_version"] = "eastmoney_industry_m90t2_v1"
+        return MarketProviderBatch("industry_snapshot", tuple(records), tuple(responses))
 
     def collect_fund_flow_records(self) -> list[dict[str, Any]]:
         return list(self.collect_fund_flow_batch().records)
@@ -973,10 +1005,14 @@ def compute_market_source_verifier_contract_hash() -> str:
         "transport_version": PRODUCTION_TRANSPORT_VERSION,
         "market_index_change_field": "f170",
         "industry_pagination": {
-            "page_size": int(INDUSTRY_BOARD_PARAMS["pz"]),
+            "mapping": "coreconception_rank_2_exact_code",
+            "breadth": "native_constituents_f3_f124",
+            "page_size": 100,
             "total_required": True,
             "continuous_pages": True,
             "per_page_raw_hash": True,
+            "invalid_count": "preserved_not_flat",
+            "max_requests": 12,
         },
         "capability_cutoff_contract": {
             "qualification": "all_capabilities_equal_14_50",
@@ -1008,7 +1044,7 @@ def compute_previous_market_source_verifier_contract_hash() -> str:
         "provider_keys": PROVIDER_KEYS,
         "fixed_codes": FIXED_CODES,
         "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
-        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+        "industry_classification_version": "eastmoney_industry_m90t2_v1",
         "transport_version": MARKET_REQUESTS_TRANSPORT_VERSION,
         "market_index_change_field": "f170",
     })
@@ -1034,7 +1070,7 @@ def compute_v2_market_source_verifier_contract_hash() -> str:
         "provider_keys": PROVIDER_KEYS,
         "fixed_codes": FIXED_CODES,
         "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
-        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+        "industry_classification_version": "eastmoney_industry_m90t2_v1",
     })
 
 
@@ -1060,7 +1096,7 @@ def compute_legacy_market_source_verifier_contract_hash() -> str:
         "provider_keys": PROVIDER_KEYS,
         "fixed_codes": FIXED_CODES,
         "market_stock_pool_version": MARKET_STOCK_POOL_VERSION,
-        "industry_classification_version": INDUSTRY_CLASSIFICATION_VERSION,
+        "industry_classification_version": "eastmoney_industry_m90t2_v1",
     })
 
 
@@ -1136,6 +1172,50 @@ def _valid_market_record(record: Mapping[str, Any]) -> bool:
 
 
 def _valid_industry_record(record: Mapping[str, Any]) -> bool:
+    from overnight_quant.data.eastmoney_derived_industry_breadth import (
+        EXPECTED_INDUSTRIES, PAGE_SIZE, SOURCE_VERSION,
+    )
+
+    payload = record.get("payload") or {}
+    expected = EXPECTED_INDUSTRIES.get(payload.get("code"))
+    counts = [payload.get(key) for key in (
+        "up_count", "down_count", "flat_count", "invalid_count", "valid_count", "total_count"
+    )]
+    if any(type(value) is not int or value < 0 for value in counts):
+        return False
+    up, down, flat, invalid, valid, total = counts
+    raw_event = parse_cn_datetime(payload.get("raw_board_event_time"))
+    event = parse_cn_datetime(record.get("event_time"))
+    cutoff = parse_cn_datetime(record.get("decision_cutoff"))
+    observed = parse_cn_datetime(record.get("observed_at"))
+    available = parse_cn_datetime(record.get("available_at"))
+    mapping_observed = parse_cn_datetime(payload.get("mapping_observed_at"))
+    mapping_available = parse_cn_datetime(payload.get("mapping_available_at"))
+    if None in (raw_event, event, cutoff, observed, available, mapping_observed, mapping_available):
+        return False
+    return (
+        expected == (payload.get("board_code"), payload.get("industry_name"))
+        and payload.get("industry") == payload.get("industry_name")
+        and payload.get("classification_version") == SOURCE_VERSION
+        and payload.get("mapping_time_semantics") == "static_classification_audit_only"
+        and payload.get("event_time_granularity") == "minute"
+        and event == raw_event.replace(second=0, microsecond=0)
+        and raw_event <= cutoff and event <= observed <= available
+        and mapping_observed <= mapping_available <= available
+        and valid == up + down + flat and valid > 0
+        and total == valid + invalid == payload.get("declared_total")
+        and _ratio(payload.get("breadth_ratio"))
+        and abs(float(payload["breadth_ratio"]) - up / valid) <= 1e-12
+        and payload.get("page_size") == PAGE_SIZE
+        and type(payload.get("page_count")) is int
+        and payload.get("page_count") == math.ceil(total / PAGE_SIZE)
+        and isinstance(payload.get("page_raw_hashes"), list)
+        and len(payload["page_raw_hashes"]) == payload["page_count"]
+        and all(_sha(value) for value in payload["page_raw_hashes"])
+    )
+
+
+def _valid_legacy_industry_record(record: Mapping[str, Any]) -> bool:
     payload = record.get("payload") or {}
     up = payload.get("up_count")
     down = payload.get("down_count")

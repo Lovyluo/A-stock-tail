@@ -393,8 +393,11 @@ def test_go_nogo_endpoints_match_formal_provider_request_shapes():
     assert urlparse(market_requests[1][1]).path == "/api/qt/stock/get"
     assert market_requests[1][2]["fields"] == "f57,f58,f86,f170"
     assert "f3" not in market_requests[1][2]["fields"]
-    assert urlparse(industry_requests[0][1]).path == "/api/qt/clist/get"
-    assert industry_requests[0][2]["fields"] == "f3,f12,f14,f104,f105,f106,f124"
+    assert len(industry_requests) == 9
+    assert urlparse(industry_requests[0][1]).path == "/PC_HSF10/CoreConception/PageAjax"
+    assert industry_requests[0][2] == {"code": "SZ000001"}
+    assert industry_requests[5][2]["fields"] == "f2,f3,f12,f14,f124"
+    assert industry_requests[5][2]["fs"] == "b:BK0474"
     assert urlparse(fund_requests[0][1]).path == "/api/qt/stock/fflow/kline/get"
     assert fund_requests[0][2]["fields1"] == "f1,f2,f3,f7"
     assert fund_requests[0][2]["fields2"] == "f51,f52,f53,f54,f55,f56,f57"
@@ -473,7 +476,7 @@ def test_combined_candidates_keep_announcements_outside_s2_gate():
     s2 = {identity for identity in identities if identity[0] != "announcement"}
     assert s2 == {
         ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_f170_dotnet_v2026-09-29"),
-        ("industry_snapshot", "eastmoney", "push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29"),
+        ("industry_snapshot", "eastmoney", "eastmoney_coreconception+board_constituent_breadth_v1"),
         ("fund_flow", "eastmoney", "push2_fflow_kline_dotnet_v2026-09-29"),
     }
 

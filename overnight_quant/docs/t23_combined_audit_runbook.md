@@ -1,6 +1,6 @@
 # T2.3 组合 audit 运行合同
 
-本入口只执行市场宽度与派生行业宽度模块审计，不是正式资格采样，不生成计划任务或提醒。正式策略四阶段时点、Registry 与资格门槛不变。
+本入口只执行市场宽度与派生行业宽度模块审计，不是正式资格采样，不生成计划任务或提醒。正式策略四阶段时点与资格门槛不变。
 
 ## 集中时间参数
 
@@ -54,4 +54,16 @@ BK1239 invalid_count=2 保持原样；不得转换为平盘或删除。2026-10-0
 
 ## 安全与停止点
 
-所有结果固定 audit_only=true、qualification=0/3、data_ready=false、hard_gate_authorized=false，candidates/tickets/orders 为空。组合 audit 通过也不自动增加资格计数。本轮仅本地提交与恢复备份，不联网、不全量测试、不推送。下一确认交易日组合通过后，另行更新候选合同及相关测试，并按 PM 指令进行一次全量测试、推送与 CI；失败保留证据，不当日补跑。
+所有结果固定 audit_only=true、qualification=0/3、data_ready=false、hard_gate_authorized=false，candidates/tickets/orders 为空。组合 audit 通过也不自动增加资格计数。失败保留证据，不当日补跑。
+
+## 2026-10-09 候选合同集成
+
+固定提交 26e6a62963fa141cf5f95aad1c5b9c0dc21188a0 于 14:37:01 开始的单轮组合审计通过：宽度 2 次、行业 9 次，无重试或 fallback。BK1239 的 invalid_count=2 不变。
+
+行业候选版本为 eastmoney_coreconception+board_constituent_breadth_v1。现有显式 envelope key collect_industry_records 保留，但实现只委托新的精确代码/成分 Provider；旧行业分页仅供私有历史回归，worker 不选用。Go/No-Go 检查五股 CoreConception 映射及四个唯一 BK 首个成分页；正式批次依据 total 检查所有连续页、原始响应及五股成员关系。
+
+新合同：source_capability_registry_v7、source_capability_adapter_registry_v10、market_source_evidence_v5、market_source_verifier_v5、market_source_go_nogo_evidence_v5、market_source_go_nogo_verifier_v5。旧市场 v1–v4 和旧 Go/No-Go v1–v4 只作 audit-only，不授权新采样。T1 的 13 请求/来源版本冻结于原 requests 诊断合同，不跟随新候选矩阵漂移。组合 audit 的独立 v1 包装合同保持不变，旧原始 evidence 与 replay 不改写。
+
+Registry 仍为 32 项，bound=8、candidate=7、资格=0/3；新行业不能由生产执行入口调用，未创建任务。provider_contract_complete=true 仅描述本轮两模块审计。派生宽度不提供 change_pct/relative_strength_pct，不能补造行业强度，完整快照仍会受现有 industry_strength_missing 门禁阻断；本轮不修改 readiness、不启用来源、不进入评分。
+
+外部锚定原文件 SHA-256：93a7370819a9b152a7e617ea18d466f8942c03249d1a6bfccf519bbc833bab4b；evidence hash：bb0c17bec969cbb6b3f1dd9ecb0ae1b9c8afd77f58ab64f008a5050cd79a49eb；replay hash：9c05960df05ad1449b0e90ddbb5e422ded2c1c82e78ff9ddebcf36490b4046b7。新合同代码下再次双重离线重放仍逐字节一致，replay 文件 SHA-256 均为 06dcf26d5ec9de5f24ba2b3b8e2a7322c380cad8eb56adf3598cde488b0f1788。

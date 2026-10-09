@@ -34,6 +34,11 @@ from overnight_quant.data.market_session_confirmation import (
     SESSION_CONFIRMED,
     verify_market_session_confirmation_evidence,
 )
+from overnight_quant.data.eastmoney_derived_industry_breadth import (
+    CORE_CONCEPTION_URL,
+    EXPECTED_INDUSTRIES,
+    PAGE_SIZE,
+)
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.source_capability_registry import (
     get_source_capability_registry,
@@ -49,11 +54,13 @@ from overnight_quant.data.static_source_qualification import (
 GO_NOGO_EVIDENCE_SCHEMA_V1 = "market_source_go_nogo_evidence_v1"
 GO_NOGO_EVIDENCE_SCHEMA_V2 = "market_source_go_nogo_evidence_v2"
 GO_NOGO_EVIDENCE_SCHEMA_V3 = "market_source_go_nogo_evidence_v3"
-GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v4"
+GO_NOGO_EVIDENCE_SCHEMA_V4 = "market_source_go_nogo_evidence_v4"
+GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v5"
 GO_NOGO_VERIFIER_CONTRACT_V1 = "market_source_go_nogo_verifier_v1"
 GO_NOGO_VERIFIER_CONTRACT_V2 = "market_source_go_nogo_verifier_v2"
 GO_NOGO_VERIFIER_CONTRACT_V3 = "market_source_go_nogo_verifier_v3"
-GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v4"
+GO_NOGO_VERIFIER_CONTRACT_V4 = "market_source_go_nogo_verifier_v4"
+GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v5"
 SAMPLING_GO = "SAMPLING_GO"
 NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
@@ -66,7 +73,7 @@ OFFICIAL_USER_AGENT = (
 )
 OFFICIAL_ENDPOINTS = {
     "market_breadth": EASTMONEY_ULIST_URL,
-    "industry_snapshot": EASTMONEY_CLIST_URL,
+    "industry_snapshot": CORE_CONCEPTION_URL,
     "fund_flow": EASTMONEY_FUND_FLOW_URL,
 }
 OFFICIAL_ENDPOINT_REQUESTS = {
@@ -74,8 +81,20 @@ OFFICIAL_ENDPOINT_REQUESTS = {
         ("market_breadth_counts", EASTMONEY_ULIST_URL, MARKET_BREADTH_PARAMS),
         ("market_benchmark_change", EASTMONEY_STOCK_URL, MARKET_INDEX_PARAMS),
     ),
-    "industry_snapshot": (
-        ("industry_boards", EASTMONEY_CLIST_URL, INDUSTRY_BOARD_PARAMS),
+    "industry_snapshot": tuple(
+        (
+            f"industry_mapping:{code}", CORE_CONCEPTION_URL,
+            {"code": ("SH" if code.startswith("6") else "SZ") + code},
+        )
+        for code in FIXED_CODES
+    ) + tuple(
+        (
+            f"industry_constituents:{board}", EASTMONEY_CLIST_URL,
+            {"pn": "1", "pz": str(PAGE_SIZE), "po": "1", "np": "1",
+             "fltt": "2", "invt": "2", "fid": "f3", "fs": f"b:{board}",
+             "fields": "f2,f3,f12,f14,f124"},
+        )
+        for board in sorted({item[0] for item in EXPECTED_INDUSTRIES.values()})
     ),
     "fund_flow": (
         ("fund_flow_sample", EASTMONEY_FUND_FLOW_URL, FUND_FLOW_PREFLIGHT_PARAMS),
@@ -279,6 +298,7 @@ def verify_market_source_go_nogo_evidence(
         GO_NOGO_EVIDENCE_SCHEMA_V1,
         GO_NOGO_EVIDENCE_SCHEMA_V2,
         GO_NOGO_EVIDENCE_SCHEMA_V3,
+        GO_NOGO_EVIDENCE_SCHEMA_V4,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -420,6 +440,7 @@ def _verify_legacy_evidence(
         GO_NOGO_EVIDENCE_SCHEMA_V1: GO_NOGO_VERIFIER_CONTRACT_V1,
         GO_NOGO_EVIDENCE_SCHEMA_V2: GO_NOGO_VERIFIER_CONTRACT_V2,
         GO_NOGO_EVIDENCE_SCHEMA_V3: GO_NOGO_VERIFIER_CONTRACT_V3,
+        GO_NOGO_EVIDENCE_SCHEMA_V4: GO_NOGO_VERIFIER_CONTRACT_V4,
     }.get(payload.get("evidence_schema_version"))
     if payload.get("verifier_contract_version") != expected_version:
         errors.append("verifier_contract_version_invalid")
@@ -646,6 +667,18 @@ def _preflight_response_valid(label: str, raw: bytes) -> bool:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
+    if label.startswith("industry_mapping:"):
+        code = label.split(":", 1)[1]
+        expected = EXPECTED_INDUSTRIES.get(code)
+        rows = payload.get("ssbk") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list) or expected is None:
+            return False
+        matches = [row for row in rows if isinstance(row, Mapping) and row.get("BOARD_RANK") in (2, "2")]
+        return len(matches) == 1 and (
+            str(matches[0].get("SECURITY_CODE") or "").zfill(6) == code
+            and "BK" + str(matches[0].get("BOARD_CODE") or "").removeprefix("BK") == expected[0]
+            and matches[0].get("BOARD_NAME") == expected[1]
+        )
     data = payload.get("data") if isinstance(payload, Mapping) else None
     if not isinstance(data, Mapping):
         return False
@@ -672,16 +705,20 @@ def _preflight_response_valid(label: str, raw: bytes) -> bool:
             and _preflight_number(data.get("f170"))
             and _preflight_timestamp(data.get("f86"))
         )
-    if label == "industry_boards":
+    if label.startswith("industry_constituents:"):
         rows = data.get("diff")
-        return isinstance(rows, list) and bool(rows) and all(
+        total = data.get("total")
+        return (
+            type(total) is int and total > 0
+            and isinstance(rows, list) and len(rows) == min(total, PAGE_SIZE)
+            and len({row.get("f12") for row in rows if isinstance(row, Mapping)}) == len(rows)
+            and all(
             isinstance(row, Mapping)
-            and bool(str(row.get("f12") or "").strip())
-            and bool(str(row.get("f14") or "").strip())
-            and _preflight_number(row.get("f3"))
-            and all(_preflight_nonnegative_int(row.get(field)) for field in ("f104", "f105", "f106"))
+            and len(str(row.get("f12") or "")) == 6
+            and "f3" in row
             and _preflight_timestamp(row.get("f124"))
             for row in rows
+            )
         )
     if label == "fund_flow_sample":
         rows = data.get("klines")

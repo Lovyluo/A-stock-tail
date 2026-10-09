@@ -76,7 +76,7 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
 def _logical_endpoint_count(capability: str) -> int:
     return {
         "market_breadth": 2,
-        "industry_snapshot": 6,
+        "industry_snapshot": 9,
         "fund_flow": 5,
     }[capability]
 
