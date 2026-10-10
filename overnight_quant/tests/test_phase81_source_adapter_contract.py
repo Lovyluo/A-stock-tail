@@ -48,7 +48,7 @@ from overnight_quant.strategy.news_briefing import fetch_cls_telegraph
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant" / "scripts" / "run_source_adapter_audit.py"
 ADAPTER_REGISTRY_HASH = (
-    "3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a"
+    "bb00c1311f8d214c9e2d088943675aac5a7980b69362ca791470c237beb0b9c1"
 )
 QUOTE_IDENTITY = {
     "capability": "quote",
@@ -239,7 +239,7 @@ def test_production_adapter_matrix_exactly_covers_registered_identities():
             row["provider_key"],
         ),
     )
-    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v7"
+    assert ADAPTER_REGISTRY_SCHEMA_VERSION == "source_capability_adapter_registry_v11"
     assert compute_source_capability_registry_hash() == (
         adapters.EXPECTED_CAPABILITY_REGISTRY_HASH
     )

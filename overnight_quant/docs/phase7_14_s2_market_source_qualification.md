@@ -19,7 +19,9 @@ days.
 ## Field contracts
 
 The market record uses `origin_source=eastmoney` for both components. The fixed
-benchmark is SSE Composite (`secid=1.000001`). Market breadth uses Eastmoney
+benchmark is SSE Composite (`secid=1.000001`). Its change is read only from
+`stock/get.f170` under `fltt=2`; `f3` is not a substitute and `ulist.f170` is
+not part of the breadth calculation. Market breadth uses Eastmoney
 index breadth counters for SSE Composite, SZSE Component, and BSE 50
 (`secids=1.000001,0.399001,0.899050`), versioned as
 `eastmoney_index_breadth_sh_sz_bj_v2026-09-21`. The clist endpoint currently
@@ -43,9 +45,15 @@ formula as market breadth. The industry board update time is the formal event
 time for breadth. The stock-to-industry mapping is a static classification
 observed before the collection deadline; its quote update timestamp is retained
 for audit, but it cannot move a valid 14:50 board breadth record into a later
-decision minute. This timing contract is identified as
-`push2_stock_industry+board_breadth_v2026-09-23`; the previous 2026-09-18
-identity is not interchangeable with it.
+decision minute. This timing and transport contract is identified as
+`push2_stock_industry+board_breadth_dotnet_paged_v2026-09-29`; earlier identities
+are not interchangeable with it.
+
+The board list uses a fixed page size of 100 and deterministic continuous page
+numbers derived from the first response's `total`. Each page is requested once.
+Total drift, a missing or short intermediate page, duplicate board identity,
+or any unmapped fixed stock rejects the whole batch. Records retain ordered
+per-page raw hashes.
 
 Fund-flow values are denominated in CNY. Each row describes one minute interval
 (`value_semantics=minute_interval_net_flow`,
@@ -57,24 +65,37 @@ provider batch.
 
 Providers have no default network construction in the adapter registry. The
 validation command requires `--network`, runs each provider batch in a killable
-child process, and enforces an absolute collection deadline. There is one
-attempt only: no retry, fallback, demo data, or cross-source stitching.
+child process, and enforces an absolute collection deadline. The only
+production-candidate transport is `MarketDotNetHttpClientTransport`, version
+`eastmoney_dotnet_httpclient_v1`. Each request runs in an independent,
+killable PowerShell/.NET HttpClient process with strict JSON I/O. The 2000 ms
+deadline starts before process creation; timeout terminates the process tree.
+TLS stays enabled, redirects are disabled, the final URL must remain HTTPS
+`push2.eastmoney.com`, and responses are capped at 5 MB. There is no retry,
+requests/urllib fallback, demo data, or cross-source stitching. Python requests
+A/B remain audit-only and unqualified.
+
+Qualification evidence fixes all three capability cutoffs at `14:50:00`.
+Audit-only runs may declare a later market/industry cutoff to prove transport
+and complete pagination after the close; fund flow remains pinned to the
+supplied minute cutoff. These per-capability cutoffs are hashed and replayed,
+and audit-only evidence can never authorize qualification.
 
 Raw responses and evidence are written only to ignored cache using exclusive,
 atomic UTF-8 creation. Verification requires an externally supplied file
 SHA-256 and reconstructs all normalized records from captured raw bytes.
 Failure evidence can pass integrity verification, but cannot become a qualified
-day. `market_source_evidence_v2` is bound to
-`market_source_verifier_v2` (`220cdd293f64f91b6fb726bccf36cbc51633ccfae6f8cdbdaffb918f6e85cea4`).
+day. `market_source_evidence_v4` is bound to
+`market_source_verifier_v4` (`34c4162259187ba6e182763bcd338c9dfae342cb7cf66f6115975ac6d1957f76`).
 The verifier recomputes the three-market breadth counts, event-minute labels,
-industry board timing, request identities, and raw response hashes. Legacy v1
-evidence remains externally anchored audit evidence only and always reports
+industry board timing, transport identity, request identities, and raw response
+hashes. Legacy v1, v2, and v3 evidence remain externally anchored audit evidence only and always report
 `provider_validation_passed=false` and `qualification_eligible=false`.
 
 ## Independent Go/No-Go evidence
 
 `run_market_source_go_nogo.ps1` is a pre-sampling environment gate. It does not
-request or require 14:50 formal records. Evidence v2 requires two independently
+request or require 14:50 formal records. Evidence v4 requires two independently
 anchored contracts: the S1 Tencent calendar still contains completed dates
 strictly before the target day, while a separate Tencent quote confirmation
 proves that all five fixed stocks have current-day events after the morning
@@ -97,9 +118,13 @@ guard. Their evidence is marked `test_only` and cannot authorize a production
 sample. Production calendar checks must also reference the approved S1 partial
 qualification record. The current-session confirmation must use the bound
 Tencent quote provider and exact production envelope. Both input files require
-external SHA-256 anchors; self-signed files are not sufficient. Legacy v1
-Go/No-Go evidence remains verifiable for audit, but can never authorize a new
-sample.
+external SHA-256 anchors; self-signed files are not sufficient. The preflight
+uses the same .NET transport as the formal worker and requires both the
+`ulist.np/get` breadth fields and the `stock/get.f170` benchmark fields before
+`official_endpoint:market_breadth` can pass. Legacy v1, v2, and v3 Go/No-Go evidence
+remain verifiable for audit, but can never authorize a new sample. The v4
+Go/No-Go verifier contract hash is
+`97e91ddc6b7b7d28d308f551f0e249276dbe0efc74c8efe4e1e0dacca170cd0f`.
 
 ## Qualification gate
 
@@ -115,10 +140,10 @@ sufficient evidence for an intraday Go/No-Go, and no hurried sampling was
 started. Current state remains:
 
 ```text
-capability_registry_schema=source_capability_registry_v4
-capability_registry_hash=eba7d83802c164ff747d0271d2b799724bbc15ee9886c031b3db59511f8d15ed
-adapter_registry_schema=source_capability_adapter_registry_v7
-adapter_registry_hash=3cdaaaeaa6de72ae7db79fa6a7e0e7b9fb408b9e4f893f817eaa36b1560a854a
+capability_registry_schema=source_capability_registry_v6
+capability_registry_hash=09b82c2b542628c3eb920fb0c91dc50bcc5bdb3b601060c4c8edac1f15d5a79d
+adapter_registry_schema=source_capability_adapter_registry_v9
+adapter_registry_hash=bd34f63782685c276717793aeb52bbccee2e57c959058bcf0adc6fcfe8e3029d
 bound_count=8
 candidate_count=7
 consecutive_count=0/3
@@ -134,3 +159,39 @@ combined production matrix was rebuilt from its actual entries and contains
 exactly 32 entries, 8 bound providers, and 7 inactive candidates. The three S2
 candidates remain unqualified at 0/3; announcement candidates do not satisfy
 any S2 readiness gate.
+
+## Transport qualification diagnostics
+
+Eastmoney transport selection is a separate audit-only process. It does not
+authorize a source, create a qualification day, or call the formal 14:50
+collector. `run_market_transport_diagnostic.py` executes exactly one selected
+path per invocation:
+
+- `python_requests_current_v1`: current requests headers and environment proxy;
+- `python_requests_fixed_headers_v1`: requests plus fixed public `Accept` and
+  `Referer` headers;
+- `dotnet_httpclient_diagnostic_v1`: independent Windows .NET HttpClient path.
+
+Each invocation makes one request for the market breadth counters, one request
+for `stock/get.f170`, one industry-board request, one mapping request per fixed
+stock, and one fund-flow request per fixed stock. It never retries, falls back,
+or switches transport after a failure. TLS verification remains enabled and a
+redirect is recorded and rejected rather than followed. Proxy audit output is
+limited to scheme, host, port, and listener state; credentials are neither
+persisted nor logged.
+
+Evidence is exclusive-create UTF-8 JSON under ignored cache. It contains raw
+response bytes, request/header/raw hashes, DNS/TLS/proxy observations, request
+times, redirect information, and exception-chain types. Integrity verification
+is separate from transport qualification: a faithfully captured timeout or
+field failure can be `MARKET_TRANSPORT_DIAGNOSTIC_VERIFIED` while
+`candidate_round_passed=false`.
+
+A transport can be selected only after at least three independently anchored
+rounds, each separated by at least 60 seconds, with at least one round during a
+confirmed trading day from 14:40 through 14:48. Every one of the 13 request
+units must return HTTP 200 from `https://push2.eastmoney.com`, finish within the
+existing 2000 ms deadline, satisfy the v3 fields, and replay deterministically.
+Exactly one transport must pass the full matrix. No winner produces
+`EASTMONEY_TRANSPORT_UNQUALIFIED`; multiple winners produce an ambiguous result.
+Neither result changes production transport configuration automatically.

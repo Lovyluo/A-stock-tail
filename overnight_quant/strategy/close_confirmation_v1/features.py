@@ -12,6 +12,7 @@ from overnight_quant.data.close_time_contract import (
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.point_in_time import parse_cn_datetime
 from overnight_quant.data.close_confirmation_readiness import normalize_daily_bars
+from overnight_quant.data.market_source_providers import fund_flow_semantics_unproven
 from overnight_quant.strategy.chip_volume import calculate_chip_metrics
 
 
@@ -424,6 +425,8 @@ def _fund_flow_available(rows: list[dict[str, Any]]) -> bool:
 
 
 def _eligible_fund_flow_row(row: dict[str, Any]) -> bool:
+    if fund_flow_semantics_unproven(row):
+        return False
     source = str(row.get("source") or "").lower()
     if bool(row.get("is_proxy")) or "sina_money_flow" in source:
         return False
