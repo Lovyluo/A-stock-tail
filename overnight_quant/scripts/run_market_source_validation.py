@@ -124,6 +124,7 @@ def run_market_source_validation(
     }
     results: dict[str, dict[str, Any]] = {}
     records_by_capability: dict[str, list[dict[str, Any]]] = {}
+    audit_records_by_capability: dict[str, list[dict[str, Any]]] = {}
     raw_responses: dict[str, list[dict[str, Any]]] = {}
     transport_attempts: dict[str, list[dict[str, Any]]] = {}
     for capability in CAPABILITIES:
@@ -149,6 +150,7 @@ def run_market_source_validation(
         if worker.get("ok") is True:
             payload = worker.get("payload") or {}
             records = list(payload.get("records") or [])
+            audit_records = list(payload.get("audit_records") or [])
             contract = validate_market_source_records(
                 capability, records, codes=normalized_codes
             )
@@ -174,11 +176,18 @@ def run_market_source_validation(
                         else "MARKET_SOURCE_CAPABILITY_FAILED"
                     )
                 ),
-                "error_code": str(payload.get("error_code") or ""),
-                "provider_error_code": str(payload.get("provider_error_code") or ""),
+                "error_code": (
+                    "FUND_FLOW_SEMANTICS_UNPROVEN" if capability == "fund_flow" and audit_records
+                    else str(payload.get("error_code") or "")
+                ),
+                "provider_error_code": (
+                    "FUND_FLOW_SEMANTICS_UNPROVEN" if capability == "fund_flow" and audit_records
+                    else str(payload.get("provider_error_code") or "")
+                ),
                 "transport_qualified": payload.get("transport_qualified") is True,
                 "provider_contract_complete": provider_complete,
                 "record_count": len(records),
+                "audit_record_count": len(audit_records),
                 "records_hash": contract["records_hash"],
                 "provenance_status": provenance["status"],
                 "errors": [
@@ -196,6 +205,7 @@ def run_market_source_validation(
                 "worker_terminated": False,
             }
             records_by_capability[capability] = records if provider_complete else []
+            audit_records_by_capability[capability] = audit_records
             raw_responses[capability] = list(payload.get("responses") or [])
             transport_attempts[capability] = list(payload.get("transport_attempts") or [])
         else:
@@ -212,6 +222,7 @@ def run_market_source_validation(
                 "provider_contract_complete": False,
             }
             records_by_capability[capability] = []
+            audit_records_by_capability[capability] = []
             raw_responses[capability] = []
             transport_attempts[capability] = list(worker.get("transport_attempts") or [])
     provider_complete = all(
@@ -247,6 +258,7 @@ def run_market_source_validation(
         "capability_registry_hash": compute_source_capability_registry_hash(),
         "capability_results": results,
         "records_by_capability": records_by_capability,
+        "audit_records_by_capability": audit_records_by_capability,
         "raw_responses": raw_responses,
         "transport_attempts": transport_attempts,
         "network_requests_made": None,

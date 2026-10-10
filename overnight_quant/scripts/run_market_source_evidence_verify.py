@@ -24,6 +24,9 @@ from overnight_quant.data.market_source_providers import (
     SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
     V4_EVIDENCE_SCHEMA_VERSION,
     V4_VERIFIER_CONTRACT_HASH,
+    V5_EVIDENCE_SCHEMA_VERSION,
+    V5_VERIFIER_CONTRACT_HASH,
+    V5_CAPABILITY_REGISTRY_HASH,
     PROVIDER_KEYS,
     EastmoneyMarketSourceProviders,
     MarketHttpResponse,
@@ -129,6 +132,7 @@ def verify_market_source_evidence(
         PREVIOUS_EVIDENCE_SCHEMA_VERSION,
         SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION,
         V4_EVIDENCE_SCHEMA_VERSION,
+        V5_EVIDENCE_SCHEMA_VERSION,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -205,6 +209,7 @@ def verify_market_source_evidence(
     for field in (
         "capability_results",
         "records_by_capability",
+        "audit_records_by_capability",
         "raw_responses",
         "transport_attempts",
     ):
@@ -218,6 +223,7 @@ def verify_market_source_evidence(
         if payload.get(key) != []:
             errors.append(f"safety_output_invalid:{key}")
     replayed_by_capability: dict[str, list[dict[str, Any]]] = {}
+    replayed_audit_by_capability: dict[str, list[dict[str, Any]]] = {}
     validated_capabilities: set[str] = set()
     for capability, method_name in (
         ("market_breadth", "collect_market_breadth_batch"),
@@ -227,9 +233,13 @@ def verify_market_source_evidence(
         result = (payload.get("capability_results") or {}).get(capability) or {}
         original = list((payload.get("records_by_capability") or {}).get(capability) or [])
         responses = list((payload.get("raw_responses") or {}).get(capability) or [])
+        original_audit = list((payload.get("audit_records_by_capability") or {}).get(capability) or [])
+        replayed_audit_by_capability[capability] = []
         if result.get("status") == "MARKET_SOURCE_CAPABILITY_FAILED":
             if original:
                 errors.append(f"{capability}:failed_batch_records_not_empty")
+            if original_audit:
+                errors.append(f"{capability}:failed_batch_audit_not_empty")
             if responses:
                 errors.append(f"{capability}:failed_batch_responses_not_empty")
             attempts = list(
@@ -263,12 +273,36 @@ def verify_market_source_evidence(
                     errors.append(f"{capability}:provider_error_code_mismatch")
                 if original:
                     errors.append(f"{capability}:incomplete_batch_records_not_empty")
+                if original_audit:
+                    errors.append(f"{capability}:incomplete_batch_audit_not_empty")
                 if transport.responses:
                     errors.append(f"{capability}:unused_responses")
                 replayed_by_capability[capability] = []
                 continue
             replayed = list(batch.records)
             replayed_by_capability[capability] = replayed
+            replayed_audit_by_capability[capability] = list(batch.audit_records)
+            if capability == "fund_flow":
+                if original or replayed:
+                    errors.append("fund_flow:formal_records_forbidden")
+                if original_audit != list(batch.audit_records):
+                    errors.append("fund_flow:audit_records_replay_mismatch")
+                expected = {
+                    "status": "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE",
+                    "error_code": "FUND_FLOW_SEMANTICS_UNPROVEN",
+                    "provider_error_code": "FUND_FLOW_SEMANTICS_UNPROVEN",
+                    "provider_contract_complete": False,
+                    "record_count": 0, "audit_record_count": len(batch.audit_records),
+                    "records_hash": stable_hash([]),
+                }
+                for key, value in expected.items():
+                    if result.get(key) != value or type(result.get(key)) is not type(value):
+                        errors.append(f"fund_flow:summary_mismatch:{key}")
+                if transport.responses:
+                    errors.append("fund_flow:unused_responses")
+                continue
+            if original_audit:
+                errors.append(f"{capability}:unexpected_audit_records")
             contract = validate_market_source_records(capability, replayed)
             if not contract["valid"]:
                 errors.extend(f"{capability}:{error}" for error in contract["errors"])
@@ -320,12 +354,21 @@ def verify_market_source_evidence(
     )
     if payload.get("transport_qualified") is not expected_transport_qualified:
         errors.append("transport_qualification_summary_mismatch")
+    expected_status = (
+        "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE" if expected_transport_qualified
+        else "MARKET_SOURCE_NETWORK_VALIDATION_FAILED"
+    )
+    if payload.get("status") != expected_status:
+        errors.append("provider_status_summary_mismatch")
     if payload.get("source_qualification_count") != 0:
         errors.append("source_qualification_count_changed")
+    if payload.get("qualification_status") != "UNQUALIFIED":
+        errors.append("qualification_status_invalid")
     verified = not errors and bool(expected_file_sha256)
     replay_hash = stable_hash({
         "evidence_hash": payload.get("evidence_hash"),
         "records_by_capability": replayed_by_capability,
+        "audit_records_by_capability": replayed_audit_by_capability,
         "errors": errors,
     })
     return {
@@ -339,6 +382,8 @@ def verify_market_source_evidence(
             and evidence_scope == "qualification"
             and payload.get("provider_validation_passed") is True
         ),
+        "provider_admission_passed": False,
+        "fund_flow_semantics_status": "UNPROVEN",
         "expected_file_sha256": expected_file_sha256 or "",
         "evidence_hash": payload.get("evidence_hash") or "",
         "replay_hash": replay_hash,
@@ -374,6 +419,7 @@ def _verify_legacy_evidence(
             compute_previous_market_source_verifier_contract_hash()
         ),
         V4_EVIDENCE_SCHEMA_VERSION: V4_VERIFIER_CONTRACT_HASH,
+        V5_EVIDENCE_SCHEMA_VERSION: V5_VERIFIER_CONTRACT_HASH,
     }.get(schema)
     if payload.get("provider_verifier_contract_hash") != expected_contract_hash:
         errors.append("legacy_verifier_contract_hash_mismatch")
@@ -388,6 +434,7 @@ def _verify_legacy_evidence(
         V4_EVIDENCE_SCHEMA_VERSION: (
             "09b82c2b542628c3eb920fb0c91dc50bcc5bdb3b601060c4c8edac1f15d5a79d"
         ),
+        V5_EVIDENCE_SCHEMA_VERSION: V5_CAPABILITY_REGISTRY_HASH,
     }.get(schema)
     if payload.get("capability_registry_hash") != expected_registry_hash:
         errors.append("legacy_capability_registry_hash_mismatch")
@@ -412,6 +459,8 @@ def _verify_legacy_evidence(
         "provider_validation_passed": False,
         "audit_only": True,
         "qualification_eligible": False,
+        "provider_admission_passed": False,
+        "admission_rejection_reasons": ["historical_contract_audit_only", "fund_flow_semantics_unproven"],
         "expected_file_sha256": expected_file_sha256 or "",
         "evidence_hash": payload.get("evidence_hash") or "",
         "replay_hash": stable_hash({

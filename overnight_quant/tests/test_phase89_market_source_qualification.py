@@ -322,6 +322,7 @@ def successful_runner(task, deadline_ms, worker_command):
         "ok": True,
         "payload": {
             "records": list(batch.records),
+            "audit_records": list(batch.audit_records),
             "responses": serialized,
             "transport_attempts": [
                 {
@@ -333,7 +334,9 @@ def successful_runner(task, deadline_ms, worker_command):
                 for _ in serialized
             ],
             "transport_qualified": True,
-            "provider_contract_complete": True,
+            "provider_contract_complete": batch.status == "AVAILABLE",
+            "error_code": "" if batch.status == "AVAILABLE" else batch.status,
+            "provider_error_code": "" if batch.status == "AVAILABLE" else batch.status,
             "batch_status": batch.status,
         },
         "elapsed_ms": 25,
@@ -389,7 +392,7 @@ def test_audit_only_uses_explicit_market_cutoff_without_changing_fund_cutoff(
 @pytest.mark.parametrize(
     ("offset_ms", "expected_status", "expected_calls"),
     [
-        (-1, "MARKET_SOURCE_NETWORK_VALIDATED", 3),
+        (-1, "EASTMONEY_PROVIDER_CONTRACT_INCOMPLETE", 3),
         (0, "AUDIT_WINDOW_MISSED", 0),
         (1, "AUDIT_WINDOW_MISSED", 0),
     ],
@@ -465,11 +468,14 @@ def test_transport_qualified_provider_incomplete_is_replayable_failure(
         try:
             batch = method()
             records = list(batch.records)
+            audit_records = list(batch.audit_records)
             captured = list(batch.responses)
-            complete = True
+            complete = batch.status == "AVAILABLE"
+            error = "" if complete else batch.status
         except MarketSourceContractError as exc:
             error = exc.code
             records = []
+            audit_records = []
             captured = list(instance.captured_responses)
             complete = False
         serialized = []
@@ -485,6 +491,7 @@ def test_transport_qualified_provider_incomplete_is_replayable_failure(
             "ok": True,
             "payload": {
                 "records": records,
+                "audit_records": audit_records,
                 "responses": serialized,
                 "transport_attempts": [
                     {"ok": True, "worker_terminated": False}
@@ -696,9 +703,11 @@ def test_industry_mapping_mismatch_rejects_whole_batch():
 
 def test_fund_flow_requires_five_stocks_and_explicit_unit_semantics():
     batch = provider(fund_responses()).collect_fund_flow_batch()
-    assert len(batch.records) == 5
-    assert validate_market_source_records("fund_flow", reversed(batch.records))["valid"]
-    tampered = deepcopy(list(batch.records))
+    assert batch.records == ()
+    assert len(batch.audit_records) == 5
+    assert batch.status == "FUND_FLOW_SEMANTICS_UNPROVEN"
+    assert not validate_market_source_records("fund_flow", reversed(batch.audit_records))["valid"]
+    tampered = deepcopy(list(batch.audit_records))
     tampered[0]["payload"]["amount_unit"] = "CNY_10K"
     assert not validate_market_source_records("fund_flow", tampered)["valid"]
 
@@ -714,7 +723,7 @@ def test_late_provider_completion_returns_no_partial_records():
 
 
 def test_source_mixing_and_sina_proxy_are_rejected():
-    records = list(provider(fund_responses()).collect_fund_flow_batch().records)
+    records = list(provider(fund_responses()).collect_fund_flow_batch().audit_records)
     records[0]["origin_source"] = "sina"
     records[0]["source"] = "sina_money_flow"
     records[0]["payload"]["is_proxy"] = True
@@ -758,7 +767,8 @@ def test_immutable_evidence_external_anchor_and_double_replay(tmp_path, monkeypa
     anchor = file_sha256(output)
     first = verify_file(output, expected_file_sha256=anchor)
     second = verify_file(output, expected_file_sha256=anchor)
-    assert result["provider_validation_passed"] is True
+    assert result["provider_validation_passed"] is False
+    assert first["qualification_eligible"] is False
     assert first["status"] == second["status"] == EVIDENCE_VERIFIED
     assert first["replay_hash"] == second["replay_hash"]
     assert first["actual_file_sha256"] == second["actual_file_sha256"] == anchor
@@ -941,13 +951,7 @@ def test_resigned_v3_transport_or_source_version_tamper_is_rejected(
     if field == "transport_version":
         evidence[field] = value
     else:
-        evidence["records_by_capability"]["fund_flow"][0][field] = value
-        contract = validate_market_source_records(
-            "fund_flow", evidence["records_by_capability"]["fund_flow"]
-        )
-        evidence["capability_results"]["fund_flow"]["records_hash"] = contract[
-            "records_hash"
-        ]
+        evidence["audit_records_by_capability"]["fund_flow"][0][field] = value
     result = verify_market_source_evidence(
         resign_evidence(evidence), expected_file_sha256="e" * 64
     )
@@ -957,7 +961,7 @@ def test_resigned_v3_transport_or_source_version_tamper_is_rejected(
 
 
 def test_record_order_does_not_change_contract_hash():
-    records = list(provider(fund_responses()).collect_fund_flow_batch().records)
+    records = list(provider(fund_responses()).collect_fund_flow_batch().audit_records)
     first = validate_market_source_records("fund_flow", records)
     second = validate_market_source_records("fund_flow", list(reversed(records)))
     assert first["records_hash"] == second["records_hash"]

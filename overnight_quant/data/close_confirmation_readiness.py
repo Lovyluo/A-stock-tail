@@ -21,9 +21,10 @@ from overnight_quant.data.s2_integration_contract import (
     security_identity,
     validate_record as validate_s2_integration_record,
 )
+from overnight_quant.data.market_source_providers import fund_flow_semantics_unproven
 
 
-SNAPSHOT_CONTRACT_VERSION = "close_confirmation_pit_v4"
+SNAPSHOT_CONTRACT_VERSION = "close_confirmation_pit_v5"
 MIN_MINUTE_BARS = 12
 MIN_DAILY_BARS = 60
 REQUIRED_NESTED_TEMPORAL_FIELDS = (
@@ -204,6 +205,9 @@ def normalize_point_in_time_records(
         if contract else None
     )
     for row in records:
+        if str(row.get("data_type") or row.get("capability") or "") in {"fund_flow", "fund_flow_audit"} and fund_flow_semantics_unproven(row):
+            contract_rejected.append({**deepcopy(row), "pit_reject_reason": "fund_flow_semantics_unproven"})
+            continue
         if str(row.get("record_schema_version") or "").startswith("s2_pit_integration_record_"):
             errors = validate_s2_integration_record(row, expected_times=expected_times)
             if expected_times is None:
@@ -856,10 +860,14 @@ def materialize_point_in_time_records(
     industry_records: list[dict[str, Any]] = []
     global_news: list[dict[str, Any]] = []
     calendar_records: list[dict[str, Any]] = []
+    audit_records: list[dict[str, Any]] = []
     for record in records:
         row = deepcopy(record)
         payload = deepcopy(record.get("payload") or {})
         data_type = _normalized_data_type(record)
+        if data_type in {"fund_flow", "fund_flow_audit"} and fund_flow_semantics_unproven(row):
+            audit_records.append({**row, "pit_reject_reason": "fund_flow_semantics_unproven"})
+            continue
         code = str(payload.get("code") or record.get("code") or "").zfill(6)
         if row.get("record_schema_version") == S2_RECORD_SCHEMA and (payload.get("code") or record.get("code")):
             code = security_identity(str(payload.get("code") or record.get("code"))).split(":")[1]
@@ -936,6 +944,7 @@ def materialize_point_in_time_records(
         stock["industry"] = industries.get(industry_name, {})
     apply_industry_associations(stocks, industry_records)
     return {
+        "audit_records": audit_records,
         "stocks": sorted(
             stocks.values(),
             key=lambda stock: str(stock.get("code") or "").zfill(6),
@@ -1367,6 +1376,8 @@ def _nested_temporal_reject_reason(
     require_published_at: bool,
     time_contract: dict[str, Any] | CloseTimeContract | None = None,
 ) -> str:
+    if data_type == "fund_flow" and fund_flow_semantics_unproven(row):
+        return "fund_flow_semantics_unproven"
     missing = [
         field
         for field in REQUIRED_NESTED_TEMPORAL_FIELDS
@@ -1753,6 +1764,8 @@ def _valid_fund_flow(rows: list[dict[str, Any]]) -> bool:
 
 
 def _eligible_fund_flow_row(row: dict[str, Any]) -> bool:
+    if fund_flow_semantics_unproven(row):
+        return False
     source = str(row.get("source") or "").lower()
     if bool(row.get("is_proxy")) or "sina_money_flow" in source:
         return False

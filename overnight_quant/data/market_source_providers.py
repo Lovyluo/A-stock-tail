@@ -34,13 +34,16 @@ EASTMONEY_FUND_FLOW_URL = (
 MARKET_BENCHMARK_SECID = "1.000001"
 MARKET_STOCK_POOL_VERSION = "eastmoney_index_breadth_sh_sz_bj_v2026-09-21"
 INDUSTRY_CLASSIFICATION_VERSION = "eastmoney_coreconception+board_constituent_breadth_v1"
-EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v5"
+EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v6"
+V5_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v5"
+V5_VERIFIER_CONTRACT_HASH = "51829b7ba3512266c1d305de27128cebdbd062e04599e021b2122f464e320411"
+V5_CAPABILITY_REGISTRY_HASH = "b7d5b05e24f56155cc5342c9dbad89c84493da8529c407acff50fb6b3f8f1e24"
 V4_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v4"
 V4_VERIFIER_CONTRACT_HASH = "34c4162259187ba6e182763bcd338c9dfae342cb7cf66f6115975ac6d1957f76"
 PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v3"
 SECONDARY_PREVIOUS_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v2"
 LEGACY_EVIDENCE_SCHEMA_VERSION = "market_source_evidence_v1"
-VERIFIER_CONTRACT_VERSION = "market_source_verifier_v5"
+VERIFIER_CONTRACT_VERSION = "market_source_verifier_v6"
 PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v3"
 SECONDARY_PREVIOUS_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v2"
 LEGACY_VERIFIER_CONTRACT_VERSION = "market_source_verifier_v1"
@@ -92,7 +95,7 @@ SOURCE_IDENTITIES = {
     "fund_flow": (
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_dotnet_v2026-09-29",
+        "push2_fflow_kline_raw_audit_dotnet_v2026-10-10",
     ),
 }
 
@@ -154,6 +157,7 @@ class MarketProviderBatch:
     records: tuple[dict[str, Any], ...]
     responses: tuple[dict[str, Any], ...]
     status: str = "AVAILABLE"
+    audit_records: tuple[dict[str, Any], ...] = ()
 
 
 class MarketTransport(Protocol):
@@ -822,9 +826,14 @@ class EastmoneyMarketSourceProviders:
                     "large_net": values[3],
                     "super_net": values[4],
                     "amount_unit": "CNY",
-                    "value_semantics": "minute_interval_net_flow",
-                    "aggregation_semantics": "incremental",
-                    "eligible_for_hard_gate": True,
+                    "value_semantics": "UNPROVEN",
+                    "aggregation_semantics": "UNPROVEN",
+                    "minute_interval_semantics": "UNPROVEN",
+                    "accumulation_start": "UNPROVEN",
+                    "revision_semantics": "UNPROVEN",
+                    "eligible_for_hard_gate": False,
+                    "usage_scope": "audit_only",
+                    "raw_values": parts[1:6],
                     "is_proxy": False,
                     "field_units": {
                         "main_net": "CNY", "small_net": "CNY",
@@ -833,7 +842,12 @@ class EastmoneyMarketSourceProviders:
                     },
                 },
             ))
-        return MarketProviderBatch("fund_flow", tuple(records), tuple(responses))
+        for row in records:
+            row["data_type"] = "fund_flow_audit"
+        return MarketProviderBatch(
+            "fund_flow", (), tuple(responses), "FUND_FLOW_SEMANTICS_UNPROVEN",
+            tuple(records),
+        )
 
     def _request(
         self,
@@ -982,6 +996,8 @@ def validate_market_source_records(
             if any(not _valid_industry_record(row) for row in rows):
                 errors.append("industry_payload_invalid")
         else:
+            # No current or legacy Eastmoney minute contract proves aggregation semantics.
+            errors.append("fund_flow_semantics_unproven")
             if any(not _valid_fund_payload(row.get("payload") or {}) for row in rows):
                 errors.append("fund_flow_payload_invalid")
     else:
@@ -1021,6 +1037,11 @@ def compute_market_source_verifier_contract_hash() -> str:
         "transport_failure_evidence": (
             "external_anchor_attempt_only_unqualified"
         ),
+        "fund_flow_admission": {
+            "semantics": "UNPROVEN", "formal_records": "always_empty",
+            "audit_values": "raw_f52_through_f56_CNY_no_aggregation",
+            "historical_versions": "integrity_only_never_current_qualification",
+        },
     })
 
 
@@ -1271,11 +1292,35 @@ def _valid_legacy_industry_record(record: Mapping[str, Any]) -> bool:
 def _valid_fund_payload(payload: Mapping[str, Any]) -> bool:
     return (
         payload.get("amount_unit") == "CNY"
-        and payload.get("value_semantics") == "minute_interval_net_flow"
-        and payload.get("aggregation_semantics") == "incremental"
+        and payload.get("value_semantics") == "UNPROVEN"
+        and payload.get("aggregation_semantics") == "UNPROVEN"
+        and payload.get("minute_interval_semantics") == "UNPROVEN"
+        and payload.get("accumulation_start") == "UNPROVEN"
+        and payload.get("revision_semantics") == "UNPROVEN"
         and payload.get("is_proxy") is False
-        and payload.get("eligible_for_hard_gate") is True
-        and any(_optional_number(payload.get(field)) is not None for field in ("main_net", "large_net", "super_net"))
+        and payload.get("eligible_for_hard_gate") is False
+        and all(_optional_number(payload.get(field)) is not None for field in ("main_net", "small_net", "mid_net", "large_net", "super_net"))
+    )
+
+
+def fund_flow_semantics_unproven(row: Mapping[str, Any]) -> bool:
+    payload = row.get("payload") or row
+    # The offline rehearsal is explicitly synthetic, not source evidence.
+    if (
+        row.get("test_only") is True
+        and row.get("record_schema_version") == "s2_pit_integration_record_v1"
+        and row.get("source") == "synthetic_test_only.eastmoney"
+        and payload.get("semantics_evidence_scope") == "synthetic_test_only"
+    ):
+        return False
+    return (
+        str(row.get("source_version") or "").startswith("push2_fflow_kline")
+        or row.get("origin_source") == "eastmoney"
+        or "eastmoney" in str(row.get("source") or "").lower()
+        or any(payload.get(key) == "UNPROVEN" for key in (
+            "value_semantics", "aggregation_semantics", "minute_interval_semantics",
+            "accumulation_start", "revision_semantics",
+        ))
     )
 
 

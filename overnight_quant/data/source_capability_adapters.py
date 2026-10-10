@@ -20,18 +20,19 @@ from overnight_quant.data.static_source_qualification import (
 from overnight_quant.data.market_source_providers import (
     PROVIDER_KEYS as S2_PROVIDER_KEYS,
     SOURCE_IDENTITIES as S2_SOURCE_IDENTITIES,
+    fund_flow_semantics_unproven,
 )
 
 
-ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v10"
-PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v9"
-PREVIOUS_ADAPTER_REGISTRY_HASH = "bd34f63782685c276717793aeb52bbccee2e57c959058bcf0adc6fcfe8e3029d"
+ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v11"
+PREVIOUS_ADAPTER_REGISTRY_SCHEMA_VERSION = "source_capability_adapter_registry_v10"
+PREVIOUS_ADAPTER_REGISTRY_HASH = "104d1df920a7cdf062e95ca5a77d33b442ad0c5472683b358ef66b1c0b964f11"
 ADAPTER_REGISTRY_HASH_CHANGE_REASON = (
-    "candidate_coreconception_exact_board_constituent_breadth_v1_not_activated"
+    "fund_flow_raw_audit_unproven_semantics_no_formal_admission"
 )
 EXPECTED_CAPABILITY_REGISTRY_ENTRY_COUNT = 32
 EXPECTED_CAPABILITY_REGISTRY_HASH = (
-    "b7d5b05e24f56155cc5342c9dbad89c84493da8529c407acff50fb6b3f8f1e24"
+    "dc542eb72213e483827f7fd9f2b357f56f18bda2af101b36012b88f73d8756ec"
 )
 
 SOURCE_ADAPTER_AUDIT_COMPLETE = "SOURCE_ADAPTER_AUDIT_COMPLETE"
@@ -238,7 +239,7 @@ _LEGACY_PROVIDER_KEYS = {
         "fund_flow",
         "eastmoney",
         "direct_http",
-        "push2_fflow_kline_dotnet_v2026-09-29",
+        "push2_fflow_kline_raw_audit_dotnet_v2026-10-10",
     ): (
         "real_point_in_time_collectors.RealPointInTimeCollectors."
         "collect_eastmoney_fund_flow"
@@ -934,6 +935,8 @@ def _execute_source_adapter_core(
 
     record_capability_errors = []
     for index, record in enumerate(records):
+        if not test_only and (record.get("test_only") is True or str(record.get("source") or "").startswith("synthetic_test_only.")):
+            record_capability_errors.append({"index": index, "reason": "synthetic_record_forbidden_in_production"})
         record_capability = record.get("capability")
         if record_capability is None or record_capability == "":
             record_capability_errors.append(
@@ -963,6 +966,17 @@ def _execute_source_adapter_core(
             rejection_reasons=record_capability_errors,
             route_status=route["status"],
             test_only=test_only,
+        )
+
+    if capability == "fund_flow" and any(
+        fund_flow_semantics_unproven(row) for row in records
+    ):
+        return output(
+            SOURCE_ADAPTER_PROVENANCE_REJECTED,
+            execution_ok=True, provider_called=True, capability=capability,
+            requested_identity=list(requested), record_count=0, binding=binding,
+            rejection_reasons=["fund_flow_semantics_unproven"],
+            route_status=route["status"], test_only=test_only,
         )
 
     provenance = validate_source_provenance_batch(

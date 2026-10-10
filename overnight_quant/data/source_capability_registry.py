@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 from overnight_quant.data.point_in_time import parse_cn_datetime, stable_hash
 
 
-REGISTRY_SCHEMA_VERSION = "source_capability_registry_v7"
+REGISTRY_SCHEMA_VERSION = "source_capability_registry_v8"
 QUALIFICATION_PROGRESS_MOOTDX = "3/3"
 QUALIFICATION_PROGRESS_MOOTDX_UNQUALIFIED = "0/3"
 QUALIFIED_MOOTDX_ENDPOINT_ID = "mootdx_locked@59.36.5.11:7709"
@@ -386,7 +386,7 @@ SOURCE_CAPABILITIES = (
         True,
         True,
         "fund_flow",
-        "push2_fflow_kline_dotnet_v2026-09-29",
+        "push2_fflow_kline_raw_audit_dotnet_v2026-10-10",
         True,
         "unqualified",
         "0/3",

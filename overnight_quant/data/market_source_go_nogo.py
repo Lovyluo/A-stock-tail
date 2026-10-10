@@ -55,12 +55,14 @@ GO_NOGO_EVIDENCE_SCHEMA_V1 = "market_source_go_nogo_evidence_v1"
 GO_NOGO_EVIDENCE_SCHEMA_V2 = "market_source_go_nogo_evidence_v2"
 GO_NOGO_EVIDENCE_SCHEMA_V3 = "market_source_go_nogo_evidence_v3"
 GO_NOGO_EVIDENCE_SCHEMA_V4 = "market_source_go_nogo_evidence_v4"
-GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v5"
+GO_NOGO_EVIDENCE_SCHEMA_VERSION = "market_source_go_nogo_evidence_v6"
+GO_NOGO_EVIDENCE_SCHEMA_V5 = "market_source_go_nogo_evidence_v5"
 GO_NOGO_VERIFIER_CONTRACT_V1 = "market_source_go_nogo_verifier_v1"
 GO_NOGO_VERIFIER_CONTRACT_V2 = "market_source_go_nogo_verifier_v2"
 GO_NOGO_VERIFIER_CONTRACT_V3 = "market_source_go_nogo_verifier_v3"
 GO_NOGO_VERIFIER_CONTRACT_V4 = "market_source_go_nogo_verifier_v4"
-GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v5"
+GO_NOGO_VERIFIER_CONTRACT_VERSION = "market_source_go_nogo_verifier_v6"
+GO_NOGO_VERIFIER_CONTRACT_V5 = "market_source_go_nogo_verifier_v5"
 SAMPLING_GO = "SAMPLING_GO"
 NO_GO = "NO_GO_FOR_QUALIFICATION_SAMPLE"
 OFFICIAL_HOST = "push2.eastmoney.com"
@@ -299,6 +301,7 @@ def verify_market_source_go_nogo_evidence(
         GO_NOGO_EVIDENCE_SCHEMA_V2,
         GO_NOGO_EVIDENCE_SCHEMA_V3,
         GO_NOGO_EVIDENCE_SCHEMA_V4,
+        GO_NOGO_EVIDENCE_SCHEMA_V5,
     }:
         return _verify_legacy_evidence(
             payload,
@@ -441,6 +444,7 @@ def _verify_legacy_evidence(
         GO_NOGO_EVIDENCE_SCHEMA_V2: GO_NOGO_VERIFIER_CONTRACT_V2,
         GO_NOGO_EVIDENCE_SCHEMA_V3: GO_NOGO_VERIFIER_CONTRACT_V3,
         GO_NOGO_EVIDENCE_SCHEMA_V4: GO_NOGO_VERIFIER_CONTRACT_V4,
+        GO_NOGO_EVIDENCE_SCHEMA_V5: GO_NOGO_VERIFIER_CONTRACT_V5,
     }.get(payload.get("evidence_schema_version"))
     if payload.get("verifier_contract_version") != expected_version:
         errors.append("verifier_contract_version_invalid")

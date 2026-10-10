@@ -290,6 +290,7 @@ def test_production_environment_can_authorize_sampling_without_counting_day():
     [
         (GO_NOGO_EVIDENCE_SCHEMA_V1, GO_NOGO_VERIFIER_CONTRACT_V1),
         (GO_NOGO_EVIDENCE_SCHEMA_V2, GO_NOGO_VERIFIER_CONTRACT_V2),
+        ("market_source_go_nogo_evidence_v5", "market_source_go_nogo_verifier_v5"),
     ],
 )
 def test_legacy_go_nogo_evidence_is_audit_only(
@@ -477,7 +478,7 @@ def test_combined_candidates_keep_announcements_outside_s2_gate():
     assert s2 == {
         ("market_breadth", "eastmoney", "push2_index_breadth+sse_index_f170_dotnet_v2026-09-29"),
         ("industry_snapshot", "eastmoney", "eastmoney_coreconception+board_constituent_breadth_v1"),
-        ("fund_flow", "eastmoney", "push2_fflow_kline_dotnet_v2026-09-29"),
+        ("fund_flow", "eastmoney", "push2_fflow_kline_raw_audit_dotnet_v2026-10-10"),
     }
 
 

@@ -61,6 +61,7 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
     return {
         "capability": capability,
         "records": list(batch.records),
+        "audit_records": list(batch.audit_records),
         "responses": [_serialize_response(item) for item in batch.responses],
         "transport_attempts": [_attempt_summary(item) for item in transport.attempts],
         "physical_request_count": transport.request_count,
@@ -68,8 +69,10 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
         "transport_qualified": all(
             item.get("ok") is True for item in transport.attempts
         ),
-        "provider_contract_complete": True,
+        "provider_contract_complete": batch.status == "AVAILABLE",
         "batch_status": batch.status,
+        "error_code": "" if batch.status == "AVAILABLE" else batch.status,
+        "provider_error_code": "" if batch.status == "AVAILABLE" else batch.status,
     }
 
 
