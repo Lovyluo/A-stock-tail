@@ -13,7 +13,7 @@ execution_start只是边界，不授权执行。旧audit14:40:10和正式14:50�
 
 ## 有界进程控制
 
-- 执行器版本：`two_process_rate_limited_audit_executor_v1`。
+- 历史执行器版本：`two_process_rate_limited_audit_executor_v1`。当前客户端调用边界限频修复见 [T2.9](t29_http_start_and_clock_diagnosis.md)，旧证据不改写。
 - 全局排他锁放在系统临时目录，跨工作树拒绝第二个生产执行器；不自动清理未知锁。
 - 一个协调器最多两个实际子进程，每主机最多两个。请求启动定义为派发前开始计时，
   包括Popen启动、输入输出读取；同主机派发起点至少相隔500ms，排队不从计时中抹除。

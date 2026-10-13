@@ -1331,6 +1331,7 @@ def _run_dotnet_http_worker(
 ) -> dict[str, Any]:
     process_started = datetime.now(CN_TZ)
     monotonic_started = time.perf_counter()
+    payload = {**payload, "deadline_monotonic_seconds": monotonic_started + float(timeout_seconds)}
     creation_flags = (
         subprocess.CREATE_NO_WINDOW
         if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")

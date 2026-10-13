@@ -23,7 +23,7 @@ from overnight_quant.data.point_in_time import stable_hash
 
 
 CONFIG_VERSION = "t25_audit_time_configuration_v1"
-EXECUTOR_VERSION = "two_process_rate_limited_audit_executor_v1"
+EXECUTOR_VERSION = "two_process_http_call_rate_limited_audit_executor_v2"
 MAX_WORKERS = 2
 HOST_INTERVAL_MS = 500
 REQUEST_MS = 2000
@@ -206,6 +206,8 @@ class BoundedAuditExecutor:
             raise ValueError("AUDIT_DEADLINE_INVALID")
         batch_wall, batch_start = datetime.now(CN_TZ), time.perf_counter()
         limit = batch_start + (deadline - batch_wall).total_seconds()
+        release_limits = {job.request_id: batch_start + (job.release_at - batch_wall).total_seconds()
+                          for job in pending if job.release_at}
         if limit - batch_start < (REQUEST_MS + FREEZE_RESERVE_MS + CLEANUP_RESERVE_MS) / 1000:
             return safe({"status": "AUDIT_BATCH_BUDGET_INSUFFICIENT", "execution_ok": False, "results": [], "dispatched_count": 0})
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,7 +282,7 @@ class BoundedAuditExecutor:
                         break
                     if not set(job.dependencies) <= completed:
                         continue
-                    if job.release_at and datetime.now(CN_TZ) < job.release_at:
+                    if job.release_at and now < release_limits[job.request_id]:
                         continue
                     if now - last_host.get(job.host, float("-inf")) < HOST_INTERVAL_MS / 1000:
                         continue
@@ -306,6 +308,9 @@ class BoundedAuditExecutor:
                         payload["test_only"] = True
                         payload["test_response"] = test_payloads[job.request_id]
                     started = time.perf_counter()
+                    payload["deadline_monotonic_seconds"] = min(started + REQUEST_MS / 1000, limit - FREEZE_RESERVE_MS / 1000)
+                    if test_payloads is not None:
+                        payload["http_start_state_directory"] = str(lock_path.parent / "http-start-state")
                     # Admission is the request start: startup/pipe reading consume its 2s.
                     last_host[job.host] = started
                     try:
