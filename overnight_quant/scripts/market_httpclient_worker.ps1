@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 Add-Type -AssemblyName System.Net.Http
+. "$PSScriptRoot/market_http_start_gate.ps1"
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)] [byte[]] $Bytes)
@@ -63,6 +64,7 @@ try {
         throw [System.ArgumentException]::new("method_invalid")
     }
     $deadlineMs = [int]$payload.request_deadline_ms
+    $deadlineSeconds = [double]$payload.deadline_monotonic_seconds
     $maxBytes = [int]$payload.max_response_bytes
     if ($deadlineMs -le 0 -or $deadlineMs -gt 2000) {
         throw [System.ArgumentException]::new("deadline_invalid")
@@ -97,13 +99,18 @@ try {
             [string]$property.Value
         )
     }
-    $cancellation = [System.Threading.CancellationTokenSource]::new($deadlineMs)
-    $started = [System.DateTimeOffset]::Now
-    $response = $client.SendAsync(
-        $request,
-        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
-        $cancellation.Token
-    ).GetAwaiter().GetResult()
+    $remainingMs = [math]::Floor(($deadlineSeconds - (Get-ClientMonotonicSeconds)) * 1000)
+    if ($remainingMs -le 0 -or [double]::IsNaN($deadlineSeconds) -or [double]::IsInfinity($deadlineSeconds)) {
+        throw "http_start_budget_exhausted"
+    }
+    $cancellation = [System.Threading.CancellationTokenSource]::new([int][math]::Min($remainingMs, $deadlineMs))
+    $gateParameters = @{ Client = $client; Request = $request; Token = $cancellation.Token; DeadlineSeconds = $deadlineSeconds }
+    if ($payload.PSObject.Properties.Name -contains "http_start_state_directory") {
+        $gateParameters.StateDirectory = [string]$payload.http_start_state_directory
+    }
+    $call = Invoke-RateLimitedHttpSend @gateParameters
+    $started = $call.StartedAt
+    $response = $call.Task.GetAwaiter().GetResult()
     $finalUri = $response.RequestMessage.RequestUri
     if ($finalUri.Scheme -ne "https" -or $allowedHosts -notcontains $finalUri.Host -or -not $finalUri.IsDefaultPort) {
         throw [System.InvalidOperationException]::new("response_url_invalid")
@@ -134,7 +141,8 @@ try {
     if ($raw.Length -eq 0) {
         throw [System.InvalidOperationException]::new("empty_response")
     }
-    $completed = [System.DateTimeOffset]::Now
+    $readTiming = Get-HttpReadCompletion $started $call.StartedSeconds $deadlineSeconds
+    $completed = $readTiming.CompletedAt
     $headers = [ordered]@{}
     foreach ($header in $response.Headers) {
         $headers[[string]$header.Key] = [string]($header.Value -join ",")
@@ -153,6 +161,13 @@ try {
             headers = $headers
             request_started_at = $started.ToString("o")
             request_completed_at = $completed.ToString("o")
+            client_call_started_monotonic_seconds = $call.StartedSeconds
+            body_completed_monotonic_seconds = $readTiming.CompletedSeconds
+            client_read_elapsed_ms = $readTiming.ElapsedMs
+            http_start_wait_ms = $call.WaitElapsedMs
+            http_start_coordination_version = $call.CoordinationVersion
+            request_started_at_semantics = "client_SendAsync_call_boundary_not_packet_transmission"
+            request_completed_at_semantics = "response_body_fully_read"
             byte_count = [int]$raw.Length
             raw_hash = Get-Sha256Hex -Bytes $raw
             content_base64 = [Convert]::ToBase64String($raw)
@@ -165,7 +180,9 @@ catch {
     $exception = $_.Exception
     $message = [string]$exception.Message
     $code = switch -Regex ($message) {
-        "deadline|canceled|cancelled" { "MARKET_SOURCE_TIMEOUT"; break }
+        "budget_exhausted|deadline|canceled|cancelled" { "MARKET_SOURCE_TIMEOUT"; break }
+        "http_wall_clock_order_invalid" { "MARKET_SOURCE_CLOCK_ORDER_INVALID"; break }
+        "http_start_coordination" { "MARKET_SOURCE_HTTP_START_COORDINATION_INVALID"; break }
         "http_status_([0-9]+)" { "MARKET_SOURCE_HTTP_$($Matches[1])"; break }
         "response_too_large" { "MARKET_SOURCE_RESPONSE_TOO_LARGE"; break }
         "empty_response" { "MARKET_SOURCE_EMPTY_RESPONSE"; break }
