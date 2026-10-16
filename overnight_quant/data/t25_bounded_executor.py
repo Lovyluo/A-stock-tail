@@ -187,6 +187,9 @@ def schedule_budget(jobs: list[AuditRequest], *, started_at: datetime, deadline:
 
 
 class BoundedAuditExecutor:
+    def _required_dispatch_budget_ms(self, pending_count: int, in_flight_count: int) -> int:
+        return REQUEST_MS + FREEZE_RESERVE_MS + CLEANUP_RESERVE_MS
+
     def run(self, jobs: list[AuditRequest], *, configuration: AuditTimeConfiguration, network: bool = False) -> dict:
         if network is not True:
             return safe({"status": "EXPLICIT_NETWORK_REQUIRED", "execution_ok": False, "results": []})
@@ -208,7 +211,7 @@ class BoundedAuditExecutor:
         limit = batch_start + (deadline - batch_wall).total_seconds()
         release_limits = {job.request_id: batch_start + (job.release_at - batch_wall).total_seconds()
                           for job in pending if job.release_at}
-        if limit - batch_start < (REQUEST_MS + FREEZE_RESERVE_MS + CLEANUP_RESERVE_MS) / 1000:
+        if limit - batch_start < self._required_dispatch_budget_ms(len(pending), 0) / 1000:
             return safe({"status": "AUDIT_BATCH_BUDGET_INSUFFICIENT", "execution_ok": False, "results": [], "dispatched_count": 0})
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -286,7 +289,7 @@ class BoundedAuditExecutor:
                         continue
                     if now - last_host.get(job.host, float("-inf")) < HOST_INTERVAL_MS / 1000:
                         continue
-                    if limit - now < (REQUEST_MS + FREEZE_RESERVE_MS + CLEANUP_RESERVE_MS) / 1000:
+                    if limit - now < self._required_dispatch_budget_ms(len(pending), len(running)) / 1000:
                         failure = "AUDIT_BATCH_BUDGET_INSUFFICIENT"
                         break
                     row = {"request_id": job.request_id, "host": job.host, "ok": False,
