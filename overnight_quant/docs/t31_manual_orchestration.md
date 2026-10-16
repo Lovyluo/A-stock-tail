@@ -121,6 +121,14 @@ The fixture now writes a pre-serialized synthetic JSON string verbatim. Exact
 timestamp-text assertions remain, with explicit non-local offsets and fractional
 seconds tested in both shells; no production time rule or assertion is relaxed.
 
+The corrective CI passed the operator tests but exposed an existing body-timeout
+fixture race: its 100ms test budget could expire during setup, before SendAsync.
+That one regression now uses the unchanged production limit (2000ms) and a
+3000ms synthetic body delay. It still requires a real single call and failure,
+and additionally checks exit 2, deadline cancellation and the raw cancellation
+exception. The production gate and startup-inclusive budget are untouched;
+separate zero-call budget and startup/body-read regressions remain in place.
+
 This fix does not change providers, Registry/Adapter identities, strategy,
 readiness, qualification, clock configuration or old evidence. It does not
 repair a historical failed audit into success. Qualification stays 0/3;

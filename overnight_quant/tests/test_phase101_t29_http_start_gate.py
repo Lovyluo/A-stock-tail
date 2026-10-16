@@ -130,9 +130,13 @@ def test_wall_clock_jump_never_upgrades_to_success(tmp_path, delta):
 
 
 def test_body_delay_over_budget_fails_without_retry(tmp_path):
-    p, marker = _spawn(tmp_path, "body", body_ms=500, budget_ms=100)
+    # Use the real request limit so cold setup does not replace the body-timeout path.
+    p, marker = _spawn(tmp_path, "body", body_ms=3000, budget_ms=2000)
     result = _finish(p)
     assert marker.exists() and not result["ok"]
+    assert p.returncode == 2 and result["http_call_made"]
+    assert result["deadline_timer_cancelled"] is True
+    assert result["raw_error_type"] in {"System.OperationCanceledException", "System.Threading.Tasks.TaskCanceledException"}
     assert len(list(tmp_path.glob("*.call"))) == 1
 
 
