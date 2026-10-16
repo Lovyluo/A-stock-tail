@@ -115,6 +115,12 @@ stderr, malformed/missing files, strict types, immutable outputs, simultaneous
 controllers, exact time boundaries, timeout tree cleanup and early failure
 receipts. Phase103 separately exercises the existing collector chain.
 
+The first PR CI exposed a fixture-only timezone conversion: PowerShell 7 parsed
+an ISO JSON string as DateTime and serialized it in the UTC runner's timezone.
+The fixture now writes a pre-serialized synthetic JSON string verbatim. Exact
+timestamp-text assertions remain, with explicit non-local offsets and fractional
+seconds tested in both shells; no production time rule or assertion is relaxed.
+
 This fix does not change providers, Registry/Adapter identities, strategy,
 readiness, qualification, clock configuration or old evidence. It does not
 repair a historical failed audit into success. Qualification stays 0/3;

@@ -6,7 +6,8 @@ $global:LASTEXITCODE = if ($data.seed -eq 'unset') { $null } else { [int]$data.s
 [IO.File]::WriteAllText($Marker,'test_only environment called')
 if ($data.stderr) { [Console]::Error.WriteLine('synthetic diagnostic on stderr') }
 if ($data.write_result) {
-    $text = if ($data.malformed) { '{broken' } else { $data.result | ConvertTo-Json -Depth 15 }
+    # Keep the synthetic JSON bytes; PS7 otherwise coerces ISO strings to local DateTime.
+    $text = if ($data.malformed) { '{broken' } else { [string]$data.result_json }
     [IO.File]::WriteAllText($OutputPath,$text,[Text.UTF8Encoding]::new($false))
 }
 if ($data.mode -eq 'throw') { throw 'synthetic environment crash' }

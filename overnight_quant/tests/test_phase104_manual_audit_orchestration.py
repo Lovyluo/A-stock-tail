@@ -22,6 +22,8 @@ SHELLS = list(dict.fromkeys(p for p in (shutil.which("powershell.exe"), shutil.w
 
 
 def dump(path, value):
+    if type(value) is dict and "result" in value:
+        value = {**value, "result_json": json.dumps(value["result"])}
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
@@ -108,7 +110,23 @@ def test_success_uses_child_exit_not_stale_last_exit_code(case, seed, shell):
     receipt = manual.read(path / "operator-run-v1/environment.receipt.json")
     assert receipt["exit_code"] == 0
     assert (path / "operator-run-v1/environment.stderr.bin").read_bytes()
+    assert manual.read(path / "pre-launch-environment.json") == payloads["environment"]["result"]
     assert manual.read(path / "pre-launch-environment.json")["checked_at"] == "2026-10-16T14:36:50+08:00"
+
+
+@pytest.mark.parametrize("shell", SHELLS or [None])
+def test_fixture_preserves_timestamp_text_without_host_timezone_conversion(case, shell):
+    path, payloads, context, clock = case
+    payloads["environment"]["result"].update(
+        checked_at="2026-10-16T14:36:50.123456+03:00",
+        system_boot_time="2026-10-15T04:00:00.654321-04:00")
+    commands = deepcopy(context.commands)
+    commands["environment"][0] = shell
+    result = execute((path, payloads, replace(context, commands=commands), clock))
+    assert result["execution_ok"], result
+    assert manual.read(path / "pre-launch-environment.json") == payloads["environment"]["result"]
+    raw = (path / "pre-launch-environment.json").read_text(encoding="utf-8")
+    assert raw == json.dumps(payloads["environment"]["result"])
 
 
 @pytest.mark.parametrize("bad", ["exit", "throw", "missing", "malformed", "blocker", "string_bool", "missing_array", "test_scope", "timestamp", "pid", "journal_type", "task_type"])
