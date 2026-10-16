@@ -138,7 +138,18 @@ reservations, page caps/duplicates/total drift, timeout cancellation, inclusive
 14:39:00 and +1ms rejection, zero-dispatch insufficient budget, exclusive locks,
 double replay and re-signed capture/scope/plan/summary tampering. The public
 zero-network CLI was also invoked as a subprocess. No local full suite was run;
-the new Draft PR receives one full CI run after the single consolidated push.
+the new Draft PR initially received one full CI run after the consolidated push.
+
+That CI returned 1328 passed / 1 failed: the old T29 zero-HTTP budget test saw
+an OperationCanceledException before its explicit monotonic deadline check.
+The zero-call assertion passed. A focused fixture-only follow-up classifies
+deadline-timer cancellation before the first HTTP call as budget exhaustion,
+retaining the original exception type/text and a false success status. The
+production gate, deadlines, spacing and assertion strength are unchanged. One
+deterministic cancellation test was added (330 distinct related cases in total).
+Only the failed module and Phase103 were rerun locally: 40 passed in 76.37s;
+the timer fixture also has an isolated targeted check. One corrective CI follows.
+The failed CI log remains in the external recovery index, not rewritten as success.
 
 Success means only `COMPLETE_INDUSTRY_SAME_ROUND_CANDIDATE_VALIDATED` with five
 audit records. Formal records and trading outputs stay empty. The public

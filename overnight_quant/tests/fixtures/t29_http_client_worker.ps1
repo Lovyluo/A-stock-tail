@@ -70,6 +70,9 @@ try {
     $remaining = [math]::Floor(($deadline - (Get-ClientMonotonicSeconds)) * 1000)
     if ($remaining -le 0) { throw "http_start_budget_exhausted" }
     $cancellation = [System.Threading.CancellationTokenSource]::new([int]$remaining)
+    if ($state.ContainsKey("wait_for_deadline_timer") -and $state.wait_for_deadline_timer) {
+        [void]$cancellation.Token.WaitHandle.WaitOne()
+    }
     $call = Invoke-RateLimitedHttpSend $client $request $cancellation.Token $deadline $inputValue.http_start_state_directory
     $response = $call.Task.GetAwaiter().GetResult()
     $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
@@ -107,8 +110,22 @@ try {
     $result | ConvertTo-Json -Depth 8 -Compress
     exit 0
 } catch {
+    $rawError = [string]$_.Exception.Message
+    $inner = $_.Exception
+    $cancelled = $false
+    while ($null -ne $inner) {
+        if ($inner -is [System.OperationCanceledException]) { $cancelled = $true; break }
+        $inner = $inner.InnerException
+    }
+    $called = $null -ne $state -and $state.ContainsKey("call_marker") -and [System.IO.File]::Exists($state.call_marker)
+    $timerCancelled = $null -ne $cancellation -and $cancellation.IsCancellationRequested
+    $code = $rawError
+    # This fixture's token is owned solely by its deadline timer, never a caller.
+    if ($cancelled -and $timerCancelled -and -not $called) { $code = "http_start_budget_exhausted" }
     @{ok=$false; test_only=$true; transport_version="eastmoney_dotnet_httpclient_v1";
-      error_code=[string]$_.Exception.Message; http_call_made=($null -ne $state -and $state.ContainsKey("call_marker") -and [System.IO.File]::Exists($state.call_marker))} | ConvertTo-Json -Compress
+      error_code=$code; raw_error_message=$rawError; deadline_timer_cancelled=$timerCancelled;
+      raw_error_type=$(if ($null -ne $inner) { $inner.GetType().FullName } else { $_.Exception.GetType().FullName });
+      http_call_made=$called} | ConvertTo-Json -Compress
     exit 2
 } finally {
     if ($null -ne $client) { $client.Dispose() }

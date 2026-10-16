@@ -90,6 +90,16 @@ def test_wait_exhausts_budget_zero_http_calls_then_no_burst(tmp_path):
     assert float(third.read_text()) - float(first.read_text()) >= .5
 
 
+def test_deadline_timer_cancellation_before_gate_keeps_raw_error_and_zero_http(tmp_path):
+    p, marker = _spawn(tmp_path, "timer", budget_ms=500, wait_for_deadline_timer=True)
+    result = _finish(p)
+    assert not result["ok"] and not marker.exists() and not result["http_call_made"]
+    assert result["error_code"] == "http_start_budget_exhausted"
+    assert result["deadline_timer_cancelled"] is True
+    assert result["raw_error_type"] == "System.OperationCanceledException"
+    assert result["raw_error_message"]
+
+
 def test_cancelled_coordination_lock_wait_makes_zero_calls(tmp_path):
     p, first = _spawn(tmp_path, "holder", block_ms=800,
                        ready_marker=str(tmp_path / "holder.ready"), release_marker=str(tmp_path / "release"))
