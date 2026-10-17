@@ -6,6 +6,15 @@ Its main CI succeeded: 1308 passed in 205.81s,
 This change prepares an executable candidate audit, not S2 qualification.
 No real source requests, tasks or reminders are authorized in this delivery.
 
+## Manual Operator Entry
+
+The collector tests below do not cover arbitrary external PowerShell launchers.
+The October 16 operator-exit incident and its versioned, behavior-tested repair
+are documented in [manual orchestration](t31_manual_orchestration.md). Future
+manually authorized launches must use that reviewed entry, not archived daily
+operator scripts. This addendum changes no source or time contract and does not
+authorize a new collection.
+
 ## Frozen Contract
 
 - Plan: `complete_industry_same_round_plan_v1`.
