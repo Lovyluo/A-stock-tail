@@ -11,6 +11,7 @@ from typing import Any, Callable
 WORKER_TIMEOUT_ERROR = "REQUEST_DEADLINE_EXCEEDED"
 WORKER_OUTPUT_ERROR = "WORKER_OUTPUT_INVALID"
 WORKER_PROCESS_ERROR = "WORKER_PROCESS_FAILED"
+WORKER_CLEANUP_ERROR = "WORKER_CLEANUP_INCOMPLETE"
 
 
 def run_probe_worker_process(
@@ -21,8 +22,19 @@ def run_probe_worker_process(
     worker_command: list[str] | None = None,
     monotonic: Callable[[], float] | None = None,
     termination_grace_seconds: float = 0.5,
+    include_startup_in_deadline: bool = False,
+    retain_streams: bool = False,
+    bounded_cleanup_ms: int | None = None,
+    hard_deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Run one provider request in a killable child process."""
+    if bounded_cleanup_ms is not None:
+        return _run_bounded_worker(
+            task, deadline_ms, worker_command=worker_command,
+            python_executable=python_executable, monotonic=monotonic or time.perf_counter,
+            cleanup_ms=bounded_cleanup_ms, retain_streams=retain_streams,
+            hard_deadline=hard_deadline_monotonic,
+        )
     runtime_monotonic = monotonic or time.monotonic
     command = list(worker_command or [
         python_executable or sys.executable,
@@ -46,13 +58,21 @@ def run_probe_worker_process(
         creationflags=creationflags,
     )
     worker_terminated = False
+    startup_ms = None
     try:
+        remaining = max(1, int(deadline_ms)) / 1000.0
+        if include_startup_in_deadline:
+            startup_ms = (runtime_monotonic() - started) * 1000
+            remaining -= startup_ms / 1000
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 0)
         stdout, stderr = process.communicate(
             json.dumps(task, ensure_ascii=False),
-            timeout=max(1, int(deadline_ms)) / 1000.0,
+            timeout=remaining,
         )
     except subprocess.TimeoutExpired:
         worker_terminated = True
+        cleanup_started = runtime_monotonic() if retain_streams else None
         _terminate_process_tree(process)
         try:
             stdout, stderr = process.communicate(
@@ -61,17 +81,19 @@ def run_probe_worker_process(
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
+        elapsed_ms = round((runtime_monotonic() - started) * 1000, 3)
         return {
             "ok": False,
             "error_code": WORKER_TIMEOUT_ERROR,
             "error": WORKER_TIMEOUT_ERROR,
             "request_timed_out": True,
             "worker_terminated": worker_terminated,
-            "elapsed_ms": round(
-                (runtime_monotonic() - started) * 1000,
-                3,
-            ),
+            "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **({"process_startup_ms": startup_ms,
+                "cleanup_ms": elapsed_ms - (cleanup_started - started) * 1000}
+               if retain_streams else {}),
         }
 
     elapsed_ms = round(
@@ -79,6 +101,8 @@ def run_probe_worker_process(
         3,
     )
     payload = _decode_worker_output(stdout)
+    diagnostics = ({"process_startup_ms": startup_ms, "cleanup_ms": 0.0,
+                    "io_and_normal_exit_ms": elapsed_ms - (startup_ms or 0.0)} if retain_streams else {})
     if payload is None:
         return {
             "ok": False,
@@ -88,6 +112,8 @@ def run_probe_worker_process(
             "worker_terminated": False,
             "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **diagnostics,
         }
     if process.returncode != 0 or payload.get("ok") is not True:
         return {
@@ -104,6 +130,8 @@ def run_probe_worker_process(
             "worker_terminated": False,
             "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **diagnostics,
         }
     return {
         "ok": True,
@@ -114,6 +142,8 @@ def run_probe_worker_process(
         "worker_terminated": False,
         "elapsed_ms": elapsed_ms,
         "returncode": process.returncode,
+        **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+        **diagnostics,
     }
 
 
@@ -153,3 +183,261 @@ def _decode_worker_output(value: str) -> dict[str, Any] | None:
 
 def _bounded_error(value: str, limit: int = 500) -> str:
     return str(value or "").strip()[:limit]
+
+
+class _ProcessScope:
+    """Track descendants even after the root exits; never shell out to taskkill."""
+
+    def __init__(self, process):
+        self.process = process
+        self.handle = None
+        self.kind = "posix_process_group"
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            self.ctypes = ctypes
+            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            class Accounting(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_int64) for name in (
+                    "total_user", "total_kernel", "period_user", "period_kernel")]
+                _fields_ += [(name, wintypes.DWORD) for name in (
+                    "page_faults", "total_processes", "active_processes", "terminated_processes")]
+            self.Accounting = Accounting
+            signatures = {
+                "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+                "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+                "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+                "QueryInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+                "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            }
+            for name, (arguments, result) in signatures.items():
+                function = getattr(self.kernel, name)
+                function.argtypes, function.restype = arguments, result
+            self.handle = self.kernel.CreateJobObjectW(None, None)
+            if not self.handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+                error = ctypes.WinError(ctypes.get_last_error())
+                self.close()
+                raise error
+            self.kind = "windows_job"
+
+    def empty(self):
+        if os.name == "nt":
+            values = self.Accounting()
+            if not self.kernel.QueryInformationJobObject(self.handle, 1, self.ctypes.byref(values),
+                                                         self.ctypes.sizeof(values), None):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            return values.active_processes == 0
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    def terminate(self):
+        if os.name == "nt":
+            if not self.kernel.TerminateJobObject(self.handle, 1):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+        else:
+            import signal
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def close(self):
+        if self.handle:
+            handle, self.handle = self.handle, None
+            if not self.kernel.CloseHandle(handle):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+
+class _PipeDrain:
+    """One caller, raw unbuffered handles, no blocked communicate/reader threads."""
+
+    def __init__(self, process):
+        self.streams = {"stdout": process.stdout, "stderr": process.stderr}
+        self.chunks = {name: [] for name in self.streams}
+        self.eof = {name: False for name in self.streams}
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+            self.ctypes, self.msvcrt = ctypes, msvcrt
+            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.kernel.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+            self.kernel.PeekNamedPipe.restype = wintypes.BOOL
+        else:
+            for stream in self.streams.values():
+                os.set_blocking(stream.fileno(), False)
+
+    def step(self):
+        received = False
+        for name, stream in self.streams.items():
+            if self.eof[name]:
+                continue
+            size = 65536
+            if os.name == "nt":
+                available = self.ctypes.c_ulong()
+                handle = self.msvcrt.get_osfhandle(stream.fileno())
+                if not self.kernel.PeekNamedPipe(handle, None, 0, None,
+                                                self.ctypes.byref(available), None):
+                    error = self.ctypes.get_last_error()
+                    if error in (109, 232):  # broken/closed pipe, including inherited handles
+                        self.eof[name] = True
+                        continue
+                    raise self.ctypes.WinError(error)
+                if not available.value:
+                    continue
+                size = min(size, available.value)
+            try:
+                data = os.read(stream.fileno(), size)
+            except BlockingIOError:
+                continue
+            if data:
+                self.chunks[name].append(data)
+                received = True
+            else:
+                self.eof[name] = True
+        return received
+
+    def text(self, name):
+        return b"".join(self.chunks[name]).decode("utf-8", errors="replace")
+
+
+def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
+                        monotonic, cleanup_ms, retain_streams, hard_deadline):
+    started = monotonic()
+    deadline = started + max(0, deadline_ms) / 1000
+    if hard_deadline is not None:
+        deadline = min(deadline, hard_deadline)
+    reserve = max(0, cleanup_ms) / 1000
+    io_deadline = deadline - reserve
+    process = scope = drain = None
+    errors, timings = [], {}
+    timed_out = terminated = False
+    tree_empty = pipes_closed = False
+    io_completed = started
+    cleanup_complete = close_complete = False
+    cleanup_deadline = deadline
+    stage = "prepare"
+    try:
+        value = json.dumps(task, ensure_ascii=False).encode("utf-8")
+        # Fits one empty anonymous input pipe; no communicate writer can get stuck.
+        if len(value) > 4096:
+            raise ValueError("bounded_worker_input_exceeds_4096_bytes")
+        if monotonic() >= io_deadline:
+            raise subprocess.TimeoutExpired(worker_command, 0)
+        stage = "startup"
+        process = subprocess.Popen(
+            list(worker_command or [python_executable or sys.executable, "-m",
+                                    "overnight_quant.data.minute_probe_worker"]),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
+        # Our worker reads stdin first: establish its descendant scope before release.
+        scope = _ProcessScope(process)
+        drain = _PipeDrain(process)
+        timings["process_startup_ms"] = (monotonic() - started) * 1000
+        if monotonic() >= io_deadline:
+            raise subprocess.TimeoutExpired(worker_command, 0)
+        process.stdin.write(value)
+        process.stdin.close()
+        stage = "read_and_normal_exit"
+        while monotonic() < io_deadline:
+            received = drain.step()
+            if process.poll() is not None and all(drain.eof.values()) and scope.empty():
+                break
+            if not received:
+                time.sleep(min(.002, max(0, io_deadline - monotonic())))
+        else:
+            raise subprocess.TimeoutExpired(worker_command, max(0, io_deadline - started))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except Exception as exc:
+        errors.append(f"{stage}:{type(exc).__name__}:{exc}")
+    finally:
+        io_completed = monotonic()
+        # One shared cleanup deadline, not a fresh reserve for each operation.
+        cleanup_deadline = min(deadline, io_completed + reserve)
+        timings["io_and_startup_ms"] = (io_completed - started) * 1000
+        termination_started = monotonic()
+        try:
+            if process is not None:
+                tree_empty = scope.empty() if scope is not None else False
+                if (process.poll() is None or not tree_empty) and monotonic() < cleanup_deadline:
+                    terminated = True
+                    if scope is not None:
+                        scope.terminate()
+                    else:
+                        process.kill()
+        except Exception as exc:
+            errors.append(f"terminate:{type(exc).__name__}:{exc}")
+        timings["termination_ms"] = (monotonic() - termination_started) * 1000
+        drain_started = monotonic()
+        try:
+            while process is not None and monotonic() < cleanup_deadline:
+                received = drain.step() if drain is not None else False
+                root_exited = process.poll() is not None
+                tree_empty = scope.empty() if scope is not None else False
+                if root_exited and tree_empty and drain is not None and all(drain.eof.values()):
+                    break
+                if not received:
+                    time.sleep(min(.002, max(0, cleanup_deadline - monotonic())))
+        except Exception as exc:
+            errors.append(f"drain_or_exit:{type(exc).__name__}:{exc}")
+        timings["drain_and_exit_ms"] = (monotonic() - drain_started) * 1000
+        close_started = monotonic()
+        try:
+            if process is not None:
+                # FileIO only, no buffered locks or reader threads to join on close.
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    stream.close()
+                pipes_closed = True
+            if scope is not None:
+                scope.close()
+            close_complete = True
+        except Exception as exc:
+            errors.append(f"close:{type(exc).__name__}:{exc}")
+        timings["pipe_and_scope_close_ms"] = (monotonic() - close_started) * 1000
+        cleanup_complete = close_complete and (process is None or (process.poll() is not None and tree_empty
+            and drain is not None and all(drain.eof.values()) and pipes_closed))
+        cleanup_complete = cleanup_complete and monotonic() <= cleanup_deadline
+        timings["cleanup_ms"] = (monotonic() - io_completed) * 1000
+    stdout, stderr = (drain.text("stdout"), drain.text("stderr")) if drain else ("", "")
+    decode_started = monotonic()
+    payload = _decode_worker_output(stdout) if cleanup_complete and not timed_out and not errors else None
+    elapsed_ms = (monotonic() - started) * 1000
+    timings["decode_ms"] = (monotonic() - decode_started) * 1000
+    cleanup_finished = monotonic()
+    timings["cleanup_ms"] = (cleanup_finished - io_completed) * 1000
+    cleanup_complete = cleanup_complete and cleanup_finished < cleanup_deadline
+    over_budget = monotonic() > deadline
+    ok = (cleanup_complete and not timed_out and not over_budget and not errors
+          and payload is not None and process is not None and process.returncode == 0
+          and payload.get("ok") is True)
+    code = (WORKER_CLEANUP_ERROR if not cleanup_complete else WORKER_TIMEOUT_ERROR if timed_out or over_budget
+            else WORKER_PROCESS_ERROR if errors or (process is not None and process.returncode != 0)
+            else WORKER_OUTPUT_ERROR if payload is None else str(payload.get("error_code") or WORKER_PROCESS_ERROR))
+    return {
+        "ok": ok, "payload": (payload.get("payload") or {}) if ok else {},
+        "error_code": "" if ok else code,
+        "error": "" if ok else (";".join(errors) or (payload or {}).get("error") or code),
+        "request_timed_out": timed_out or over_budget, "worker_terminated": terminated,
+        "returncode": process.poll() if process is not None else None,
+        "pid": process.pid if process is not None else None,
+        "cleanup_complete": cleanup_complete, "cleanup_budget_exhausted": cleanup_finished >= cleanup_deadline,
+        "tree_empty_observed": tree_empty if scope is not None else None,
+        "tree_tracking": scope.kind if scope is not None else "UNCONFIRMED",
+        "stdout_eof": drain.eof["stdout"] if drain else False,
+        "stderr_eof": drain.eof["stderr"] if drain else False,
+        "pipes_closed": pipes_closed, "stage": stage, "diagnostics": errors,
+        "elapsed_ms": round(elapsed_ms, 3), **timings,
+        "hard_deadline_monotonic": deadline, "io_deadline_monotonic": io_deadline,
+        "cleanup_deadline_monotonic": cleanup_deadline,
+        **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+    }
