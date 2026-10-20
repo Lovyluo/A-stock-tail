@@ -16,7 +16,8 @@ from overnight_quant.strategy.close_confirmation_noflow_v1.contracts import STRA
 from overnight_quant.strategy.close_confirmation_noflow_v1.strategy import NoFundFlowResearchStrategy
 
 
-def run(*, input_path: Path | None, expected_sha256: str | None, test_only: bool = False) -> dict:
+def run(*, input_path: Path | None, expected_sha256: str | None, test_only: bool = False,
+        provider_capture: bool = False) -> dict:
     try:
         if input_path is None:
             raise ValueError("offline_input_required")
@@ -32,6 +33,9 @@ def run(*, input_path: Path | None, expected_sha256: str | None, test_only: bool
             return result
         snapshot = json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=unique,
                               parse_constant=lambda value: (_ for _ in ()).throw(ValueError("nonfinite_json")))
+        if provider_capture:
+            from overnight_quant.strategy.close_confirmation_noflow_v1.record_bridge import bridge_captured_records
+            return bridge_captured_records(snapshot, test_only=test_only)
         return NoFundFlowResearchStrategy().evaluate_snapshot(snapshot, test_only=test_only)
     except (OSError, ValueError, TypeError, UnicodeError) as exc:
         return {**safety(), "execution_ok": False, "research_ready": False, "research_ranking": [],
@@ -44,11 +48,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", type=Path)
     parser.add_argument("--expected-input-sha256")
     parser.add_argument("--test-only", action="store_true", help="Accept only explicitly synthetic records; never formal data.")
+    parser.add_argument("--provider-capture", action="store_true", help="Offline captured Provider batches; no source activation.")
     parser.add_argument("--output-dir", type=Path, help="Optional write-once strategy-isolated report directory.")
     args = parser.parse_args(argv)
-    result = run(input_path=args.input, expected_sha256=args.expected_input_sha256, test_only=args.test_only)
+    result = run(input_path=args.input, expected_sha256=args.expected_input_sha256, test_only=args.test_only,
+                 provider_capture=args.provider_capture)
     if args.output_dir:
-        target = args.output_dir / STRATEGY_ID / ("test_only" if args.test_only else "research") / (
+        namespace = args.output_dir / STRATEGY_ID
+        if args.provider_capture:
+            namespace = namespace / "record_bridge_v1"
+        target = namespace / ("test_only" if args.test_only else "research") / (
             result.get("snapshot_hash", "rejected") + ".json"
         )
         try:
