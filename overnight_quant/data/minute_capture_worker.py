@@ -61,7 +61,7 @@ class NativeClient:
 
         def capture(parser, body):
             owner.bodies.append(bytes(body))
-            owner.body_times.append({"parser_received_at": now(), "parser_received_monotonic": time.monotonic()})
+            owner.body_times.append({"parser_received_at": now(), "parser_received_monotonic": time.perf_counter()})
             return original(parser, body)
 
         self.parser.parseResponse = capture
@@ -95,27 +95,28 @@ def capture_wave(task, *, client_factory=NativeClient, emit=None):
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
         raise ValueError("capture_deadline_invalid")
     client, called = None, 0
-    emit({"kind": "wave_started", "at": now(), "worker_version": VERSION})
+    emit({"kind": "wave_started", "at": now(), "worker_version": VERSION,
+          "budget_clock": "time.perf_counter"})
     try:
-        if time.monotonic() >= deadline:
+        if time.perf_counter() >= deadline:
             raise TimeoutError("wave_budget_exhausted_before_client")
         client = client_factory()
-        emit({"kind": "client_ready", "at": now(), "monotonic": time.monotonic()})
+        emit({"kind": "client_ready", "at": now(), "monotonic": time.perf_counter()})
         for code in CODES:
-            if time.monotonic() >= deadline:
+            if time.perf_counter() >= deadline:
                 raise TimeoutError("wave_budget_exhausted_before_dispatch")
             request = {"symbol": code, "frequency": "1m", "start": 0, "offset": 800}
             receipt = {"kind": "request_started", "request_id": f"{task['wave']}:{code}",
                        "wave": task["wave"], "code": code, "request": request,
                        "request_hash": digest({"request": request, "endpoint": ENDPOINT}),
-                       "request_started_at": now(), "call_monotonic": time.monotonic(),
-                       "remaining_io_ms": max(0, (deadline - time.monotonic()) * 1000)}
+                       "request_started_at": now(), "call_monotonic": time.perf_counter(),
+                       "remaining_io_ms": max(0, (deadline - time.perf_counter()) * 1000)}
             emit(receipt)
             called += 1
-            start = time.monotonic()
+            start = time.perf_counter()
             try:
                 frame = client.bars(**request)
-                completed, read_end = now(), time.monotonic()
+                completed, read_end = now(), time.perf_counter()
                 bodies = list(client.bodies)
                 if not bodies:
                     raise ValueError("native_parser_response_body_missing")

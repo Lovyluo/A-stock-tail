@@ -55,7 +55,9 @@ def main(argv=None):
             evidence, path = audit.capture(plan, args.date, authorization=auth)
             receipt = json.loads((path.parent / "seal-receipt.json").read_text(encoding="utf-8"))
             result = audit.safe(status=receipt["status"], evidence_path=str(path),
-                                evidence_hash=evidence["evidence_hash"], summary=evidence["summary"])
+                                evidence_hash=evidence["evidence_hash"], summary=evidence["summary"],
+                                cleanup_complete=receipt["cleanup_complete"],
+                                residual_process_state=receipt["residual_process_state"])
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 2 if result["status"] == "MINUTE_CAPTURE_AUDIT_FAILED" else 0
     except Exception as exc:

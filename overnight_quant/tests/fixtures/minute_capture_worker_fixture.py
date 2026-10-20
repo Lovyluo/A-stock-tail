@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,7 +14,14 @@ from overnight_quant.data import minute_capture_worker as worker
 task = json.loads(sys.stdin.read())
 mode = sys.argv[1] if len(sys.argv) > 1 else "complete"
 base = datetime.fromisoformat(task["parent_started_at"])
-worker.now = lambda: (base + timedelta(seconds=time.monotonic() - task["parent_started_monotonic"])).isoformat()
+worker.now = lambda: (base + timedelta(seconds=time.perf_counter() - task["parent_started_monotonic"])).isoformat()
+
+if mode == "orphan_pipe":
+    child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])
+    Path(sys.argv[2]).write_text(str(child.pid))
+    print('{"ok":true,"payload":{"synthetic_test_only":true}}', flush=True)
+    print("synthetic stderr before root exit", file=sys.stderr, flush=True)
+    os._exit(0)  # The descendant deliberately keeps both output pipes open.
 
 
 class Frame:
@@ -58,7 +66,7 @@ class Client:
         if mode == "reverse":
             rows.reverse()
         self.bodies = [json.dumps(rows, sort_keys=True).encode()]
-        self.body_times = [{"parser_received_at": worker.now(), "parser_received_monotonic": time.monotonic()}]
+        self.body_times = [{"parser_received_at": worker.now(), "parser_received_monotonic": time.perf_counter()}]
         return Frame(rows)
 
     def close(self):

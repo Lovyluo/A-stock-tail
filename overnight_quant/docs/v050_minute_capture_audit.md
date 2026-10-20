@@ -21,6 +21,17 @@
 - stdout逐响应刷新，超时杀树后保留已经收到的回包和失败流；同日intent、每波原件、evidence、外部SHA锚点、seal-receipt均原子不可覆盖。日期目录也是永久单次启动凭据，不自动删除/重置失败锁。只写ignored `overnight_quant/data/cache/minute_capture_audit/`；test-only写隔离测试目录。
 - 完整性verifier通过可以对应失败采集，不能升级来源资格。封存完成与source available_at分开；迟封存单独返回失败，不回填较早available_at。离线双重放发生在封存之后，不倒写成采集前可用。
 
+### PR #39 有界终止与收尾
+
+- 仅新捕获路径显式传入`bounded_cleanup_ms=500`及绝对单调截止；共享执行器旧调用的默认行为不变。父进程与原生捕获worker统一使用`time.perf_counter()`控制这一路径的预算和耗时，墙钟只作追溯，不校时、不改变原生事件。Windows旧`time.monotonic()`在当前Python下为15.625ms粒度，本次不再用它计量新路径的毫秒清理预算。
+- 整波截止仍是2000ms：启动/导入/连接/输入/全部读取/正常退出在前1500ms内；终止、剩余stdout/stderr读取、退出确认、无缓冲管道关闭、跟踪句柄关闭及结果整理**共享**最多剩余500ms，且不得越过整波绝对截止。终止耗去350ms时，后续只剩约150ms，不重新获得500ms。
+- 新路径不调用旧`taskkill`或`communicate()`，也没有无超时`wait()`。Windows在发送stdin前把worker纳入独立Job Object，根进程退出后仍追踪后代；使用[TerminateJobObject](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)单次终止、非等待式状态检查和单调用者的[PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe)读取。没有后台读取线程或待完成的同句柄读取，关闭原始FileIO时不等待reader锁；POSIX使用独立进程组和非阻塞管道。新路径stdin限4096字节，任务本身不包含市场响应。
+- 正常清理必须在预算内确认根进程退出、跟踪进程树为空、stdout/stderr均EOF及句柄关闭。清理不完整或耗尽返回`WORKER_CLEANUP_INCOMPLETE / cleanup_complete=false`，保留已收到的输出、PID、退出码/EOF/树状态和逐阶段耗时；不声称无残留。OS调度导致返回稍晚时如实记实际耗时，不能按时成功或增加容差。
+- 清理失败立即停止后续波次，并在audit根目录原子保留`cleanup-incomplete.json`。该凭据跨日期阻断再次启动，不自动删除或重置；必须保全记录、独立确认进程清理并获得恢复处置后再考虑新启动。原同日intent、失败原件与历史结论不改写。历史没有新增清理字段的证据仍只按其原结构审计，不能倒推为已确认清理。
+- 离线行为回归覆盖旧taskkill卡住/失败路径不被新入口调用、终止失败/不退出、根进程退出但后代持管道、正常超时回收，以及共享预算耗尽后本波失败/后续和跨日零派发。测试独立监督并在finally中限时回收所有测试PID，故意注入的残留不遗留到测试结束。
+
+本轮相关专项80 passed in 45.97s，无本地全量。故障注入实测：正常超时1504.890ms（清理4.344ms）；根退出/后代持管道1502.567ms（清理2.395ms）；终止350.239ms后仅再等149.746ms。清理失败的实际总耗时2000.160–2000.491ms均拒绝、cleanup_complete=false，不作为放宽2000ms的依据。完整诊断及最终PR CI在仓库外`local-archive/recovery/pr39-bounded-cleanup-20261020`；本轮零行情请求。冻结计划、20次bars/0次逐笔、固定节点/串行、分钟语义与最终性和资格不变。
+
 ## 无日期冻结候选计划
 
 | 阶段 | 请求、依赖与最坏预算（待审核，不是执行许可） |
