@@ -1,6 +1,10 @@
 param(
     [Parameter(Mandatory=$true)][string]$OpsDirectory,
-    [Parameter(Mandatory=$true)][string]$OutputPath
+    [Parameter(Mandatory=$true)][string]$OutputPath,
+    [switch]$MinuteCapture,
+    [string]$ProjectRoot,
+    [string]$MinuteCaptureRoot,
+    [string]$TradeDate
 )
 $ErrorActionPreference = 'Stop'
 $code = 2
@@ -10,14 +14,43 @@ function Write-Result($Path,$Value) {
     try { $f.Write($bytes,0,$bytes.Length);$f.Flush($true) } finally { $f.Dispose() }
 }
 try {
+    if ($MinuteCapture) {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $OutputEncoding = [Text.UTF8Encoding]::new($false)
+    }
     if (Test-Path -LiteralPath $OutputPath) { throw 'Immutable environment output exists' }
     $intent = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $OpsDirectory 'intent.json') | ConvertFrom-Json
     $since = [DateTimeOffset]::Parse([string]$intent.created_at).LocalDateTime
+    if ($MinuteCapture) {
+        if (!$intent.environment_observation_since) { throw 'Minute environment observation start missing' }
+        $since = [DateTimeOffset]::Parse([string]$intent.environment_observation_since).LocalDateTime
+    }
     $issues = @()
-    $workers = @(Get-CimInstance Win32_Process | Where-Object {
+    $allProcesses = @(Get-CimInstance Win32_Process)
+    $workers = @($allProcesses | Where-Object {
         $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
         $_.CommandLine -match 'market_httpclient_worker\.ps1|market_source_worker\.py|run_complete_industry_audit\.py|run_market_source_validation\.py|pytest|run_minute_probe_watchdog\.ps1'
     } | Select-Object ProcessId,ParentProcessId,Name,CommandLine)
+    if ($MinuteCapture) {
+        if (!$ProjectRoot -or !$MinuteCaptureRoot -or !$TradeDate) { throw 'Minute environment arguments missing' }
+        # Match actual entry/module tokens, not every Python process or a word in a note.
+        $pattern = '(?:[\\/]|^|[\s"])' +
+            '(?:run_minute_capture_audit|minute_capture_worker|minute_probe_worker|run_minute_probe_watchdog|' +
+            'run_market_source_validation|run_complete_industry_audit|market_source_worker)\.(?:py|ps1)(?:["\s]|$)' +
+            '|(?:^|\s)-m\s+overnight_quant\.data\.(?:minute_capture_worker|minute_probe_worker|market_source_worker)(?:\s|$)' +
+            '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
+        $ids = @($allProcesses | Where-Object {
+            $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
+            $_.CommandLine -match $pattern
+        } | ForEach-Object { [int]$_.ProcessId })
+        do {
+            $more = @($allProcesses | Where-Object { $_.ParentProcessId -in $ids -and $_.ProcessId -notin $ids } |
+                ForEach-Object { [int]$_.ProcessId })
+            $ids += $more
+        } while ($more.Count)
+        $workers = @($allProcesses | Where-Object { $_.ProcessId -in $ids } |
+            Select-Object ProcessId,ParentProcessId,Name,CommandLine)
+    }
     $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
         $_.TaskName -match 'AStock|A-stock|MarketSource|IndustryAudit' -or
         (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'A-stock|market_source|complete_industry'
@@ -85,8 +118,35 @@ try {
         workers=$workers;tasks=$tasks;locks=$locks;journals=$journals;clock_or_power_events=$events;blockers=$issues
         journal_changes=0;task_changes=0
     }
+    if ($MinuteCapture) {
+        $record.scope = 'minute_capture_environment_v1'
+        $record.trade_date = $TradeDate
+        $record.project_root = [IO.Path]::GetFullPath($ProjectRoot)
+        $record.capture_root = [IO.Path]::GetFullPath($MinuteCaptureRoot)
+        $record.cleanup_incomplete_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot 'cleanup-incomplete.json')
+        $record.date_output_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot $TradeDate)
+        $record.git_head = (& git -C $ProjectRoot rev-parse HEAD | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Git HEAD query failed' }
+        $record.git_status = @(& git -C $ProjectRoot status --porcelain=v1)
+        if ($LASTEXITCODE -ne 0) { throw 'Git status query failed' }
+        # Keep native bytes: the Python verifier parses this same source, not a GO flag.
+        $clockOut = Join-Path $OpsDirectory 'clock-status.stdout.bin'
+        $clockErr = Join-Path $OpsDirectory 'clock-status.stderr.bin'
+        if ((Test-Path -LiteralPath $clockOut) -or (Test-Path -LiteralPath $clockErr)) { throw 'Clock output already exists' }
+        $clockProcess = Start-Process -FilePath 'w32tm.exe' -ArgumentList '/query','/status','/verbose' `
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput $clockOut -RedirectStandardError $clockErr
+        try {
+            if (!$clockProcess.WaitForExit(5000)) { $clockProcess.Kill(); throw 'Clock status query timed out' }
+            $clockProcess.Refresh()
+            $record.clock_query = @{command=@('w32tm','/query','/status','/verbose');exit_code=$clockProcess.ExitCode
+                stdout_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($clockOut))
+                stderr_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($clockErr))}
+        } finally { $clockProcess.Dispose() }
+        $record.checked_at = Get-Date -Format o
+    }
     Write-Result $OutputPath $record
-    [ordered]@{status=if($issues.Count){'ENVIRONMENT_REJECTED'}else{'ENVIRONMENT_PASSED'};blockers=$issues} | ConvertTo-Json -Depth 5
+    if ($MinuteCapture) { @{ok=(!$issues.Count);payload=$record} | ConvertTo-Json -Depth 20 }
+    else { [ordered]@{status=if($issues.Count){'ENVIRONMENT_REJECTED'}else{'ENVIRONMENT_PASSED'};blockers=$issues} | ConvertTo-Json -Depth 5 }
     if (!$issues.Count) { $code = 0 }
 } catch {
     $failure = [ordered]@{schema_version='industry_audit_environment_v1';status='ENVIRONMENT_INSPECTION_FAILED';blockers=@($_.Exception.Message);service_running=$false}
