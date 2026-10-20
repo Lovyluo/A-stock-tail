@@ -20,7 +20,7 @@
 | 当日交易状态/报价 | 腾讯固定五股；10/19 session 5/5 | quote bound，显式 envelope | 14:50 同批报价、价格 CNY、涨幅 percent、停牌/涨跌停/可交易性明确；上午 session 不能当14:50报价 |
 | 市场基准及宽度 | 东财三个市场计数与上证指数 f170，历史 audit | candidate、S2 0/3 | 基准 SH:000001；全 A 有效股票口径/池版本；尚无获准正式 14:50 组合批次 |
 | 身份→BK→行业 | 东财 CoreConception、成分宽度、fltt=1 强度 | 新组合 candidate 未激活；10/19 单轮 audit 接受 | 同源、同批、精确 BK 关联和原生涨幅；14:40证据不可挪为14:50资格 |
-| 分钟量价 | mootdx 固定端点与五股，既有3/3有限范围 | minute_bar bound；逐笔仅审计 | 12个连续事件分钟含14:50、区间60秒、shares/CNY、真实成交额、最终性与分钟标签证据；本轮无真实量额语义桥接或新采集 |
+| 分钟量价 | mootdx 固定端点与五股，既有3/3有限范围 | minute_bar bound；逐笔仅审计 | 12个完整连续区间，截至14:50；minute_start原生标签14:38–14:49；60秒、shares/CNY、真实成交额及可信区间/最终性证据；真实语义桥接仍缺失 |
 | 个股新闻 | 东财 S1真实 evidence | bound；成功零新闻合法 | 来源成功及明确风险审阅 CLEAR；缺发布时间/来源失败/风险未知拒绝 |
 | 全球新闻 | 东财 S1真实 evidence | bound；成功零新闻合法 | 与个股新闻独立状态；未知不能当无风险 |
 | 公告 | 巨潮403、SSE/SZSE/BSE候选材料 | 均 candidate/unqualified | 唯一实际交易所身份、发布时间精度、风险审阅；仍是实际阻断，不以新闻替代 |
@@ -30,11 +30,11 @@
 
 ### 准入层次与来源限制
 
-1. `noflow_research_input_v1` 接受 records-first 显式输入，不从网络或旧缓存自动构造。
-2. `noflow_research_record_v1` 每条携带能力、身份、版本、批次、交易日、时间合同hash、请求/raw/payload hash。
+1. `noflow_research_input_v2` 接受 records-first 显式输入，不从网络或旧缓存自动构造。旧v1文件保留，不自动迁移或重签为v2。
+2. `noflow_research_record_v2` 每条携带能力、身份、版本、批次、交易日、时间合同hash、请求/raw/payload hash；分钟记录另有 `noflow_minute_interval_v1` 区间/最终性元字段。
 3. 复用既有 PIT 检查、证券身份规范化、生产 Adapter 矩阵和 provenance 路由；没有修改其标准。
 4. 公开真实路径先检查精确 bound/provider key 和来源资格，**仍拒绝缺少独立核验的 noflow 来源桥接**。本轮并未实现或批准真实来源准入器；即使真实标签看似合格，也返回 `verified_noflow_source_bridge_not_available`。这不是资金流阻断。
-5. `--test-only` 只接受每条均为 `synthetic_test_only.noflow / synthetic_noflow_v1 / test_only` 的合成输入，不能用于真实来源提升。
+5. `--test-only` 只接受每条均为 `synthetic_test_only.noflow / synthetic_noflow_v2 / test_only` 的合成输入，不能用于真实来源提升。
 6. payload hash 和外部文件 SHA 分别检查数据损坏与文件身份，不能单独证明来源/字段语义真实。真实候选 audit 原件仍交原 verifier，不由新策略重签成正式数据。
 
 ## 时间、身份与单位合同
@@ -42,7 +42,11 @@
 - 正式研究目标沿用保守 minute-start 四阶段：feature_event_cutoff=14:50:00；collection_deadline=14:51:05；decision_time=14:51:10；execution_not_before=14:52:00。
 - 复用 `build_close_time_contract` 生成时间形状，不在生成器中补造 VERIFIED 或 probe hash。输入必须有已核验分钟标签；本轮合成 hash 仅在 test-only fixture。
 - `decision_cutoff` 必须等于 decision_time，不是 feature cutoff。事件不得晚于 feature cutoff；event≤observed≤available≤collection_deadline；同日且有时区，不截断毫秒或平移原生时点。
-- 12个连续分钟标签从14:39至14:50，间隔严格60秒。分钟 OHLC、量、额均有效；量额是该行对应区间值，不是累计值。volume=0只在amount=0时合法，必要计算窗口分母必须非零。
+- 分钟准入以实际 `interval_end<=feature_cutoff` 为准，不以原生起点标签代替成交区间终点。minute_start的12个完整区间为 `[14:38,14:39)` 至 `[14:49,14:50)`，不要求纳入起点14:50的行；`[14:50,14:51)` 即使在14:51:05前已完成且is_final=true仍拒绝。
+- 每条必须分别保留 `native_label`、`minute_label_semantics`、`interval_start`、`interval_end`；`event_time=native_label=interval_start`，长度精确60秒，同日、连续、无重叠。按实际终点排序后完整覆盖14:38–14:50，不平移/截断原生时间，也不改共享旧策略规则。
+- `finalized_at`及最终性证据均必须存在，且 `interval_end<=finalized_at<=observed_at<=available_at<=collection_deadline`。仅is_final=true不能证明最终性；即便早1ms宣称最终可用也拒绝。
+- 本轮仅合成路径接受显式 `VERIFIED_SYNTHETIC_TEST_ONLY` 区间证据，区间/最终性hash须与合成probe锚点匹配；该匹配不证明上游真实语义。公开真实路径仍要求独立桥接，不因合成通过获得资格。
+- 分钟 OHLC、量、额均有效，量额为各60秒区间值而非累计值。volume=0仅在amount=0时合法，计算窗口分母必须非零。
 - 报价、基准与行业涨幅在同批同日的14:50原生事件时点对齐。证券身份由代码及交易所规范化，不能把 SZ:000001 当 SH:000001。
 - 股票按有证据的 `security_identity → board_code` 关联；分类固定 `eastmoney_coreconception+board_constituent_breadth_v1`；名称不用于 join、不补写腾讯报价。
 - 同一BK的多股视图必须一致；完全相同重复记录去重，冲突/缺股/缺分钟/其他身份拒绝，不用“最后一条”掩盖冲突。
@@ -63,7 +67,7 @@
 | 量价结构 P | mean(C(0.5+VWAP位置%/3), C(0.5+VWAP斜率%/1.5), C(0.5+成交量比变化/2), C(0.5+尾段涨幅%/4)) |
 
 - 总分=100×0.25×(M+I+R+P)；仅降序排序，同分按六位代码排序。没有入选阈值或自动重分配权重。
-- VWAP=sum(amount_CNY)/sum(volume_shares)，范围仅最后12个连续分钟，**不是全天VWAP**，不以price×volume补成交额。
+- VWAP=sum(amount_CNY)/sum(volume_shares)，范围为上述12个完整成交区间，**不是全天VWAP**，不以price×volume补成交额。现有特征 `window_start/window_end` 保留原生标签14:38/14:49的含义，不冒充实际区间边界；实际边界由输入和readiness规范记录中原样保留的interval字段确定。
 - VWAP位置=(最后收盘价/窗口VWAP-1)×100；斜率=(12分钟VWAP/前7分钟VWAP-1)×100，即两个扩展窗口端点相隔5分钟。
 - 成交量比变化=sum(最后5行volume)/sum(此前5行volume)-1；负值合法，但缺分母拒绝。
 - 尾段涨幅=(最后close/最后5行首行open-1)×100。正方向表示尾段确认；不引入盘口或资金流。
@@ -75,7 +79,9 @@
 - `ingest_hash`覆盖原始输入，允许随审计资金流、重复顺序变化。
 - `decision_hash`只覆盖本策略、参数/需求、时间合同、readiness结果和排名特征；不含资金流/原始输入hash。`snapshot_hash`在本策略命名空间覆盖同一决策内容。
 - 数据类型 fund_flow/fund_flow_audit/order_book/transaction/daily_bar/cost_proxy 在准入、评分与决策哈希前排除；根级其他审计内容同样不参与。无法通过 forged incremental/eligible 标志提升资格。
-- `audit_source_index`独立保留被使用记录的请求/raw hash、版本、时点，不能回流评分。
+- `audit_source_index`独立保留被使用记录的请求/raw hash、版本、时点，不能回流评分。区间元字段在输入和readiness的rows/state完整保留，不通过标签改写隐藏原始区间。
+- 本轮需求、输入、record、报告及feature合同升级至v2，区间准入规则参与feature/requirements hash；公式、权重、评分参数和parameter hash不变。旧v1 hash/输出不改写，v1输入不得经新准入器自动通过。
+- 新requirements hash：`435b52d1ceeffdd66af9636d4ef8fbd155623a3fd0d4c3f6dbefed9712a33614`；feature hash：`e307d5aedae47fe5d09e10ea3d129032dd56fc1ce1abd53148917fa4dbe57c3d`；parameter hash保持 `3a3346720dcc8134d345bf1e4d7473c0a3b597c1ea9b940938056ccd4f023f9b`。
 - 只写 `output_dir/close_confirmation_noflow_v1/{test_only|research}/<snapshot_hash>.json`，复用现有不可覆盖写入函数；原有缓存/快照/报告均不改写。外部SHA只锚定输入，不授予资格。
 - 完整合成路径最多为 `SYNTHETIC_RESEARCH_RANKING / research_ready=true / test_only=true`；**正式 data_ready=false、records/candidates/tickets/orders=[]**，研究入选为空。
 - 不完整或真实尚未准入路径为 `POINT_IN_TIME_DATA_INCOMPLETE / research_ready=false`，整批无排名，无自动补零、demo、fallback或按可用股重新选池。
@@ -114,6 +120,7 @@ D:\A-stock\.venv\Scripts\python.exe -m pytest overnight_quant/tests/test_phase10
 
 ## 证据索引与安全
 
+- 10/20分钟区间修复前反例：原Head `40f793cbe6e3ba7a897342af2255855837498981` 接受截至14:51的最后区间并返回五股排序。修复后该反例拒绝，完整截至14:50的12区间通过；缺失、长度、重叠、标签、过早最终可用与资金流不变性均有专项。完整修复前后结果及hash：仓库外 `D:\Projects\A-stock-tail\local-archive\recovery\v050-minute-interval-20261020`，不是行情证据。
 - 10/19被接受的原批次及完整hash：仓库外 `reports/t31-same-round-audit-20261019-c13549f-recovered-reauthorized-v1` 的 delivery/manifest；原NO_GO目录不变。详情归档至 `docs/project-history/2026-Q4.md`，正文不复制原始市场数据。
 - 本版本恢复清单：`D:\Projects\A-stock-tail\local-archive\recovery\v050-noflow-20261019`；文件/diff备份、stash、保护对象核对和最终测试/CI索引均在仓库外。
 - 本轮未采集、不改时间服务、不创建任务、不下载历史、不大规模调参、不安装依赖。

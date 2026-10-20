@@ -21,9 +21,9 @@ from overnight_quant.data.t24_offline_rehearsal import synthetic_fixture as old_
 from overnight_quant.scripts.run_noflow_research import run
 from overnight_quant.strategy.close_confirmation_noflow_v1.contracts import (
     BENCHMARK, CLASSIFICATION, INPUT_SCHEMA, PARAMETERS, RECORD_SCHEMA, STRATEGY_ID,
-    formal_time_contract, parameter_hash, requirement_hash,
+    MINUTE_INTERVAL_VERSION, feature_hash, formal_time_contract, parameter_hash, requirement_hash,
 )
-from overnight_quant.strategy.close_confirmation_noflow_v1.readiness import timestamp
+from overnight_quant.strategy.close_confirmation_noflow_v1.readiness import timestamp, validate_research_input
 from overnight_quant.strategy.close_confirmation_noflow_v1.strategy import NoFundFlowResearchStrategy
 from overnight_quant.strategy.legacy_frozen_baseline import legacy_baseline_is_intact
 from overnight_quant.strategy.close_confirmation_v1.strategy import CloseConfirmationStrategy
@@ -50,7 +50,7 @@ def synthetic_input() -> dict:
             "record_schema_version": RECORD_SCHEMA, "test_only": True,
             "batch_id": value["batch_id"], "trade_date": DAY,
             "source": "synthetic_test_only.noflow", "origin_source": "synthetic_test_only",
-            "source_version": "synthetic_noflow_v1", "adapter": "test_only",
+            "source_version": "synthetic_noflow_v2", "adapter": "test_only",
             "requirements_hash": requirement_hash(), "time_contract_hash": stable_hash(contract),
             "event_time": event or contract["feature_event_cutoff"],
             "observed_at": f"{DAY}T14:50:00+08:00", "available_at": f"{DAY}T14:50:01+08:00",
@@ -59,6 +59,7 @@ def synthetic_input() -> dict:
             "payload_hash": stable_hash(payload),
         }
         value["records"].append(row)
+        return row
 
     counts = {"up_count": 6, "down_count": 3, "flat_count": 1, "invalid_count": 0,
               "valid_count": 10, "total_count": 10, "breadth_ratio": 0.6}
@@ -75,17 +76,26 @@ def synthetic_input() -> dict:
             "change_pct": 0.8, "change_unit": "percent", "invalid_count": 2 if code == "000333" else 0,
             "total_count": 12 if code == "000333" else 10,
             "association_contract": {"security_identity": security_identity(code), "board_code": BOARDS[code],
-                "classification_version": CLASSIFICATION, "source_version": "synthetic_noflow_v1",
+                "classification_version": CLASSIFICATION, "source_version": "synthetic_noflow_v2",
                 "origin_source": "synthetic_test_only", "request_hash": stable_hash(code), "raw_hash": stable_hash(BOARDS[code])},
         })
         for kind in ("stock_news", "announcement"):
             add(kind, {"code": code, "status": "SUCCESS", "risk_review_status": "CLEAR", "items": []})
-        for minute in range(39, 51):
-            price = 10.1 if minute == 50 else 10.0
-            add("minute_bar", {"code": code, "open": 10.0, "high": 10.2, "low": 9.8, "close": price,
+        for minute in range(38, 50):
+            price = 10.1 if minute == 49 else 10.0
+            minute_row = add("minute_bar", {"code": code, "open": 10.0, "high": 10.2, "low": 9.8, "close": price,
                 "volume": 20000, "amount": price * 20000, "price_unit": "CNY", "volume_unit": "shares", "amount_unit": "CNY",
                 "aggregation_semantics": "interval", "interval_seconds": 60, "is_final": True},
                 event=f"{DAY}T14:{minute:02}:00+08:00")
+            minute_row.update(
+                minute_interval_contract_version=MINUTE_INTERVAL_VERSION,
+                native_label=minute_row["event_time"], minute_label_semantics="minute_start",
+                interval_start=minute_row["event_time"], interval_end=f"{DAY}T14:{minute + 1:02}:00+08:00",
+                interval_semantics_validation_status="VERIFIED_SYNTHETIC_TEST_ONLY",
+                interval_semantics_evidence_hash=contract["probe_evidence_hash"],
+                finalized_at=f"{DAY}T14:{minute + 1:02}:00+08:00",
+                finalization_evidence_hash=contract["probe_evidence_hash"],
+            )
     return value
 
 
@@ -233,8 +243,8 @@ def test_risk_publication_is_not_inferred(state):
     safe(result)
 
 
-def test_minute_gap_duplicate_conflict_and_1450_missing():
-    for minute in (39, 50):
+def test_minute_gap_duplicate_conflict_and_cutoff_interval_missing():
+    for minute in (38, 49):
         value = synthetic_input()
         value["records"] = [r for r in value["records"] if not (
             r["data_type"] == "minute_bar" and r["payload"]["code"] == "000001"
@@ -384,4 +394,143 @@ def test_actual_cli_in_process_forbids_network_and_subprocess(tmp_path, monkeypa
 def test_malformed_input_has_safe_outputs(value):
     result = NoFundFlowResearchStrategy().evaluate_snapshot(value)
     assert result["research_ready"] is False
+    safe(result)
+
+
+def test_complete_intervals_end_at_cutoff_without_relabeling():
+    value = synthetic_input()
+    original = deepcopy(value)
+    readiness = validate_research_input(value, test_only=True)
+    assert readiness["research_ready"] is True, readiness["errors"]
+    for stock in readiness["state"]["stocks"].values():
+        bars = stock["minute_bar"]
+        assert len(bars) == 12
+        assert bars[0]["native_label"] == bars[0]["interval_start"] == f"{DAY}T14:38:00+08:00"
+        assert bars[-1]["native_label"] == bars[-1]["event_time"] == f"{DAY}T14:49:00+08:00"
+        assert bars[-1]["interval_end"] == value["time_contract"]["feature_event_cutoff"]
+        assert all(b["minute_label_semantics"] == "minute_start" for b in bars)
+    assert value == original
+    result = evaluate(value)
+    assert result["research_ready"] is True
+    assert all(r["features"]["window_start"] == f"{DAY}T14:38:00+08:00"
+               and r["features"]["window_end"] == f"{DAY}T14:49:00+08:00" for r in result["research_ranking"])
+    safe(result)
+
+
+def test_1450_start_1451_end_rejected_even_if_final_and_before_collection_deadline():
+    value = synthetic_input()
+    last = next(r for r in value["records"] if r["data_type"] == "minute_bar"
+                and r["payload"]["code"] == "000001" and "14:49:00" in r["event_time"])
+    last.update(event_time=f"{DAY}T14:50:00+08:00", native_label=f"{DAY}T14:50:00+08:00",
+                interval_start=f"{DAY}T14:50:00+08:00", interval_end=f"{DAY}T14:51:00+08:00",
+                finalized_at=f"{DAY}T14:51:00+08:00", observed_at=f"{DAY}T14:51:00+08:00",
+                available_at=f"{DAY}T14:51:01+08:00")
+    assert last["payload"]["is_final"] is True
+    assert timestamp(last["available_at"]) < timestamp(value["time_contract"]["collection_deadline"])
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_interval_end_after_feature_cutoff"]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+def test_interval_end_1ms_after_cutoff_is_not_rounded_into_window():
+    value = synthetic_input()
+    last = next(r for r in value["records"] if r["data_type"] == "minute_bar"
+                and r["payload"]["code"] == "000001" and "14:49:00" in r["event_time"])
+    for key in ("event_time", "native_label", "interval_start", "interval_end", "finalized_at", "observed_at"):
+        last[key] = (timestamp(last[key]) + timedelta(milliseconds=1)).isoformat()
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_interval_end_after_feature_cutoff"]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+@pytest.mark.parametrize("field", [
+    "native_label", "minute_label_semantics", "interval_start", "interval_end",
+    "finalized_at", "interval_semantics_evidence_hash", "finalization_evidence_hash",
+])
+def test_final_flag_cannot_replace_required_interval_or_finality_evidence(field):
+    value = synthetic_input()
+    bar = row(value, "minute_bar")
+    bar.pop(field)
+    assert bar["payload"]["is_final"] is True
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_interval_metadata_missing"]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+@pytest.mark.parametrize("updates,reason", [
+    ({"interval_end": f"{DAY}T14:39:00.001+08:00"}, "minute_interval_length_invalid"),
+    ({"interval_end": f"{DAY}T14:38:59.999+08:00"}, "minute_interval_length_invalid"),
+    ({"native_label": f"{DAY}T14:39:00+08:00"}, "minute_label_interval_mismatch"),
+    ({"event_time": f"{DAY}T14:37:00+08:00"}, "minute_label_interval_mismatch"),
+    ({"minute_label_semantics": "minute_end"}, "minute_label_interval_mismatch"),
+    ({"interval_semantics_validation_status": "UNKNOWN"}, "minute_interval_semantics_unverified"),
+    ({"interval_semantics_evidence_hash": "0" * 64}, "minute_interval_evidence_mismatch"),
+    ({"finalization_evidence_hash": "1" * 64}, "minute_interval_evidence_mismatch"),
+    ({"minute_interval_contract_version": "noflow_minute_interval_v0"}, "minute_interval_contract_mismatch"),
+    ({"finalized_at": f"{DAY}T14:38:59.999+08:00"}, "minute_finalization_before_interval_end_or_observation"),
+    ({"finalized_at": f"{DAY}T14:50:00.001+08:00"}, "minute_finalization_before_interval_end_or_observation"),
+    ({"observed_at": f"{DAY}T14:38:59.999+08:00", "available_at": f"{DAY}T14:38:59.999+08:00"},
+     "minute_finalization_before_interval_end_or_observation"),
+])
+def test_interval_semantics_and_finality_fail_closed(updates, reason):
+    value = synthetic_input()
+    row(value, "minute_bar").update(updates)
+    resign(value)
+    result = evaluate(value)
+    assert result["missing_reasons"] == [reason]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+def test_final_data_can_be_available_exactly_at_interval_end_but_not_1ms_before():
+    value = synthetic_input()
+    bar = row(value, "minute_bar")
+    end = bar["interval_end"]
+    bar.update(observed_at=end, available_at=end, finalized_at=end)
+    assert evaluate(value)["research_ready"] is True
+    too_early = (timestamp(end) - timedelta(milliseconds=1)).isoformat()
+    bar.update(observed_at=too_early, available_at=too_early)
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_finalization_before_interval_end_or_observation"]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+@pytest.mark.parametrize("shift_seconds", [-30, 30, 60])
+def test_interval_overlap_or_gap_refused(shift_seconds):
+    value = synthetic_input()
+    bar = next(r for r in value["records"] if r["data_type"] == "minute_bar"
+               and r["payload"]["code"] == "000001" and "14:39:00" in r["event_time"])
+    for key in ("event_time", "native_label", "interval_start", "interval_end", "finalized_at"):
+        bar[key] = (timestamp(bar[key]) + timedelta(seconds=shift_seconds)).isoformat()
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_intervals_not_contiguous"]
+    assert result["research_ranking"] == []
+    safe(result)
+
+
+def test_cannot_move_only_the_label_or_hide_end_with_resigned_payload():
+    value = synthetic_input()
+    bar = row(value, "minute_bar")
+    bar.update(native_label=f"{DAY}T14:49:00+08:00", event_time=f"{DAY}T14:49:00+08:00",
+               interval_start=f"{DAY}T14:50:00+08:00", interval_end=f"{DAY}T14:51:00+08:00")
+    resign(value)
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["minute_label_interval_mismatch"]
+    safe(result)
+
+
+def test_new_interval_contract_rehashes_requirements_features_not_score_parameters():
+    assert INPUT_SCHEMA == "noflow_research_input_v2" and RECORD_SCHEMA == "noflow_research_record_v2"
+    assert requirement_hash() != "b7e503da416ea5aec4667e58507e4c4206ef256ea8f589b6a980580c138eaac4"
+    assert feature_hash() != "9ae5648af81cfa2724d08973fd40108d6a03a0067d2d5c41cf3369243219c71f"
+    assert parameter_hash() == "3a3346720dcc8134d345bf1e4d7473c0a3b597c1ea9b940938056ccd4f023f9b"
+    value = synthetic_input()
+    value.update(schema_version="noflow_research_input_v1")
+    result = evaluate(value)
+    assert result["missing_reasons"] == ["strategy_input_schema_mismatch"]
+    assert result["research_ranking"] == []
     safe(result)

@@ -9,11 +9,24 @@ from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.s2_integration_contract import FIXED_CODES
 
 STRATEGY_ID = "close_confirmation_noflow_v1"
-REQUIREMENTS_VERSION = "noflow_requirements_v1"
-INPUT_SCHEMA = "noflow_research_input_v1"
-RECORD_SCHEMA = "noflow_research_record_v1"
-REPORT_SCHEMA = "noflow_research_report_v1"
-FEATURE_VERSION = "noflow_features_v1"
+REQUIREMENTS_VERSION = "noflow_requirements_v2"
+INPUT_SCHEMA = "noflow_research_input_v2"
+RECORD_SCHEMA = "noflow_research_record_v2"
+REPORT_SCHEMA = "noflow_research_report_v2"
+FEATURE_VERSION = "noflow_features_v2"
+MINUTE_INTERVAL_VERSION = "noflow_minute_interval_v1"
+MINUTE_INTERVAL_CONTRACT = MappingProxyType({
+    "version": MINUTE_INTERVAL_VERSION,
+    "fields": ("native_label", "minute_label_semantics", "interval_start", "interval_end",
+               "interval_semantics_validation_status", "interval_semantics_evidence_hash",
+               "finalized_at", "finalization_evidence_hash"),
+    "label": "event_time=native_label=interval_start;minute_start_only",
+    "admission": "interval_end<=feature_cutoff;duration=60_seconds;contiguous_nonoverlap",
+    "window": "12_complete_intervals_[14:38,14:39)_through_[14:49,14:50)",
+    "report_window_fields": "window_start_and_window_end_are_native_labels_not_interval_boundaries",
+    "finality": "interval_end<=finalized_at<=observed_at<=available_at;is_final_not_sufficient",
+    "trust": "synthetic_scope_only_or_independently_verified_source_bridge;no_self_qualification",
+})
 CLASSIFICATION = "eastmoney_coreconception+board_constituent_breadth_v1"
 BENCHMARK = "SH:000001"
 GROUPS = ("market_state", "industry_resonance", "relative_strength", "price_volume")
@@ -47,7 +60,8 @@ def parameter_hash() -> str:
 
 
 def feature_hash() -> str:
-    return stable_hash({"version": FEATURE_VERSION, "formulas": dict(FORMULAS), "parameters": parameter_hash()})
+    return stable_hash({"version": FEATURE_VERSION, "formulas": dict(FORMULAS), "parameters": parameter_hash(),
+                        "minute_intervals": dict(MINUTE_INTERVAL_CONTRACT)})
 
 
 def requirement_hash() -> str:
@@ -57,6 +71,7 @@ def requirement_hash() -> str:
         "required": REQUIRED_TYPES, "capabilities": dict(CAPABILITIES), "groups": GROUPS,
         "fixed_codes": FIXED_CODES, "benchmark": BENCHMARK, "classification": CLASSIFICATION,
         "time": "minute_start_verified_1450_145105_145110_145200",
+        "minute_intervals": dict(MINUTE_INTERVAL_CONTRACT),
         "units": "percent_points_CNY_shares_interval_minute_endpoints",
         "risk": "reviewed_CLEAR_per_stock_news_global_news_announcement_no_unknown",
         "output": "ranking_only_never_formal", "parameters": parameter_hash(), "features": feature_hash(),

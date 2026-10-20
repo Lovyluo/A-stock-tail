@@ -11,7 +11,8 @@ from overnight_quant.data.s2_integration_contract import FIXED_CODES, security_i
 from overnight_quant.data.source_capability_adapters import get_source_adapter_registry
 from overnight_quant.data.source_capability_registry import validate_source_provenance_batch
 from .contracts import (
-    BENCHMARK, CAPABILITIES, CLASSIFICATION, INPUT_SCHEMA, PARAMETERS, RECORD_SCHEMA,
+    BENCHMARK, CAPABILITIES, CLASSIFICATION, INPUT_SCHEMA, MINUTE_INTERVAL_CONTRACT,
+    MINUTE_INTERVAL_VERSION, PARAMETERS, RECORD_SCHEMA,
     REQUIRED_TYPES, STRATEGY_ID, formal_time_contract, requirement_hash,
 )
 
@@ -51,7 +52,7 @@ def _admission(row: dict, *, test_only: bool) -> None:
     if test_only:
         require(row.get("test_only") is True and row.get("source") == "synthetic_test_only.noflow"
                 and row.get("origin_source") == "synthetic_test_only"
-                and row.get("source_version") == "synthetic_noflow_v1"
+                and row.get("source_version") == "synthetic_noflow_v2"
                 and row.get("adapter") == "test_only", "synthetic_scope_invalid")
         return
     require(row.get("test_only") is False, "test_only_not_formal")
@@ -63,9 +64,33 @@ def _admission(row: dict, *, test_only: bool) -> None:
             and bindings[0]["provider_key"] == row.get("provider_key"), "source_not_bound")
     provenance = validate_source_provenance_batch(capability, [row], require_hard_gate=True)
     require(provenance.get("hard_gate_authorized") is True, "source_not_qualified")
-    # This v1 has no audited bridge for the new research risk/unit schema yet.
+    # No audited bridge for the new research risk/unit/interval schema exists yet.
     # A source label or a self-signed payload cannot stand in for such a bridge.
     raise ValueError("verified_noflow_source_bridge_not_available")
+
+
+def _minute_interval(row: dict, snapshot: dict, times: dict, *, test_only: bool) -> None:
+    require(all(key in row for key in MINUTE_INTERVAL_CONTRACT["fields"]), "minute_interval_metadata_missing")
+    require(row.get("minute_interval_contract_version") == MINUTE_INTERVAL_VERSION, "minute_interval_contract_mismatch")
+    native, event, start, end, finalized, observed, available = (
+        timestamp(row[key]) for key in (
+            "native_label", "event_time", "interval_start", "interval_end", "finalized_at", "observed_at", "available_at",
+        )
+    )
+    require(row["minute_label_semantics"] == snapshot["time_contract"]["minute_label_semantics"] == "minute_start"
+            and native == event == start, "minute_label_interval_mismatch")
+    require(end - start == timedelta(seconds=60), "minute_interval_length_invalid")
+    require(start.date() == end.date() == times["feature_event_cutoff"].date(), "minute_interval_date_invalid")
+    require(end <= times["feature_event_cutoff"], "minute_interval_end_after_feature_cutoff")
+    probe = snapshot["time_contract"]["probe_evidence_hash"]
+    require(row["interval_semantics_evidence_hash"] == probe
+            and row["finalization_evidence_hash"] == probe,
+            "minute_interval_evidence_mismatch")
+    # Hash equality binds the synthetic fixture; it is not proof of real semantics.
+    # Production still requires the independent source bridge in _admission().
+    require(test_only and row["interval_semantics_validation_status"] == "VERIFIED_SYNTHETIC_TEST_ONLY",
+            "minute_interval_semantics_unverified")
+    require(end <= finalized <= observed <= available, "minute_finalization_before_interval_end_or_observation")
 
 
 def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool) -> None:
@@ -80,6 +105,8 @@ def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool) ->
     require(isinstance(row.get("payload"), dict), "payload_invalid")
     require(row.get("payload_hash") == stable_hash(row["payload"]), "payload_hash_invalid")
     _admission(row, test_only=test_only)
+    if kind == "minute_bar":
+        _minute_interval(row, snapshot, times, test_only=test_only)
     event, observed, available = (timestamp(row.get(k)) for k in ("event_time", "observed_at", "available_at"))
     require(event <= observed <= available <= times["collection_deadline"], "time_order_invalid")
     require(observed.date() == available.date() == times["feature_event_cutoff"].date(), "observation_date_invalid")
@@ -133,7 +160,7 @@ def _materialize(rows: list[dict], times: dict) -> dict:
         for kind in ("quote", "industry", "stock_news", "announcement", "minute_bar"):
             matches = [r for r in by_type[kind] if security_identity(r["payload"].get("code")) == identity]
             if kind == "minute_bar":
-                selected[kind] = sorted(matches, key=lambda r: timestamp(r["event_time"]))
+                selected[kind] = sorted(matches, key=lambda r: timestamp(r["interval_end"]))
             else:
                 require(len(matches) == 1, f"{code}:{kind}_missing_or_conflicting")
                 selected[kind] = matches[0]
@@ -161,8 +188,10 @@ def _materialize(rows: list[dict], times: dict) -> dict:
         number(industry.get("change_pct"), "industry_strength_missing")
         breadth(industry)
         bars = selected["minute_bar"]
+        require(all(timestamp(previous["interval_end"]) == timestamp(following["interval_start"])
+                    for previous, following in zip(bars, bars[1:])), "minute_intervals_not_contiguous")
         expected = [times["feature_event_cutoff"] - timedelta(minutes=i) for i in range(11, -1, -1)]
-        require([timestamp(r["event_time"]) for r in bars] == expected, "minute_window_incomplete_or_conflicting")
+        require([timestamp(r["interval_end"]) for r in bars] == expected, "minute_window_incomplete_or_conflicting")
         for row in bars:
             bar = row["payload"]
             require(bar.get("price_unit") == "CNY" and bar.get("volume_unit") == "shares" and bar.get("amount_unit") == "CNY"
