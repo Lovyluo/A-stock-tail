@@ -6,7 +6,7 @@ from statistics import mean
 
 from overnight_quant.data.point_in_time import stable_hash
 from .contracts import GROUPS, PARAMETERS, safety
-from .readiness import validate_research_input
+from .readiness import _SourceBridgeAdmission, validate_research_input
 
 
 def _clip(value: float) -> float:
@@ -64,8 +64,9 @@ def build_features(stock: dict, market: dict) -> dict:
 
 
 class NoFundFlowResearchStrategy:
-    def evaluate_snapshot(self, snapshot: dict, *, test_only: bool = False) -> dict:
-        readiness = validate_research_input(snapshot, test_only=test_only)
+    def evaluate_snapshot(self, snapshot: dict, *, test_only: bool = False,
+                          _bridge: _SourceBridgeAdmission | None = None) -> dict:
+        readiness = validate_research_input(snapshot, test_only=test_only, _bridge=_bridge)
         base = {
             **safety(), "test_only": test_only, "execution_ok": True,
             "research_ready": readiness["research_ready"], "missing_reasons": readiness["errors"],

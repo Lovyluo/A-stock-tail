@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
 import re
@@ -48,7 +49,13 @@ def breadth(payload: dict) -> None:
                 - payload["up_count"] / valid) < 1e-12, "breadth_ratio_inconsistent")
 
 
-def _admission(row: dict, *, test_only: bool) -> None:
+@dataclass(frozen=True)
+class _SourceBridgeAdmission:
+    """Runtime-only binding, never reconstructed from input JSON."""
+    row_hashes: frozenset[str]
+
+
+def _admission(row: dict, *, test_only: bool, bridge: _SourceBridgeAdmission | None = None) -> None:
     if test_only:
         require(row.get("test_only") is True and row.get("source") == "synthetic_test_only.noflow"
                 and row.get("origin_source") == "synthetic_test_only"
@@ -64,9 +71,8 @@ def _admission(row: dict, *, test_only: bool) -> None:
             and bindings[0]["provider_key"] == row.get("provider_key"), "source_not_bound")
     provenance = validate_source_provenance_batch(capability, [row], require_hard_gate=True)
     require(provenance.get("hard_gate_authorized") is True, "source_not_qualified")
-    # No audited bridge for the new research risk/unit/interval schema exists yet.
-    # A source label or a self-signed payload cannot stand in for such a bridge.
-    raise ValueError("verified_noflow_source_bridge_not_available")
+    require(type(bridge) is _SourceBridgeAdmission and stable_hash(row) in bridge.row_hashes,
+            "verified_noflow_source_bridge_not_available")
 
 
 def _minute_interval(row: dict, snapshot: dict, times: dict, *, test_only: bool) -> None:
@@ -93,7 +99,8 @@ def _minute_interval(row: dict, snapshot: dict, times: dict, *, test_only: bool)
     require(end <= finalized <= observed <= available, "minute_finalization_before_interval_end_or_observation")
 
 
-def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool) -> None:
+def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool,
+                  bridge: _SourceBridgeAdmission | None = None) -> None:
     kind = row["data_type"]
     require(row.get("record_schema_version") == RECORD_SCHEMA, "record_schema_mismatch")
     require(row.get("capability") == CAPABILITIES[kind], "capability_mismatch")
@@ -104,13 +111,16 @@ def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool) ->
     require(all(sha(row.get(k)) for k in ("request_hash", "raw_hash")), "provenance_hash_invalid")
     require(isinstance(row.get("payload"), dict), "payload_invalid")
     require(row.get("payload_hash") == stable_hash(row["payload"]), "payload_hash_invalid")
-    _admission(row, test_only=test_only)
+    _admission(row, test_only=test_only, bridge=bridge)
     if kind == "minute_bar":
         _minute_interval(row, snapshot, times, test_only=test_only)
     event, observed, available = (timestamp(row.get(k)) for k in ("event_time", "observed_at", "available_at"))
     require(event <= observed <= available <= times["collection_deadline"], "time_order_invalid")
     require(observed.date() == available.date() == times["feature_event_cutoff"].date(), "observation_date_invalid")
-    require(event.date() == times["feature_event_cutoff"].date(), "event_date_invalid")
+    # Calendar events and individual publications legitimately precede collection.
+    # The original event is retained, not replaced by the target day's cutoff.
+    if kind not in {"trading_calendar", "stock_news", "global_news", "announcement"}:
+        require(event.date() == times["feature_event_cutoff"].date(), "event_date_invalid")
     require(timestamp(row.get("decision_cutoff")) == times["decision_time"], "decision_cutoff_invalid")
     accepted, rejected = records_available_at(
         [row], times["decision_time"], time_contract=snapshot["time_contract"],
@@ -128,7 +138,8 @@ def _validate_row(row: dict, snapshot: dict, times: dict, *, test_only: bool) ->
             require(published <= event and published <= times["feature_event_cutoff"]
                     and published <= observed, "risk_publication_invalid")
             require(item.get("published_at_precision") == "datetime"
-                    or (item.get("published_at_precision") == "date" and published.date() < event.date()),
+                    or (item.get("published_at_precision") == "date"
+                        and published.date() < times["feature_event_cutoff"].date()),
                     "publication_time_precision_insufficient")
             require(sha(item.get("raw_hash")) and bool(item.get("origin_source")), "risk_item_provenance_missing")
 
@@ -222,7 +233,8 @@ def _materialize(rows: list[dict], times: dict) -> dict:
     return {"market": market, "stocks": stocks}
 
 
-def validate_research_input(snapshot: dict, *, test_only: bool = False) -> dict:
+def validate_research_input(snapshot: dict, *, test_only: bool = False,
+                            _bridge: _SourceBridgeAdmission | None = None) -> dict:
     """Fund-flow rows are discarded before validation, hashing or materialization."""
     try:
         require(isinstance(snapshot, dict), "input_not_object")
@@ -253,7 +265,7 @@ def validate_research_input(snapshot: dict, *, test_only: bool = False) -> dict:
             rows.append(deepcopy(item))
         rows = sorted({stable_hash(row): row for row in rows}.values(), key=stable_hash)
         for row in rows:
-            _validate_row(row, snapshot, times, test_only=test_only)
+            _validate_row(row, snapshot, times, test_only=test_only, bridge=_bridge)
         state = _materialize(rows, times)
         return {"research_ready": True, "errors": [], "rows": rows, "state": state}
     except (ValueError, KeyError, TypeError, OverflowError, AttributeError) as exc:
