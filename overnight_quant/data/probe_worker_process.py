@@ -21,6 +21,8 @@ def run_probe_worker_process(
     worker_command: list[str] | None = None,
     monotonic: Callable[[], float] | None = None,
     termination_grace_seconds: float = 0.5,
+    include_startup_in_deadline: bool = False,
+    retain_streams: bool = False,
 ) -> dict[str, Any]:
     """Run one provider request in a killable child process."""
     runtime_monotonic = monotonic or time.monotonic
@@ -46,13 +48,21 @@ def run_probe_worker_process(
         creationflags=creationflags,
     )
     worker_terminated = False
+    startup_ms = None
     try:
+        remaining = max(1, int(deadline_ms)) / 1000.0
+        if include_startup_in_deadline:
+            startup_ms = (runtime_monotonic() - started) * 1000
+            remaining -= startup_ms / 1000
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 0)
         stdout, stderr = process.communicate(
             json.dumps(task, ensure_ascii=False),
-            timeout=max(1, int(deadline_ms)) / 1000.0,
+            timeout=remaining,
         )
     except subprocess.TimeoutExpired:
         worker_terminated = True
+        cleanup_started = runtime_monotonic() if retain_streams else None
         _terminate_process_tree(process)
         try:
             stdout, stderr = process.communicate(
@@ -61,17 +71,19 @@ def run_probe_worker_process(
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
+        elapsed_ms = round((runtime_monotonic() - started) * 1000, 3)
         return {
             "ok": False,
             "error_code": WORKER_TIMEOUT_ERROR,
             "error": WORKER_TIMEOUT_ERROR,
             "request_timed_out": True,
             "worker_terminated": worker_terminated,
-            "elapsed_ms": round(
-                (runtime_monotonic() - started) * 1000,
-                3,
-            ),
+            "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **({"process_startup_ms": startup_ms,
+                "cleanup_ms": elapsed_ms - (cleanup_started - started) * 1000}
+               if retain_streams else {}),
         }
 
     elapsed_ms = round(
@@ -79,6 +91,8 @@ def run_probe_worker_process(
         3,
     )
     payload = _decode_worker_output(stdout)
+    diagnostics = ({"process_startup_ms": startup_ms, "cleanup_ms": 0.0,
+                    "io_and_normal_exit_ms": elapsed_ms - (startup_ms or 0.0)} if retain_streams else {})
     if payload is None:
         return {
             "ok": False,
@@ -88,6 +102,8 @@ def run_probe_worker_process(
             "worker_terminated": False,
             "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **diagnostics,
         }
     if process.returncode != 0 or payload.get("ok") is not True:
         return {
@@ -104,6 +120,8 @@ def run_probe_worker_process(
             "worker_terminated": False,
             "elapsed_ms": elapsed_ms,
             "returncode": process.returncode,
+            **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+            **diagnostics,
         }
     return {
         "ok": True,
@@ -114,6 +132,8 @@ def run_probe_worker_process(
         "worker_terminated": False,
         "elapsed_ms": elapsed_ms,
         "returncode": process.returncode,
+        **({"stdout": stdout, "stderr": stderr} if retain_streams else {}),
+        **diagnostics,
     }
 
 
