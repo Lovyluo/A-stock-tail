@@ -232,37 +232,26 @@ def verify(evidence, expected_file_sha256, actual_file_sha256):
                 evidence_hash=evidence.get("evidence_hash"))
 
 
-def _authorization(auth, trade_date, plan, current):
-    if (auth.get("schema") != "minute_capture_manual_authorization_v1"
+def _authorization(auth, trade_date, plan, current, *, test_only=False):
+    from . import minute_capture_preflight as preflight
+    if (auth.get("schema") != preflight.AUTHORIZATION_VERSION
             or auth.get("status") != "PM_APPROVED_SINGLE_AUDIT" or auth.get("trade_date") != trade_date
             or auth.get("plan_hash") != plan["plan_hash"] or auth.get("single_use") is not True):
         raise ValueError("date_specific_PM_authorization_required")
+    if auth.get("test_only", False) is not test_only:
+        raise ValueError("test_only_authorization_cannot_start_real_capture")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     status = subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=ROOT, text=True).strip()
     if head != auth.get("code_sha") or status:
         raise ValueError("authorized_code_or_worktree_mismatch")
-    from .market_source_go_nogo import _completed_calendar_errors
-    from .market_session_confirmation import verify_market_session_confirmation_evidence
-    from overnight_quant.scripts.run_complete_industry_audit_manual import _verify_preflight, _verify_environment
-    inputs = {}
-    for key in ("calendar", "session", "preflight", "environment"):
-        ref = auth[key]
-        inputs[key] = read_anchored(ref["path"], ref["sha256"])
-    cal_sha = auth["calendar"]["sha256"]
-    if _completed_calendar_errors(inputs["calendar"], trade_date,
-                                   expected_file_sha256=cal_sha, actual_file_sha256=cal_sha):
-        raise ValueError("completed_calendar_rejected")
-    session_sha = auth["session"]["sha256"]
-    session = verify_market_session_confirmation_evidence(inputs["session"],
-        expected_file_sha256=session_sha, actual_file_sha256=session_sha)
-    if (session.get("evidence_integrity_verified") is not True or inputs["session"].get("trade_date") != trade_date
-            or inputs["session"].get("status") != "MARKET_SESSION_CONFIRMED"):
-        raise ValueError("session_confirmation_rejected")
-    _verify_environment(inputs["environment"])
-    _verify_preflight(inputs["preflight"], current)
+    reference = auth["preflight"]
+    verified = preflight.verify_file(reference["path"], reference["sha256"], trade_date=trade_date,
+        approved_sha=auth["code_sha"], current=current, root=ROOT, _test_only=test_only)
+    if not verified["integrity_verified"]:
+        raise ValueError("minute_preflight_rejected:" + ";".join(verified["errors"]))
     if current.utcoffset() != timedelta(hours=8):
         raise ValueError("current_timezone_invalid")
-    return inputs["preflight"]
+    return read_anchored(reference["path"], reference["sha256"])
 
 
 def capture(plan, trade_date, *, authorization, audit_root=AUDIT_ROOT, _test=None):
@@ -282,13 +271,15 @@ def capture(plan, trade_date, *, authorization, audit_root=AUDIT_ROOT, _test=Non
     cleanup_guard = Path(audit_root) / "cleanup-incomplete.json"
     if cleanup_guard.exists():
         raise ValueError("prior_worker_cleanup_unconfirmed_preserve_guard_no_new_worker")
+    # Reject authorization before consuming the permanent single-run intent.
+    preflight = (_authorization(authorization, trade_date, plan, current, test_only=bool(_test))
+                 if not _test or _test.get("validate_authorization") else None)
     directory = Path(audit_root) / trade_date
     # Permanent write-once receipt is both the same-date single-run lock and audit.
     write(directory / "intent.json", safe(trade_date=trade_date, plan_hash=plan["plan_hash"],
           started_at=current.isoformat(), test_only=bool(_test), authorization=authorization))
     waves, error = [], None
     try:
-        preflight = None if _test else _authorization(authorization, trade_date, plan, current)
         for index, text in enumerate(CLOCKS):
             target = datetime.fromisoformat(f"{trade_date}T{text}+08:00")
             while clock() < target:
@@ -296,8 +287,8 @@ def capture(plan, trade_date, *, authorization, audit_root=AUDIT_ROOT, _test=Non
             mono = time.perf_counter()
             actual = clock()
             if index == 0 and preflight is not None:
-                from overnight_quant.scripts.run_complete_industry_audit_manual import _verify_preflight
-                _verify_preflight(preflight, actual)
+                from .minute_capture_preflight import fresh_at
+                fresh_at(preflight, actual)
             remaining_ms = (target + timedelta(milliseconds=1500) - actual).total_seconds() * 1000
             if remaining_ms <= 0:
                 raise ValueError("observation_window_missed_zero_new_worker")

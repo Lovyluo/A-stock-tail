@@ -1,4 +1,5 @@
-param([string]$Script,[string]$OpsDirectory,[string]$OutputPath,[string]$TempDirectory,[string]$Mode)
+param([string]$Script,[string]$OpsDirectory,[string]$OutputPath,[string]$TempDirectory,[string]$Mode,
+    [switch]$MinuteCapture,[string]$ProjectRoot,[string]$MinuteCaptureRoot,[string]$TradeDate)
 $ErrorActionPreference = 'Stop'
 $env:TEMP = $TempDirectory
 $env:TMP = $TempDirectory
@@ -7,6 +8,18 @@ function global:Get-CimInstance {
     [CmdletBinding()] param([string]$ClassName,[string]$Filter)
     if ($ClassName -eq 'Win32_Service') { return [pscustomobject]@{ProcessId=42} }
     if ($ClassName -eq 'Win32_OperatingSystem') { return [pscustomobject]@{LastBootUpTime=[datetime]::Parse('2026-10-15T04:00:00+08:00')} }
+    if ($MinuteCapture -and $ClassName -eq 'Win32_Process') {
+        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact')) {
+            $command = if($Mode -eq 'worker') {'python -m overnight_quant.data.minute_capture_worker'} `
+                elseif($Mode -eq 'cli') {'python overnight_quant/scripts/run_minute_capture_audit.py --network'} `
+                elseif($Mode -eq 'module-cli') {'python -m overnight_quant.scripts.run_minute_capture_audit --network'} `
+                elseif($Mode -eq 'module-cli-compact') {'python -movernight_quant.scripts.run_minute_capture_audit --network'} `
+                else {'python "C:\synthetic directory\run_minute_capture_audit.py" --network'}
+            [pscustomobject]@{ProcessId=6000;ParentProcessId=1;Name='python.exe';CommandLine=$command}
+            [pscustomobject]@{ProcessId=6001;ParentProcessId=6000;Name='synthetic-helper.exe';CommandLine='test-only child'}
+        }
+        [pscustomobject]@{ProcessId=6002;ParentProcessId=1;Name='python.exe';CommandLine='python unrelated_synthetic_app.py'}
+    }
     return
 }
 function global:Get-ScheduledTask {
@@ -15,6 +28,12 @@ function global:Get-ScheduledTask {
     if ($Mode -eq 'disabled') {
         return [pscustomobject]@{TaskPath='\';TaskName='AStockHistoricalDisabled';State='Disabled';
             Settings=[pscustomobject]@{Enabled=$false};Actions=@()}
+    }
+    if ($Mode -in @('minute-task','minute-task-disabled')) {
+        return [pscustomobject]@{TaskPath='\';TaskName='DailyMinuteCapture';
+            State=$(if($Mode -eq 'minute-task'){'Ready'}else{'Disabled'});
+            Settings=[pscustomobject]@{Enabled=($Mode -eq 'minute-task')};
+            Actions=@([pscustomobject]@{Execute='python.exe';Arguments='-m overnight_quant.scripts.run_minute_capture_audit';WorkingDirectory=''})}
     }
 }
 function global:Get-WinEvent {
@@ -27,6 +46,30 @@ function global:Get-Service {
     [CmdletBinding()] param([string]$Name)
     return [pscustomobject]@{Status='Running'}
 }
+if ($MinuteCapture) {
+    function global:git {
+        $global:LASTEXITCODE = 0
+        if ($args -contains 'rev-parse') { return ('a' * 40) }
+    }
+    function global:Start-Process {
+        param($FilePath,$ArgumentList,$WindowStyle,[switch]$PassThru,$RedirectStandardOutput,$RedirectStandardError)
+        if ($FilePath -ne 'w32tm.exe' -or ($ArgumentList -join ' ') -ne '/query /status /verbose') {
+            throw 'Unexpected real process request in isolated harness'
+        }
+        $text = "Leap Indicator: 0`nLast Successful Sync Time: 2026/10/21 14:30:00`nSource: time.windows.com,0x9`nLast Sync Error: 0`n"
+        [IO.File]::WriteAllBytes($RedirectStandardOutput,[Text.Encoding]::UTF8.GetBytes($text))
+        [IO.File]::WriteAllBytes($RedirectStandardError,[byte[]]@())
+        $fake = [pscustomobject]@{ExitCode=0}
+        $fake | Add-Member ScriptMethod WaitForExit {param($Milliseconds) return $true}
+        $fake | Add-Member ScriptMethod Kill {}
+        $fake | Add-Member ScriptMethod Refresh {}
+        $fake | Add-Member ScriptMethod Dispose {}
+        return $fake
+    }
+}
 # Only this isolated process has mocks. No real service, task, network or clock calls.
-& $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath
+if ($MinuteCapture) {
+    & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath -MinuteCapture `
+        -ProjectRoot $ProjectRoot -MinuteCaptureRoot $MinuteCaptureRoot -TradeDate $TradeDate
+} else { & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath }
 exit $LASTEXITCODE
