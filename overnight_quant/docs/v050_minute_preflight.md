@@ -62,7 +62,7 @@ $preflightSha = (Get-FileHash -LiteralPath $preflight -Algorithm SHA256).Hash.To
 
 ## 离线验收与停止
 
-Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个真实fixture子进程/20个合成bars调用。替换仅在测试harness，不给实际脚本增加skip、任意worker命令或test-only公共CLI开关；真实准入拒绝test-only材料。另以Windows PowerShell5.1/7执行真实环境脚本的隔离mock行为测试，覆盖残留根/后代、无关Python、历史Disabled任务与权限拒绝。
+Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个真实fixture子进程/20个合成bars调用。替换仅在测试harness，不给实际脚本增加skip、任意worker命令或test-only公共CLI开关；真实准入拒绝test-only材料。另以Windows PowerShell5.1/7执行真实环境脚本的隔离mock行为测试，覆盖脚本/带空格路径/`-m`及紧凑模块启动、残留根/后代、无关Python、名称不含AStock的分钟任务、历史Disabled任务与权限拒绝。模块/任务漏识别先复现6项拒绝断言失败，再修复；最终新阶段62项与旧编排59项共121项通过，较早兼容组213项与之重叠，不相加。
 
 错误日期/SHA/计划、缺失/过期材料、时钟失败、清理/当日输出阻断、异常退出/非法或缺失JSON、超时回收均拒绝；拒绝结果交给捕获CLI仍不得派发worker。外部SHA错误、重签派生内容、旧授权与合成提权均拒绝。没有真实行情或NTP，不表示生产最坏耗时、最终性或来源资格得到证明。
 

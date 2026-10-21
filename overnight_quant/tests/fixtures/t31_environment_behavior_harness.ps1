@@ -9,9 +9,11 @@ function global:Get-CimInstance {
     if ($ClassName -eq 'Win32_Service') { return [pscustomobject]@{ProcessId=42} }
     if ($ClassName -eq 'Win32_OperatingSystem') { return [pscustomobject]@{LastBootUpTime=[datetime]::Parse('2026-10-15T04:00:00+08:00')} }
     if ($MinuteCapture -and $ClassName -eq 'Win32_Process') {
-        if ($Mode -in @('worker','cli','quoted-cli')) {
+        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact')) {
             $command = if($Mode -eq 'worker') {'python -m overnight_quant.data.minute_capture_worker'} `
                 elseif($Mode -eq 'cli') {'python overnight_quant/scripts/run_minute_capture_audit.py --network'} `
+                elseif($Mode -eq 'module-cli') {'python -m overnight_quant.scripts.run_minute_capture_audit --network'} `
+                elseif($Mode -eq 'module-cli-compact') {'python -movernight_quant.scripts.run_minute_capture_audit --network'} `
                 else {'python "C:\synthetic directory\run_minute_capture_audit.py" --network'}
             [pscustomobject]@{ProcessId=6000;ParentProcessId=1;Name='python.exe';CommandLine=$command}
             [pscustomobject]@{ProcessId=6001;ParentProcessId=6000;Name='synthetic-helper.exe';CommandLine='test-only child'}
@@ -26,6 +28,12 @@ function global:Get-ScheduledTask {
     if ($Mode -eq 'disabled') {
         return [pscustomobject]@{TaskPath='\';TaskName='AStockHistoricalDisabled';State='Disabled';
             Settings=[pscustomobject]@{Enabled=$false};Actions=@()}
+    }
+    if ($Mode -in @('minute-task','minute-task-disabled')) {
+        return [pscustomobject]@{TaskPath='\';TaskName='DailyMinuteCapture';
+            State=$(if($Mode -eq 'minute-task'){'Ready'}else{'Disabled'});
+            Settings=[pscustomobject]@{Enabled=($Mode -eq 'minute-task')};
+            Actions=@([pscustomobject]@{Execute='python.exe';Arguments='-m overnight_quant.scripts.run_minute_capture_audit';WorkingDirectory=''})}
     }
 }
 function global:Get-WinEvent {

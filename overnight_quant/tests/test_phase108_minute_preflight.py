@@ -268,7 +268,8 @@ SHELLS = list(dict.fromkeys(p for p in (shutil.which("powershell.exe"), shutil.w
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-@pytest.mark.parametrize("mode", ["unrelated", "worker", "cli", "quoted-cli", "denied", "disabled"])
+@pytest.mark.parametrize("mode", ["unrelated", "worker", "cli", "quoted-cli", "denied", "disabled",
+                                  "module-cli", "module-cli-compact", "minute-task", "minute-task-disabled"])
 def test_actual_powershell_minute_inventory_and_child_scope(tmp_path, shell, mode):
     ops, temp = tmp_path / "synthetic ops", tmp_path / "synthetic temp"
     ops.mkdir(); temp.mkdir()
@@ -279,13 +280,15 @@ def test_actual_powershell_minute_inventory_and_child_scope(tmp_path, shell, mod
         "-TempDirectory", str(temp), "-Mode", mode, "-MinuteCapture", "-ProjectRoot", str(tmp_path),
         "-MinuteCaptureRoot", str(tmp_path / "minute-capture"), "-TradeDate", DAY]
     result = subprocess.run(command, capture_output=True, timeout=20)
-    expected = 2 if mode in ("worker", "cli", "quoted-cli", "denied") else 0
+    expected = 2 if mode in ("worker", "cli", "quoted-cli", "module-cli", "module-cli-compact", "denied", "minute-task") else 0
     assert result.returncode == expected, (result.stdout, result.stderr)
     record = json.loads((ops / "environment.json").read_text(encoding="utf-8-sig"))
-    if mode in ("worker", "cli", "quoted-cli"):
+    if mode in ("worker", "cli", "quoted-cli", "module-cli", "module-cli-compact"):
         assert {r["ProcessId"] for r in record["workers"]} == {6000, 6001}
     elif mode == "denied":
         assert any("denied" in x for x in record["blockers"])
+    elif mode == "minute-task":
+        assert any("Active project task" in x for x in record["blockers"])
     else:
         assert record["workers"] == [] and record["scope"] == pre.ENV_SCOPE
         assert pre.clock_status(record)["error"] == 0

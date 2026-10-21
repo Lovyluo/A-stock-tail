@@ -37,7 +37,8 @@ try {
         $pattern = '(?:[\\/]|^|[\s"])' +
             '(?:run_minute_capture_audit|minute_capture_worker|minute_probe_worker|run_minute_probe_watchdog|' +
             'run_market_source_validation|run_complete_industry_audit|market_source_worker)\.(?:py|ps1)(?:["\s]|$)' +
-            '|(?:^|\s)-m\s+overnight_quant\.data\.(?:minute_capture_worker|minute_probe_worker|market_source_worker)(?:\s|$)' +
+            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_capture_worker|minute_probe_worker|market_source_worker)' +
+            '|scripts\.(?:run_minute_capture_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
             '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
         $ids = @($allProcesses | Where-Object {
             $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
@@ -53,7 +54,9 @@ try {
     }
     $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
         $_.TaskName -match 'AStock|A-stock|MarketSource|IndustryAudit' -or
-        (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'A-stock|market_source|complete_industry'
+        (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'A-stock|market_source|complete_industry' -or
+        ($MinuteCapture -and ($_.TaskName -match 'MinuteCapture' -or
+            (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture'))
     } | ForEach-Object { [ordered]@{TaskPath=$_.TaskPath;TaskName=$_.TaskName;State=[string]$_.State;Enabled=[bool]$_.Settings.Enabled} })
     if ($workers.Count) { $issues += 'Residual worker present' }
     if (@($tasks | Where-Object { $_.Enabled -or $_.State -eq 'Running' }).Count) { $issues += 'Active project task present' }
