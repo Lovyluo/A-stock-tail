@@ -1,6 +1,6 @@
 param([string]$Script,[string]$OpsDirectory,[string]$OutputPath,[string]$TempDirectory,[string]$Mode,
     [switch]$MinuteCapture,[string]$ProjectRoot,[string]$MinuteCaptureRoot,[string]$TradeDate,
-    [switch]$HashUnavailable,[string]$HashTarget)
+    [switch]$HashUnavailable,[string]$HashTarget,[string]$ClockExecutable,[string]$ClockArguments)
 $ErrorActionPreference = 'Stop'
 $env:TEMP = $TempDirectory
 $env:TMP = $TempDirectory
@@ -91,10 +91,14 @@ if ($MinuteCapture) {
         if ($FilePath -ne 'w32tm.exe' -or ($ArgumentList -join ' ') -ne '/query /status /verbose') {
             throw 'Unexpected real process request in isolated harness'
         }
+        if ($ClockExecutable) {
+            return Microsoft.PowerShell.Management\Start-Process -FilePath $ClockExecutable -ArgumentList $ClockArguments `
+                -WindowStyle Hidden -PassThru -RedirectStandardOutput $RedirectStandardOutput -RedirectStandardError $RedirectStandardError
+        }
         $text = "Leap Indicator: 0`nLast Successful Sync Time: 2026/10/21 14:30:00`nSource: time.windows.com,0x9`nLast Sync Error: 0`n"
         [IO.File]::WriteAllBytes($RedirectStandardOutput,[Text.Encoding]::UTF8.GetBytes($text))
         [IO.File]::WriteAllBytes($RedirectStandardError,[byte[]]@())
-        $fake = [pscustomobject]@{ExitCode=0}
+        $fake = [pscustomobject]@{ExitCode=$(if($Mode -eq 'clock-null'){$null}else{0});Handle=[IntPtr]1}
         $fake | Add-Member ScriptMethod WaitForExit {param($Milliseconds) return $true}
         $fake | Add-Member ScriptMethod Kill {}
         $fake | Add-Member ScriptMethod Refresh {}

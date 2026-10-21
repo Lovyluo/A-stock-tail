@@ -153,14 +153,25 @@ try {
         $clockOut = Join-Path $OpsDirectory 'clock-status.stdout.bin'
         $clockErr = Join-Path $OpsDirectory 'clock-status.stderr.bin'
         if ((Test-Path -LiteralPath $clockOut) -or (Test-Path -LiteralPath $clockErr)) { throw 'Clock output already exists' }
+        $clockTimer = [Diagnostics.Stopwatch]::StartNew()
         $clockProcess = Start-Process -FilePath 'w32tm.exe' -ArgumentList '/query','/status','/verbose' `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput $clockOut -RedirectStandardError $clockErr
         try {
-            if (!$clockProcess.WaitForExit(5000)) { $clockProcess.Kill(); throw 'Clock status query timed out' }
-            $clockProcess.Refresh()
-            $record.clock_query = @{command=@('w32tm','/query','/status','/verbose');exit_code=$clockProcess.ExitCode
+            # PS5.1 Start-Process does not retain the native handle until requested.
+            $null = $clockProcess.Handle
+            $waitMs = [int][Math]::Max(0,4500 - $clockTimer.Elapsed.TotalMilliseconds)
+            if (!$clockProcess.WaitForExit($waitMs)) {
+                $clockProcess.Kill()
+                $cleanupMs = [int][Math]::Max(0,5000 - $clockTimer.Elapsed.TotalMilliseconds)
+                $reaped = $clockProcess.WaitForExit($cleanupMs)
+                throw "Clock status query timed out; cleanup_complete=$reaped"
+            }
+            $clockExitCode = $clockProcess.ExitCode
+            if ($null -eq $clockExitCode) { throw 'Clock status query exit code unavailable' }
+            $record.clock_query = @{command=@('w32tm','/query','/status','/verbose');exit_code=$clockExitCode
                 stdout_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($clockOut))
                 stderr_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($clockErr))}
+            if ($clockTimer.Elapsed.TotalMilliseconds -gt 5000) { throw 'Clock status query budget exceeded' }
         } finally { $clockProcess.Dispose() }
         $record.checked_at = Get-Date -Format o
     }

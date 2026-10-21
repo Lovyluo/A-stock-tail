@@ -74,6 +74,14 @@ Phase109新增36项，连同Phase108/104/107为185 passed in 116.17s。原正常
 
 修复提交后的真实入口仅执行一次：环境查询退出0，两份真实日志均哈希成功、合法且非pending，无workers/tasks/locks/blockers；但完整前置仍以clock_status_query_failed拒绝，因为内层clock_query.exit_code为null。原始W32Time内容显示服务Running、Leap=0及同步错误0，不能用正文代替缺失的进程退出码。该独立兼容阻断保全报告，本轮不扩大哈希修复、不追加真实检查或采集；没有日历/session/NTP测量、捕获worker、任务或资格增加。
 
+### PR #41退出码跟进
+
+独立跟进授权下，使用本地cmd退出7复现PS5.1：不预取Handle时WaitForExit后的ExitCode为空，Refresh不能补回；预持Handle后正确为7。PS7三种路径均为7。检查脚本在有界等待前取得原生Handle，读取真实ExitCode及重定向文件后再Dispose；不把null转0、从正文猜成功或改系统配置。
+
+本机查询保持5秒总预算，单调计时含启动/等待/读取，预留内部500ms用于Kill后的有界退出确认；整体环境10500ms与捕获2000ms均不变，隐藏窗口不变。Phase110实际PS5.1/7→本地Python fixture覆盖0/7、超时/回收、完整stdout/stderr、启动失败及null继续拒绝；所有输入明确合成，零时钟服务/NTP/行情请求。PS7 fixture参数以-u开头导致的绑定错误已保留并修正，不增加生产绕过开关。
+
+旧Phase103 CI失败在coordination_wait、无客户端调用；缺历史持锁者证据，精确根因仍未确认。最多两轮本地诊断，不放宽成功用例或计时；仅增失败时PID/阶段剩余预算/同批peer/回收后的协调日志摘要，不声称收尾快照证明历史锁归属。最终专项、一次真实环境查询和新增一次CI结果以`local-archive/recovery/pr41-exitcode-ci-followup-20261021`为准。若CI再失败报告停止，不重跑求绿；通过也不把未知根因写成已修复。
+
 Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个真实fixture子进程/20个合成bars调用。替换仅在测试harness，不给实际脚本增加skip、任意worker命令或test-only公共CLI开关；真实准入拒绝test-only材料。另以Windows PowerShell5.1/7执行真实环境脚本的隔离mock行为测试，覆盖脚本/带空格路径/`-m`及紧凑模块启动、残留根/后代、无关Python、名称不含AStock的分钟任务、历史Disabled任务与权限拒绝。模块/任务漏识别先复现6项拒绝断言失败，再修复；最终新阶段62项与旧编排59项共121项通过，较早兼容组213项与之重叠，不相加。
 
 错误日期/SHA/计划、缺失/过期材料、时钟失败、清理/当日输出阻断、异常退出/非法或缺失JSON、超时回收均拒绝；拒绝结果交给捕获CLI仍不得派发worker。外部SHA错误、重签派生内容、旧授权与合成提权均拒绝。没有真实行情或NTP，不表示生产最坏耗时、最终性或来源资格得到证明。
