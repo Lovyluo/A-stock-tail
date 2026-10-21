@@ -1,12 +1,45 @@
 param([string]$Script,[string]$OpsDirectory,[string]$OutputPath,[string]$TempDirectory,[string]$Mode,
-    [switch]$MinuteCapture,[string]$ProjectRoot,[string]$MinuteCaptureRoot,[string]$TradeDate)
+    [switch]$MinuteCapture,[string]$ProjectRoot,[string]$MinuteCaptureRoot,[string]$TradeDate,
+    [switch]$HashUnavailable,[string]$HashTarget)
 $ErrorActionPreference = 'Stop'
 $env:TEMP = $TempDirectory
 $env:TMP = $TempDirectory
 $global:LASTEXITCODE = 17
+if ($HashUnavailable) {
+    function global:Get-FileHash {
+        throw [Management.Automation.CommandNotFoundException]::new('test-only Get-FileHash unavailable')
+    }
+}
+if ($Mode -in @('hash-file','hash-locked')) {
+    $locked = $null
+    try {
+        $tokens = $null; $parseErrors = $null
+        $tree = [Management.Automation.Language.Parser]::ParseFile($Script,[ref]$tokens,[ref]$parseErrors)
+        if ($parseErrors.Count) { throw 'Synthetic hash target script parse failed' }
+        $function = $tree.Find({param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-FileSha256'
+        },$false)
+        if (!$function) { throw 'Production file hash function missing' }
+        . ([scriptblock]::Create($function.Extent.Text))
+        if ($Mode -eq 'hash-locked') {
+            $locked = [IO.File]::Open($HashTarget,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        }
+        $digest = Get-FileSha256 -Path $HashTarget
+        $exclusive = [IO.File]::Open($HashTarget,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        $exclusive.Dispose()
+        @{test_only=$true;sha256=$digest;handles_released=$true} | ConvertTo-Json
+        exit 0
+    } catch {
+        @{test_only=$true;error=$_.Exception.Message} | ConvertTo-Json
+        exit 2
+    } finally { if ($null -ne $locked) { $locked.Dispose() } }
+}
 function global:Get-CimInstance {
     [CmdletBinding()] param([string]$ClassName,[string]$Filter)
-    if ($ClassName -eq 'Win32_Service') { return [pscustomobject]@{ProcessId=42} }
+    if ($ClassName -eq 'Win32_Service') {
+        if ($Mode -eq 'identity-query-error') { throw 'synthetic service identity denied' }
+        return [pscustomobject]@{ProcessId=42}
+    }
     if ($ClassName -eq 'Win32_OperatingSystem') { return [pscustomobject]@{LastBootUpTime=[datetime]::Parse('2026-10-15T04:00:00+08:00')} }
     if ($MinuteCapture -and $ClassName -eq 'Win32_Process') {
         if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact')) {
@@ -44,6 +77,8 @@ function global:Get-WinEvent {
 }
 function global:Get-Service {
     [CmdletBinding()] param([string]$Name)
+    if ($Mode -eq 'service-query-error') { throw 'synthetic service query denied' }
+    if ($Mode -eq 'service-stopped') { return [pscustomobject]@{Status='Stopped'} }
     return [pscustomobject]@{Status='Running'}
 }
 if ($MinuteCapture) {
@@ -68,8 +103,14 @@ if ($MinuteCapture) {
     }
 }
 # Only this isolated process has mocks. No real service, task, network or clock calls.
-if ($MinuteCapture) {
-    & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath -MinuteCapture `
-        -ProjectRoot $ProjectRoot -MinuteCaptureRoot $MinuteCaptureRoot -TradeDate $TradeDate
-} else { & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath }
+$heldJournal = $null
+try {
+    if ($Mode -eq 'journal-read-failure') {
+        $heldJournal = [IO.File]::Open($HashTarget,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+    }
+    if ($MinuteCapture) {
+        & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath -MinuteCapture `
+            -ProjectRoot $ProjectRoot -MinuteCaptureRoot $MinuteCaptureRoot -TradeDate $TradeDate
+    } else { & $Script -OpsDirectory $OpsDirectory -OutputPath $OutputPath }
+} finally { if ($null -ne $heldJournal) { $heldJournal.Dispose() } }
 exit $LASTEXITCODE

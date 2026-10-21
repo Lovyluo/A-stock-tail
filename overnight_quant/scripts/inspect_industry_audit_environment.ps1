@@ -8,6 +8,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $code = 2
+$serviceRunning = $null
+$serviceCheckStatus = 'NOT_QUERIED'
+function Get-FileSha256([string]$Path) {
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+    } finally {
+        if ($null -ne $algorithm) { $algorithm.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
 function Write-Result($Path,$Value) {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 15))
     $f = [IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
@@ -69,7 +83,7 @@ try {
             $issues += "Executor lock exists: $path"
             $copy = Join-Path $OpsDirectory ([Guid]::NewGuid().ToString('N') + '-' + $name)
             Copy-Item -LiteralPath $path -Destination $copy
-            $locks += @{path=$path;preserved_copy=$copy;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+            $locks += @{path=$path;preserved_copy=$copy;sha256=(Get-FileSha256 -Path $path)}
         }
     }
     foreach ($name in @('http-start-state','a-stock-http-start-v1')) {
@@ -97,7 +111,7 @@ try {
                 $issues += "Invalid/pending journal: $($file.FullName)"
                 Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $OpsDirectory ([Guid]::NewGuid().ToString('N') + '-' + $file.Name))
             }
-            $journals += @{path=$file.FullName;valid=$valid;pending=$tail.pending;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+            $journals += @{path=$file.FullName;valid=$valid;pending=$tail.pending;sha256=(Get-FileSha256 -Path $file.FullName)}
         }
     }
     $events = @()
@@ -110,7 +124,10 @@ try {
         catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $issues += "Event query unavailable: $($_.Exception.Message)" } }
     }
     if ($events.Count) { $issues += 'Clock-adjustment or sleep/wake event since preparation began' }
+    $serviceCheckStatus = 'QUERY_FAILED'
     $service = Get-Service W32Time -ErrorAction Stop
+    $serviceRunning = ($service.Status -eq 'Running')
+    $serviceCheckStatus = 'OBSERVED'
     $svc = Get-CimInstance Win32_Service -Filter "Name='W32Time'" -ErrorAction Stop
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
     if ($service.Status -ne 'Running') { $issues += 'W32Time is not Running' }
@@ -152,7 +169,9 @@ try {
     else { [ordered]@{status=if($issues.Count){'ENVIRONMENT_REJECTED'}else{'ENVIRONMENT_PASSED'};blockers=$issues} | ConvertTo-Json -Depth 5 }
     if (!$issues.Count) { $code = 0 }
 } catch {
-    $failure = [ordered]@{schema_version='industry_audit_environment_v1';status='ENVIRONMENT_INSPECTION_FAILED';blockers=@($_.Exception.Message);service_running=$false}
+    $failure = [ordered]@{schema_version='industry_audit_environment_v1';status='ENVIRONMENT_INSPECTION_FAILED'
+        blockers=@($_.Exception.Message);inspection_succeeded=$false
+        service_running=$serviceRunning;service_check_status=$serviceCheckStatus}
     if (!(Test-Path -LiteralPath $OutputPath)) { Write-Result $OutputPath $failure }
     $failure | ConvertTo-Json -Depth 5
 }
