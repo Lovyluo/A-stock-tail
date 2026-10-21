@@ -72,6 +72,8 @@ PR #40合并后实际Python子进程为Windows PowerShell `5.1.26100.9711`，路
 
 Phase109新增36项，连同Phase108/104/107为185 passed in 116.17s。原正常日志反例2项失败和新测试二进制case ID过长的设施错误均保留；短ID修正不改变测试输入或行为。Python编译/diff及实际只读入口、Draft PR最终CI与恢复SHA索引位于同一仓库外恢复目录，不重复本地全量、不以开发环境只读成功授权捕获。
 
+修复提交后的真实入口仅执行一次：环境查询退出0，两份真实日志均哈希成功、合法且非pending，无workers/tasks/locks/blockers；但完整前置仍以clock_status_query_failed拒绝，因为内层clock_query.exit_code为null。原始W32Time内容显示服务Running、Leap=0及同步错误0，不能用正文代替缺失的进程退出码。该独立兼容阻断保全报告，本轮不扩大哈希修复、不追加真实检查或采集；没有日历/session/NTP测量、捕获worker、任务或资格增加。
+
 Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个真实fixture子进程/20个合成bars调用。替换仅在测试harness，不给实际脚本增加skip、任意worker命令或test-only公共CLI开关；真实准入拒绝test-only材料。另以Windows PowerShell5.1/7执行真实环境脚本的隔离mock行为测试，覆盖脚本/带空格路径/`-m`及紧凑模块启动、残留根/后代、无关Python、名称不含AStock的分钟任务、历史Disabled任务与权限拒绝。模块/任务漏识别先复现6项拒绝断言失败，再修复；最终新阶段62项与旧编排59项共121项通过，较早兼容组213项与之重叠，不相加。
 
 错误日期/SHA/计划、缺失/过期材料、时钟失败、清理/当日输出阻断、异常退出/非法或缺失JSON、超时回收均拒绝；拒绝结果交给捕获CLI仍不得派发worker。外部SHA错误、重签派生内容、旧授权与合成提权均拒绝。没有真实行情或NTP，不表示生产最坏耗时、最终性或来源资格得到证明。
