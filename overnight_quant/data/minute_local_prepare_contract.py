@@ -13,8 +13,10 @@ from . import minute_capture_audit as legacy
 EXECUTION_CONTRACT = "local_prepare_v2"
 PLAN_VERSION = "mootdx_minute_capture_plan_v2"
 WORKER_VERSION = "mootdx_local_prepare_worker_v2"
-EVIDENCE_VERSION = "mootdx_minute_capture_audit_v2"
-VERIFIER_VERSION = "mootdx_minute_capture_verifier_v2"
+EVIDENCE_VERSION = "mootdx_minute_capture_audit_v3"
+VERIFIER_VERSION = "mootdx_minute_capture_verifier_v3"
+SEAL_RECEIPT_VERSION = "mootdx_minute_seal_receipt_v1"
+SEAL_COMPLETION_VERSION = "mootdx_minute_seal_completion_v1"
 PREFLIGHT_VERSION = "minute_capture_preflight_v2"
 PREFLIGHT_VERIFIER = "minute_capture_preflight_verifier_v2"
 AUTHORIZATION_VERSION = "minute_capture_manual_authorization_v3"
@@ -34,7 +36,9 @@ def frozen_plan():
         process_startup_budget_phase="local_preparation_counted_separately_not_in_2000ms",
         parent_death_policy="windows_job_kill_on_parent_handle_close",
         execution_enabled_by_default=False, preconnection=False,
-        cross_wave_worker_reuse=False, cross_wave_connection_reuse=False)
+        cross_wave_worker_reuse=False, cross_wave_connection_reuse=False,
+        seal_receipt_version=SEAL_RECEIPT_VERSION, seal_completion_version=SEAL_COMPLETION_VERSION,
+        seal_policy="external_anchors_for_raw_receipt_and_post_write_completion_witness")
     return {**plan, "plan_hash": legacy.digest(plan)}
 
 
@@ -111,4 +115,7 @@ def verifier_hash():
                   "one_GO_with_send_receive_order", "absolute_phase_deadlines_no_reset",
                   "native_rows_and_request_replay", "same_batch_code_config_scope",
                   "bounded_tree_and_pipe_cleanup", "immutable_start_cleanup_witness_no_reset",
+                  "external_seal_receipt_and_post_write_completion_anchors",
+                  "recompute_seal_absolute_deadline_and_monotonic_budget",
+                  "separate_integrity_capture_seal_final_execution",
                   "audit_integrity_never_grants_admission"]})

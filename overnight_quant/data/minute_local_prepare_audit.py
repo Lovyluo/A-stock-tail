@@ -15,6 +15,7 @@ import uuid
 
 from . import minute_capture_audit as legacy
 from . import minute_local_prepare_contract as contract
+from . import minute_local_prepare_seal as sealing
 from .minute_local_prepare_process import run_prepared_wave
 from .probe_worker_process import _decode_worker_output
 
@@ -229,18 +230,13 @@ def capture(plan, trade_date, *, authorization, audit_root=AUDIT_ROOT, _test=Non
         waves=waves, summary=summary, capture_error=error, confirmation_elapsed_ms=confirmation_ms,
         source_finality="UNPROVEN")
     evidence["evidence_hash"] = legacy.digest(evidence)
-    seal_started = time.perf_counter()
-    path = legacy.write(directory / "evidence-v2.json", evidence)
-    legacy.write(directory / "file-anchor-v2.json", {"file": path.name, "sha256": sha256(path.read_bytes()).hexdigest()})
-    late = clock() > datetime.fromisoformat(f"{trade_date}T14:51:05+08:00")
-    legacy.write(directory / "seal-receipt-v2.json", legacy.safe(
-        status="MINUTE_CAPTURE_AUDIT_FAILED" if late or time.perf_counter() - seal_started > 3 else summary["status"],
-        evidence_file=path.name, sealed_at=clock().isoformat(), late_seal=late,
-        cleanup_complete=summary.get("cleanup_complete"), source_available_at="UNPROVEN"))
+    path = sealing.seal(directory, evidence, clock=clock, write=legacy.write)
     return evidence, path
 
 
-def verify(evidence, expected_file_sha256, actual_file_sha256):
+def verify(evidence, expected_file_sha256, actual_file_sha256, *, seal_receipt=None,
+           expected_receipt_sha256=None, actual_receipt_sha256=None, seal_completion=None,
+           expected_completion_sha256=None, actual_completion_sha256=None):
     errors, summary = [], None
     if not expected_file_sha256 or expected_file_sha256 != actual_file_sha256:
         errors.append("external_file_sha256_mismatch")
@@ -273,7 +269,38 @@ def verify(evidence, expected_file_sha256, actual_file_sha256):
         errors.append("prepared_wave_structure_invalid")
     if any(evidence.get(k) != value for k, value in legacy.safe().items()):
         errors.append("prepared_unsafe_or_promoted_output")
+    evidence_valid = not errors
+    seal_errors, seal_status = sealing.verify(evidence, actual_file_sha256,
+        seal_receipt, expected_receipt_sha256, actual_receipt_sha256,
+        seal_completion, expected_completion_sha256, actual_completion_sha256)
+    errors.extend(seal_errors)
+    capture_result = summary.get("status") if summary is not None else "CAPTURE_UNCONFIRMED"
+    final = (capture_result if not errors and seal_status == "SEAL_COMPLETED_WITHIN_BUDGET"
+             else sealing.FAILED)
+    final_summary = {**(summary or {}), "status": final, "capture_result": capture_result, "seal_status": seal_status}
     return legacy.safe(status="MINUTE_CAPTURE_EVIDENCE_VERIFIED" if not errors else "MINUTE_CAPTURE_EVIDENCE_INVALID",
-        verifier=contract.VERIFIER_VERSION, integrity_verified=not errors, errors=errors, summary=summary,
+        verifier=contract.VERIFIER_VERSION, integrity_verified=not errors,
+        evidence_integrity_verified=evidence_valid, seal_integrity_verified=not seal_errors,
+        errors=errors, summary=final_summary, capture_summary=summary,
+        capture_result=capture_result, seal_status=seal_status, final_execution_result=final,
+        verification_inputs={"evidence_file_sha256": expected_file_sha256,
+            "seal_receipt_sha256": expected_receipt_sha256, "seal_completion_sha256": expected_completion_sha256},
         verifier_hash=contract.verifier_hash(),
         evidence_hash=evidence.get("evidence_hash"), source_finality="UNPROVEN")
+
+
+def verify_files(path, expected_file_sha256, *, receipt_path=None, expected_receipt_sha256=None,
+                 completion_path=None, expected_completion_sha256=None):
+    raw = Path(path).read_bytes()
+    values = []
+    for item in (receipt_path, completion_path):
+        try:
+            material = Path(item).read_bytes()
+            value = json.loads(material, parse_constant=lambda s: (_ for _ in ()).throw(ValueError(s)))
+            values.append((value, sha256(material).hexdigest()))
+        except (OSError, ValueError, TypeError):
+            values.append((None, None))
+    return verify(json.loads(raw), expected_file_sha256, sha256(raw).hexdigest(),
+        seal_receipt=values[0][0], expected_receipt_sha256=expected_receipt_sha256,
+        actual_receipt_sha256=values[0][1], seal_completion=values[1][0],
+        expected_completion_sha256=expected_completion_sha256, actual_completion_sha256=values[1][1])

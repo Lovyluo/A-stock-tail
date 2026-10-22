@@ -78,7 +78,8 @@ semantics are created. Observational stability is never proof of upstream finali
 | Explicit selection | local_prepare_v2 |
 | Plan | mootdx_minute_capture_plan_v2 |
 | Worker | mootdx_local_prepare_worker_v2 |
-| Evidence / verifier | mootdx_minute_capture_audit_v2 / mootdx_minute_capture_verifier_v2 |
+| Evidence / verifier | mootdx_minute_capture_audit_v3 / mootdx_minute_capture_verifier_v3 |
+| Seal material receipt / completion witness | mootdx_minute_seal_receipt_v1 / mootdx_minute_seal_completion_v1 |
 | Preflight / verifier | minute_capture_preflight_v2 / minute_capture_preflight_verifier_v2 |
 | Manual authorization | minute_capture_manual_authorization_v3 |
 
@@ -99,6 +100,50 @@ to reuse the legacy native-row checks; only an internal network-window view is
 passed to those unchanged checks. Integrity does not imply successful capture,
 finality, authorization of formal sampling or source qualification.
 
+### Final Seal Is Part of Independent Replay
+
+The aca115e offline counterexample completed all four fixture waves, then sealed
+after 14:51:05 and over the existing 3000ms seal budget. The CLI failed while raw-only
+replay returned success. That discrepancy is retained in the incremental index;
+the original evidence is never rewritten to repair its final status.
+
+The v3 writer preserves `evidence-v3.json`, its file anchor and a create-only
+`seal-receipt-v1.json`. It measures monotonic elapsed time and wall completion
+**after** the receipt writer has flushed, closed, published and read back the
+receipt, and after evidence readback. Deadline 14:51:05 and seal budget 3000ms
+are unchanged. A separately create-only `seal-completion-v1.json` witnesses that
+observed receipt completion, including its raw file SHA, deadline/budget outcome
+and batch/date/code/plan/evidence SHA bindings. This is an after-boundary audit
+witness, not another capture stage, a new source `available_at`, or a claim about
+the witness file's own publication time. Its publication and readback must succeed
+before the CLI can return complete audit success. Failure is not auto-anchored as
+success even if a file happens to exist after an exception.
+
+Independent replay requires external SHA anchors for the evidence, receipt and
+completion witness. Missing, damaged, wrong-batch, old-version or unanchored proof
+keeps final execution failed, while `evidence_integrity_verified` can still report
+the raw file's separate integrity. A valid late/overbudget seal is **valid failure
+evidence**: `integrity_verified=true`, `seal_status=SEAL_FAILED`, final execution
+failed, CLI exit 2. Outputs separate `capture_result`, `seal_status` and
+`final_execution_result`; the CLI and replay share this same reducer. A receipt
+cannot assert its own post-write completion; only the subsequent anchored witness
+attests that boundary. No self-file hash is embedded into its own file.
+
+Old v2 raw evidence and old seal files remain historical/audit-only, not complete
+success under the current verifier. The evidence/verifier versions and exact plan
+hash change; worker, execution profile, authorization schema and all capture/cleanup
+budgets stay unchanged. An authorization anchored to the old plan cannot start
+the changed contract. No new date or real execution is authorized by this patch.
+
+Seal regression: 100 affected tests passed in 137.08s, followed by 25 final seal
+tests in 22.40s (overlapping, not additive). These include normal/equal-boundary
+sealing, absolute late completion, elapsed overbudget, missing/corrupt/unanchored
+or cross-batch proof, re-signed malformed timing, publication/readback failure,
+legal failure integrity and two byte-identical independent replays. READY/GO,
+zero-network preparation and persistent cleanup-blocker regressions are retained.
+The original 24.27s counterexample and final results/hashes are stored only in
+`local-archive/recovery/minute-ops3-seal-20261022`.
+
 ## Commands and Offline Acceptance
 
 Safe, complete default command (no worker, source request or NTP):
@@ -114,7 +159,7 @@ Future manual syntax only, **not execution permission**:
 & $python overnight_quant/scripts/run_minute_capture_preflight.py --execution-contract local_prepare_v2 --prepare --date $day --approved-code-sha $code --plan $plan --expected-plan-sha256 $planFileSha --output-dir $newPreflightDirectory --calendar $calendar --calendar-sha256 $calendarSha --session $session --session-sha256 $sessionSha --before-environment $baselineEnvironment --before-environment-sha256 $baselineEnvironmentSha --clock-raw $clockRaw --clock-raw-sha256 $clockRawSha
 & $python overnight_quant/scripts/run_minute_capture_preflight.py --execution-contract local_prepare_v2 --verify $preflight --expected-file-sha256 $preflightSha --date $day --approved-code-sha $code
 & $python overnight_quant/scripts/run_minute_local_prepare_audit.py --network --date $day --plan $plan --expected-plan-sha256 $planFileSha --authorization $manualV3Authorization --authorization-sha256 $manualV3AuthorizationSha
-& $python overnight_quant/scripts/run_minute_local_prepare_audit.py --verify $rawEvidence --expected-file-sha256 $rawEvidenceSha --replay-output $newReplayPath
+& $python overnight_quant/scripts/run_minute_local_prepare_audit.py --verify $rawEvidence --expected-file-sha256 $rawEvidenceSha --seal-receipt $sealReceipt --expected-receipt-sha256 $sealReceiptFileSha --seal-completion $sealCompletion --expected-completion-sha256 $sealCompletionFileSha --replay-output $newReplayPath
 ```
 
 Phase112/113 exercise real processes and installed parser/client code with local

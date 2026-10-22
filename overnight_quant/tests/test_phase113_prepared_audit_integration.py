@@ -14,6 +14,7 @@ from overnight_quant.data import minute_capture_audit as legacy
 from overnight_quant.data import minute_capture_preflight as pre
 from overnight_quant.data import minute_local_prepare_audit as audit
 from overnight_quant.data import minute_local_prepare_contract as contract
+from overnight_quant.data import minute_local_prepare_seal as sealing
 from overnight_quant.data import minute_local_prepare_process as process
 from overnight_quant.scripts import run_minute_local_prepare_audit as cli
 from overnight_quant.scripts import run_minute_capture_preflight as pre_cli
@@ -91,9 +92,15 @@ def test_real_v2_entries_four_workers_twenty_bars_and_dual_replay(case, monkeypa
     replays = []
     for index in range(2):
         replay = case["tmp"] / f"independent-replay-{index}.json"
-        assert cli.main(["--verify", str(raw_path), "--expected-file-sha256", anchor, "--replay-output", str(replay)]) == 0
+        assert cli.main(["--verify", str(raw_path), "--expected-file-sha256", anchor, "--replay-output", str(replay),
+            "--seal-receipt", str(raw_path.parent / sealing.RECEIPT_NAME),
+            "--expected-receipt-sha256", output["seal_receipt_sha256"],
+            "--seal-completion", str(raw_path.parent / sealing.COMPLETION_NAME),
+            "--expected-completion-sha256", output["seal_completion_sha256"]]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["integrity_verified"]
+        assert result["summary"] == output["summary"]
+        assert result["final_execution_result"] == output["final_execution_result"]
         assert_safe(result)
         replays.append(replay.read_bytes())
     assert replays[0] == replays[1] and raw_path.read_bytes() == raw
@@ -104,7 +111,7 @@ def test_real_v2_entries_four_workers_twenty_bars_and_dual_replay(case, monkeypa
     modified = deepcopy(evidence)
     modified["waves"][0]["result"]["task"]["io_deadline_monotonic"] += .001
     modified["evidence_hash"] = legacy.digest({k: v for k, v in modified.items() if k != "evidence_hash"})
-    assert not audit.verify(modified, anchor, sha256(json.dumps(modified).encode()).hexdigest())["integrity_verified"]
+    assert not audit.verify(modified, anchor, sha256(json.dumps(modified).encode()).hexdigest())["evidence_integrity_verified"]
     # Even a new external anchor plus all re-signed task/stream hashes cannot
     # authorize a changed absolute phase budget.
     result = modified["waves"][0]["result"]
@@ -118,7 +125,7 @@ def test_real_v2_entries_four_workers_twenty_bars_and_dual_replay(case, monkeypa
     result["stdout_sha256"] = sha256(result["stdout"].encode()).hexdigest()
     modified["evidence_hash"] = legacy.digest({k: v for k, v in modified.items() if k != "evidence_hash"})
     resigned = sha256(json.dumps(modified).encode()).hexdigest()
-    assert not audit.verify(modified, resigned, resigned)["integrity_verified"]
+    assert not audit.verify(modified, resigned, resigned)["evidence_integrity_verified"]
 
 
 @pytest.mark.parametrize("args", [[], ["--validate-only"]])
@@ -201,7 +208,12 @@ def test_zero_child_failure_is_frozen_and_replays_without_invented_PID(case, mon
     assert evidence["summary"]["status"] == "MINUTE_CAPTURE_AUDIT_FAILED"
     assert evidence["summary"]["requests_attempted"] == 0
     anchor = sha256(path.read_bytes()).hexdigest()
-    assert audit.verify(evidence, anchor, anchor)["integrity_verified"]
+    receipt, completion = path.parent / sealing.RECEIPT_NAME, path.parent / sealing.COMPLETION_NAME
+    checked = audit.verify_files(path, anchor, receipt_path=receipt,
+        expected_receipt_sha256=sha256(receipt.read_bytes()).hexdigest(), completion_path=completion,
+        expected_completion_sha256=sha256(completion.read_bytes()).hexdigest())
+    assert checked["evidence_integrity_verified"] and checked["integrity_verified"]
+    assert checked["final_execution_result"] == sealing.FAILED
     assert_safe(evidence)
 
 
