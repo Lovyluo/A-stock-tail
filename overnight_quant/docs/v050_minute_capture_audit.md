@@ -67,6 +67,14 @@ Get-FileHash overnight_quant/data/cache/minute_capture_audit/candidate-plan-v1.j
 & $py overnight_quant/scripts/run_minute_capture_audit.py --verify 'overnight_quant/data/cache/minute_capture_audit/<批准日期>/evidence.json' --expected-file-sha256 '<同一原件外部SHA256>' --replay-output '<新的ignored审计目录>/replay-b.json'
 ```
 
-当前授权JSON合同升级为`minute_capture_manual_authorization_v2`：status=`PM_APPROVED_SINGLE_AUDIT`、trade_date、code_sha、plan_hash、single_use=true，以及`preflight={path,sha256}`。预检必须来自仓库内[版本化分钟前置入口](v050_minute_preflight.md)，其独立verifier重读锚定的日历、session、原始三样本及环境查询输出，不再接纳旧行业临时脚本或v1授权用于新采集。预检通过只说明材料通过，不生成PM批准或自动采集。旧v1采集原件仍按原verifier审计，不重写、迁移或升级资格；合成harness只能走私有test-only控制注入。
+本页`legacy_v1`路径的授权JSON合同为`minute_capture_manual_authorization_v2`：status=`PM_APPROVED_SINGLE_AUDIT`、trade_date、code_sha、plan_hash、single_use=true，以及`preflight={path,sha256}`。预检必须来自仓库内[版本化分钟前置入口](v050_minute_preflight.md)，其独立verifier重读锚定的日历、session、原始三样本及环境查询输出，不再接纳旧行业临时脚本或v1授权用于新采集。预检通过只说明材料通过，不生成PM批准或自动采集。旧v1采集原件仍按原verifier审计，不重写、迁移或升级资格；合成harness只能走私有test-only控制注入。
 
 下一轮最多证明该日原生响应、窗口覆盖、实际变化/稳定性与时间预算表现；不能凭单轮采集、hash或连续相同证明上游最终性、取得资格、激活Provider或宣称真实策略就绪。资金流冻结及市场/行业/公告/风险阻断不变。正式qualification=0/3、data_ready=false、hard_gate_authorized=false，records/ranking/candidates/tickets/orders=[]。
+
+## New Local-Preparation Candidate Contract
+
+MINUTE-OPS-3 adds an explicitly selected, unactivated
+[local_prepare_v2 execution path](minute_ops3_local_prepare.md). It does not
+replace this legacy contract, reclassify its evidence, or move old startup cost
+outside the old budget. New plan/worker/evidence/verifier/preflight and v3 manual
+authorization are distinct. No real date or capture is authorized by the code.

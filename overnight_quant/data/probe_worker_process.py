@@ -188,7 +188,7 @@ def _bounded_error(value: str, limit: int = 500) -> str:
 class _ProcessScope:
     """Track descendants even after the root exits; never shell out to taskkill."""
 
-    def __init__(self, process):
+    def __init__(self, process, *, kill_on_parent_close=False):
         self.process = process
         self.handle = None
         self.kind = "posix_process_group"
@@ -217,6 +217,29 @@ class _ProcessScope:
             self.handle = self.kernel.CreateJobObjectW(None, None)
             if not self.handle:
                 raise ctypes.WinError(ctypes.get_last_error())
+            if kill_on_parent_close:
+                class BasicLimits(ctypes.Structure):
+                    _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                        ("flags", wintypes.DWORD), ("min_working", ctypes.c_size_t),
+                        ("max_working", ctypes.c_size_t), ("active_limit", wintypes.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                        ("scheduling", wintypes.DWORD)]
+                class IoCounters(ctypes.Structure):
+                    _fields_ = [(name, ctypes.c_uint64) for name in (
+                        "read_ops", "write_ops", "other_ops", "read_bytes", "write_bytes", "other_bytes")]
+                class ExtendedLimits(ctypes.Structure):
+                    _fields_ = [("basic", BasicLimits), ("io", IoCounters),
+                        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+                limits = ExtendedLimits()
+                limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                setter = self.kernel.SetInformationJobObject
+                setter.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+                setter.restype = wintypes.BOOL
+                if not setter(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                    error = ctypes.WinError(ctypes.get_last_error())
+                    self.close()
+                    raise error
             if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
                 error = ctypes.WinError(ctypes.get_last_error())
                 self.close()
@@ -246,6 +269,28 @@ class _ProcessScope:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    def contains(self, pid):
+        """Verify the actual interpreter belongs to this tracked job, not just its launcher."""
+        if os.name != "nt":
+            return os.getpgid(pid) == self.process.pid
+        from ctypes import wintypes
+        opener = self.kernel.OpenProcess
+        opener.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        opener.restype = wintypes.HANDLE
+        member = self.kernel.IsProcessInJob
+        member.argtypes = [wintypes.HANDLE, wintypes.HANDLE, self.ctypes.POINTER(wintypes.BOOL)]
+        member.restype = wintypes.BOOL
+        handle = opener(0x1000, False, pid)
+        if not handle:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        try:
+            result = wintypes.BOOL()
+            if not member(handle, self.handle, self.ctypes.byref(result)):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            return bool(result.value)
+        finally:
+            self.kernel.CloseHandle(handle)
 
     def close(self):
         if self.handle:
@@ -308,6 +353,96 @@ class _PipeDrain:
         return b"".join(self.chunks[name]).decode("utf-8", errors="replace")
 
 
+def _resume_suspended_primary(process):
+    """Resume a new-path root only after its Job owns all future descendants."""
+    import ctypes
+    from ctypes import wintypes
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("tid", wintypes.DWORD),
+                    ("owner", wintypes.DWORD), ("base_priority", ctypes.c_long),
+                    ("delta_priority", ctypes.c_long), ("flags", wintypes.DWORD)]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for name in ("Thread32First", "Thread32Next"):
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL
+    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenThread.restype = wintypes.HANDLE
+    kernel.ResumeThread.argtypes, kernel.ResumeThread.restype = [wintypes.HANDLE], wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    snapshot = kernel.CreateToolhelp32Snapshot(4, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry, ids = ThreadEntry(), []
+        entry.size = ctypes.sizeof(entry)
+        more = kernel.Thread32First(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.owner == process.pid:
+                ids.append(entry.tid)
+            more = kernel.Thread32Next(snapshot, ctypes.byref(entry))
+        if len(ids) != 1:
+            raise ValueError("suspended_primary_thread_identity_invalid")
+        handle = kernel.OpenThread(0x2, False, ids[0])
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if kernel.ResumeThread(handle) != 1:
+                raise ValueError("suspended_primary_resume_count_invalid")
+        finally:
+            kernel.CloseHandle(handle)
+    finally:
+        kernel.CloseHandle(snapshot)
+
+
+def _bounded_cleanup(process, scope, drain, *, deadline, monotonic):
+    """One absolute cleanup deadline shared by termination, draining and close."""
+    errors, timings = [], {}
+    tree_empty = pipes_closed = close_complete = False
+    terminated = False
+    started = monotonic()
+    try:
+        if process is not None:
+            tree_empty = scope.empty() if scope is not None else False
+            if (process.poll() is None or not tree_empty) and monotonic() < deadline:
+                terminated = True
+                scope.terminate() if scope is not None else process.kill()
+    except Exception as exc:
+        errors.append(f"terminate:{type(exc).__name__}:{exc}")
+    timings["termination_ms"] = (monotonic() - started) * 1000
+    drain_started = monotonic()
+    try:
+        while process is not None and monotonic() < deadline:
+            received = drain.step() if drain is not None else False
+            root_exited = process.poll() is not None
+            tree_empty = scope.empty() if scope is not None else False
+            if root_exited and tree_empty and drain is not None and all(drain.eof.values()):
+                break
+            if not received:
+                time.sleep(min(.002, max(0, deadline - monotonic())))
+    except Exception as exc:
+        errors.append(f"drain_or_exit:{type(exc).__name__}:{exc}")
+    timings["drain_and_exit_ms"] = (monotonic() - drain_started) * 1000
+    close_started = monotonic()
+    try:
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+            pipes_closed = True
+        if scope is not None:
+            scope.close()
+        close_complete = True
+    except Exception as exc:
+        errors.append(f"close:{type(exc).__name__}:{exc}")
+    timings["pipe_and_scope_close_ms"] = (monotonic() - close_started) * 1000
+    complete = close_complete and (process is None or (process.poll() is not None and tree_empty
+        and drain is not None and all(drain.eof.values()) and pipes_closed))
+    return {"cleanup_complete": complete and monotonic() <= deadline,
+            "worker_terminated": terminated, "tree_empty_observed": tree_empty,
+            "pipes_closed": pipes_closed, "diagnostics": errors, **timings}
+
+
 def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
                         monotonic, cleanup_ms, retain_streams, hard_deadline):
     started = monotonic()
@@ -365,48 +500,12 @@ def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
         # One shared cleanup deadline, not a fresh reserve for each operation.
         cleanup_deadline = min(deadline, io_completed + reserve)
         timings["io_and_startup_ms"] = (io_completed - started) * 1000
-        termination_started = monotonic()
-        try:
-            if process is not None:
-                tree_empty = scope.empty() if scope is not None else False
-                if (process.poll() is None or not tree_empty) and monotonic() < cleanup_deadline:
-                    terminated = True
-                    if scope is not None:
-                        scope.terminate()
-                    else:
-                        process.kill()
-        except Exception as exc:
-            errors.append(f"terminate:{type(exc).__name__}:{exc}")
-        timings["termination_ms"] = (monotonic() - termination_started) * 1000
-        drain_started = monotonic()
-        try:
-            while process is not None and monotonic() < cleanup_deadline:
-                received = drain.step() if drain is not None else False
-                root_exited = process.poll() is not None
-                tree_empty = scope.empty() if scope is not None else False
-                if root_exited and tree_empty and drain is not None and all(drain.eof.values()):
-                    break
-                if not received:
-                    time.sleep(min(.002, max(0, cleanup_deadline - monotonic())))
-        except Exception as exc:
-            errors.append(f"drain_or_exit:{type(exc).__name__}:{exc}")
-        timings["drain_and_exit_ms"] = (monotonic() - drain_started) * 1000
-        close_started = monotonic()
-        try:
-            if process is not None:
-                # FileIO only, no buffered locks or reader threads to join on close.
-                for stream in (process.stdin, process.stdout, process.stderr):
-                    stream.close()
-                pipes_closed = True
-            if scope is not None:
-                scope.close()
-            close_complete = True
-        except Exception as exc:
-            errors.append(f"close:{type(exc).__name__}:{exc}")
-        timings["pipe_and_scope_close_ms"] = (monotonic() - close_started) * 1000
-        cleanup_complete = close_complete and (process is None or (process.poll() is not None and tree_empty
-            and drain is not None and all(drain.eof.values()) and pipes_closed))
-        cleanup_complete = cleanup_complete and monotonic() <= cleanup_deadline
+        cleaned = _bounded_cleanup(process, scope, drain, deadline=cleanup_deadline, monotonic=monotonic)
+        terminated = cleaned["worker_terminated"]
+        tree_empty, pipes_closed = cleaned["tree_empty_observed"], cleaned["pipes_closed"]
+        cleanup_complete = cleaned["cleanup_complete"]
+        errors.extend(cleaned["diagnostics"])
+        timings.update({key: value for key, value in cleaned.items() if key.endswith("_ms")})
         timings["cleanup_ms"] = (monotonic() - io_completed) * 1000
     stdout, stderr = (drain.text("stdout"), drain.text("stderr")) if drain else ("", "")
     decode_started = monotonic()

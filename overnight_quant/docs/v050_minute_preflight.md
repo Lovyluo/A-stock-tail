@@ -87,3 +87,12 @@ Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个�
 错误日期/SHA/计划、缺失/过期材料、时钟失败、清理/当日输出阻断、异常退出/非法或缺失JSON、超时回收均拒绝；拒绝结果交给捕获CLI仍不得派发worker。外部SHA错误、重签派生内容、旧授权与合成提权均拒绝。没有真实行情或NTP，不表示生产最坏耗时、最终性或来源资格得到证明。
 
 下一步为Draft PR审核及受控合并；本轮不合并、不发布、不建任务。qualification=0/3，data_ready=false，hard_gate_authorized=false；records/research_ranking/candidates/tickets/orders=[]。
+# Explicit Local-Preparation Profile
+
+The legacy default remains unchanged. The unactivated
+[MINUTE-OPS-3 candidate](minute_ops3_local_prepare.md) explicitly selects
+`--execution-contract local_prepare_v2` for environment inspection, preparation
+and independent verification. It requires its new plan, v2 preflight and v3
+manual authorization; passing preflight never grants PM approval. Do not mix
+legacy authorization or plans with that path, or treat these commands as a live
+date authorization.

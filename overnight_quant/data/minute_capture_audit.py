@@ -80,6 +80,29 @@ def events_from_result(result):
     return events
 
 
+def pending_preparation_receipts(root):
+    """An interrupted v2 owner leaves an immutable start, never an automatic reset."""
+    pending = []
+    for started in sorted(Path(root).glob("*/wave-*.started.json")):
+        try:
+            raw = started.read_bytes()
+            opening = json.loads(raw)
+            from .minute_local_prepare_contract import check_task
+            check_task(opening["task"])
+            if (started.name != f"wave-{opening['task']['wave']}.started.json"
+                    or started.parent.name != opening["task"]["trade_date"]):
+                raise ValueError("preparation_receipt_path_binding_invalid")
+            closed = json.loads(started.with_name(started.name.replace(".started.json", ".json")).read_bytes())
+            task = dict(closed["result"]["task"])
+            task.pop("launch_root_pid", None)
+            if (closed["result"].get("cleanup_complete") is not True or task != opening["task"]
+                    or closed.get("start_receipt_sha256") != sha256(raw).hexdigest()):
+                raise ValueError("unconfirmed_or_mismatched_cleanup_receipt")
+        except (OSError, ValueError, TypeError, KeyError):
+            pending.append(str(started))
+    return pending
+
+
 def native_label(row):
     value = row.get("datetime")
     if isinstance(value, dict):
@@ -271,6 +294,8 @@ def capture(plan, trade_date, *, authorization, audit_root=AUDIT_ROOT, _test=Non
     cleanup_guard = Path(audit_root) / "cleanup-incomplete.json"
     if cleanup_guard.exists():
         raise ValueError("prior_worker_cleanup_unconfirmed_preserve_guard_no_new_worker")
+    if pending_preparation_receipts(audit_root):
+        raise ValueError("pending_preparation_cleanup_receipt_preserve_no_new_worker")
     # Reject authorization before consuming the permanent single-run intent.
     preflight = (_authorization(authorization, trade_date, plan, current, test_only=bool(_test))
                  if not _test or _test.get("validate_authorization") else None)
