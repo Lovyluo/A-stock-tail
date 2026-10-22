@@ -27,13 +27,14 @@ $fixturePhases = [System.Collections.Generic.List[object]]::new()
 function Set-FixturePhase([string] $Phase) {
     if ($state.ContainsKey("diagnostic_path")) {
         $seconds = [double][System.Diagnostics.Stopwatch]::GetTimestamp() / [System.Diagnostics.Stopwatch]::Frequency
-        $fixturePhases.Add(@{ stage=$Phase; monotonic_seconds=$seconds })
         # Test-temp checkpoint survives parent termination; only failures print it.
         $parentDeadline = $null
         if ($inputValue.PSObject.Properties.Name -contains "deadline_monotonic_seconds") {
             $parentDeadline = [double]$inputValue.deadline_monotonic_seconds
         }
-        @{ test_only=$true; fixture_entry_seconds=$fixtureEntry; parent_deadline_monotonic_seconds=$parentDeadline;
+        $fixturePhases.Add(@{ stage=$Phase; monotonic_seconds=$seconds;
+            deadline_remaining_ms=$(if($null -ne $parentDeadline){($parentDeadline - $seconds) * 1000}else{$null}) })
+        @{ test_only=$true; process_id=$PID; fixture_entry_seconds=$fixtureEntry; parent_deadline_monotonic_seconds=$parentDeadline;
            phases=@($fixturePhases.ToArray()) } |
             ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath $state.diagnostic_path -Encoding UTF8
     }

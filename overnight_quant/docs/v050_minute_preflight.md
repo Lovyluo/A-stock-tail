@@ -62,6 +62,26 @@ $preflightSha = (Get-FileHash -LiteralPath $preflight -Algorithm SHA256).Hash.To
 
 ## 离线验收与停止
 
+### PowerShell文件哈希兼容热修复
+
+PR #40合并后实际Python子进程为Windows PowerShell `5.1.26100.9711`，路径为`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。继承的模块搜索路径优先包含运行时Core版Utility 7.0，后有Windows Desktop版3.1；真实`Get-Command Get-FileHash`返回CommandNotFoundException。直接从PowerShell调用的查询则可发现Desktop命令，不能用该状态代替Python派生路径。原始诊断、异常及两批NO_GO保存在仓库外`local-archive/recovery/v050-preflight-hash-compat-20261021`和既有审计索引；本次不修改任何PATH、PSModulePath、执行策略或系统配置。
+
+环境脚本改用局部`Get-FileSha256`：.NET FileStream流式读取原始文件字节，SHA256输出64位小写hex；文件缺失、共享读取/权限失败或算法失败均抛错，finally释放算法和流。不用空hash补齐，不跳过日志检查；锁仍保全并拒绝，pending/损坏/未知日志仍保全并拒绝。成功环境schema与既有验证规则不变；失败回执增加inspection_succeeded=false和service_check_status，服务尚未查询或查询失败时service_running=null，只有实际Get-Service结果才可为true/false。检查异常始终拒绝，不能把未知状态当通过或当作真实停服。
+
+真实PS5.1/7子进程在隔离harness中屏蔽Get-FileHash，执行实际环境脚本。哈希单测从实际脚本提取同一函数，与Python hashlib独立核对空文件、二进制及非ASCII路径，并验证句柄释放；正常/空目录、pending、损坏/空/二进制日志、锁、文件缺失/拒读及服务查询异常分别覆盖。合成设施只在独立临时目录mock服务/任务/事件，不访问行情或NTP、不写真实协调日志。哈希计算成功不授予预检、PM授权、来源资格或采集许可。
+
+Phase109新增36项，连同Phase108/104/107为185 passed in 116.17s。原正常日志反例2项失败和新测试二进制case ID过长的设施错误均保留；短ID修正不改变测试输入或行为。Python编译/diff及实际只读入口、Draft PR最终CI与恢复SHA索引位于同一仓库外恢复目录，不重复本地全量、不以开发环境只读成功授权捕获。
+
+修复提交后的真实入口仅执行一次：环境查询退出0，两份真实日志均哈希成功、合法且非pending，无workers/tasks/locks/blockers；但完整前置仍以clock_status_query_failed拒绝，因为内层clock_query.exit_code为null。原始W32Time内容显示服务Running、Leap=0及同步错误0，不能用正文代替缺失的进程退出码。该独立兼容阻断保全报告，本轮不扩大哈希修复、不追加真实检查或采集；没有日历/session/NTP测量、捕获worker、任务或资格增加。
+
+### PR #41退出码跟进
+
+独立跟进授权下，使用本地cmd退出7复现PS5.1：不预取Handle时WaitForExit后的ExitCode为空，Refresh不能补回；预持Handle后正确为7。PS7三种路径均为7。检查脚本在有界等待前取得原生Handle，读取真实ExitCode及重定向文件后再Dispose；不把null转0、从正文猜成功或改系统配置。
+
+本机查询保持5秒总预算，单调计时含启动/等待/读取，预留内部500ms用于Kill后的有界退出确认；整体环境10500ms与捕获2000ms均不变，隐藏窗口不变。Phase110实际PS5.1/7→本地Python fixture覆盖0/7、超时/回收、完整stdout/stderr、启动失败及null继续拒绝；所有输入明确合成，零时钟服务/NTP/行情请求。PS7 fixture参数以-u开头导致的绑定错误已保留并修正，不增加生产绕过开关。
+
+旧Phase103 CI失败在coordination_wait、无客户端调用；缺历史持锁者证据，精确根因仍未确认。最多两轮本地诊断，不放宽成功用例或计时；仅增失败时PID/阶段剩余预算/同批peer/回收后的协调日志摘要，不声称收尾快照证明历史锁归属。最终专项、一次真实环境查询和新增一次CI结果以`local-archive/recovery/pr41-exitcode-ci-followup-20261021`为准。若CI再失败报告停止，不重跑求绿；通过也不把未知根因写成已修复。
+
 Phase108实际入口贯通：生成CLI→独立verifier CLI→捕获CLI→4个真实fixture子进程/20个合成bars调用。替换仅在测试harness，不给实际脚本增加skip、任意worker命令或test-only公共CLI开关；真实准入拒绝test-only材料。另以Windows PowerShell5.1/7执行真实环境脚本的隔离mock行为测试，覆盖脚本/带空格路径/`-m`及紧凑模块启动、残留根/后代、无关Python、名称不含AStock的分钟任务、历史Disabled任务与权限拒绝。模块/任务漏识别先复现6项拒绝断言失败，再修复；最终新阶段62项与旧编排59项共121项通过，较早兼容组213项与之重叠，不相加。
 
 错误日期/SHA/计划、缺失/过期材料、时钟失败、清理/当日输出阻断、异常退出/非法或缺失JSON、超时回收均拒绝；拒绝结果交给捕获CLI仍不得派发worker。外部SHA错误、重签派生内容、旧授权与合成提权均拒绝。没有真实行情或NTP，不表示生产最坏耗时、最终性或来源资格得到证明。

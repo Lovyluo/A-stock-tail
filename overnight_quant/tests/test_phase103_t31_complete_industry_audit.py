@@ -110,25 +110,38 @@ def cli_run(tmp_path, capsys, day, context, *, limits=CAPS):
 
 def failure_diagnostics(result, directory):
     details = []
+    journals = []
+    for path in sorted((directory / "http-start-state").glob("*.json")):
+        try:
+            raw = path.read_bytes()
+            state = json.loads(raw.splitlines()[-1])
+            journals.append({"file": path.name, "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw),
+                "pending": state.get("pending"), "last_call_end_seconds": state.get("last_call_end_seconds")})
+        except (OSError, ValueError, IndexError) as exc:
+            journals.append({"file": path.name, "error": type(exc).__name__})
     for row in result.get("request_trace", []):
         if row.get("ok"):
             continue
         path = directory / (row["request_id"] + ".diagnostic.json")
         try:
             stored = json.loads(path.read_text(encoding="utf-8-sig"))
-            checkpoint = {"fixture_entry_seconds": stored.get("fixture_entry_seconds"),
+            checkpoint = {"process_id": stored.get("process_id"), "fixture_entry_seconds": stored.get("fixture_entry_seconds"),
                 "parent_deadline_monotonic_seconds": stored.get("parent_deadline_monotonic_seconds"), "phases": [
-                {"stage": phase.get("stage"), "monotonic_seconds": phase.get("monotonic_seconds")}
+                {"stage": phase.get("stage"), "monotonic_seconds": phase.get("monotonic_seconds"),
+                 "deadline_remaining_ms": phase.get("deadline_remaining_ms")}
                 for phase in stored.get("phases", [])
             ]}
         except (OSError, ValueError):
             checkpoint = {"stage": "UNKNOWN_CHECKPOINT_MISSING_OR_PARTIAL"}
         details.append({**{key: row.get(key) for key in (
-            "request_id", "stage", "request_elapsed_ms", "worker_exit_code", "worker_terminated", "worker_reaped", "error_code",
+            "request_id", "stage", "worker_pid", "request_elapsed_ms", "worker_exit_code", "worker_terminated", "worker_reaped", "error_code",
         )}, "fixture": checkpoint,
             "client_call_seen": (directory / (row["request_id"] + ".call")).exists(),
             "raw_error": (row.get("failure_response") or {}).get("raw_error_message")})
-    return json.dumps({"errors": result.get("errors"), "failed_requests": details}, ensure_ascii=True)
+    peers = [{key: row.get(key) for key in ("request_id", "stage", "worker_pid", "worker_reaped", "request_elapsed_ms")}
+             for row in result.get("request_trace", [])]
+    return json.dumps({"errors": result.get("errors"), "failed_requests": details, "peer_requests": peers,
+        "coordinator_logs": journals, "journal_snapshot_semantics": "after_reaping_not_historical_lock_owner"}, ensure_ascii=True)
 
 
 @pytest.mark.parametrize("page_case,count", [("single", 13), ("full", 16), ("reserved_unused", 13)])
@@ -227,6 +240,19 @@ def test_failure_diagnostic_is_compact_and_does_not_dump_response(tmp_path):
     value = json.loads(message)["failed_requests"][0]
     assert value["request_id"] == "request" and value["stage"] == "mapping"
     assert value["worker_terminated"] and value["fixture"]["phases"][0]["stage"] == "fixture_assembly_load"
+
+
+def test_failure_diagnostics_report_coordination_without_inventing_lock_owner(tmp_path):
+    folder = tmp_path / "http-start-state"
+    folder.mkdir()
+    raw = (json.dumps({"pending": True, "last_call_end_seconds": 1.5,
+                       "body": "must-not-print"}) + "\n").encode()
+    (folder / "synthetic.json").write_bytes(raw)
+    value = json.loads(failure_diagnostics({"errors": ["timeout"], "request_trace": []}, tmp_path))
+    assert value["coordinator_logs"][0]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert value["coordinator_logs"][0]["pending"] is True
+    assert value["journal_snapshot_semantics"] == "after_reaping_not_historical_lock_owner"
+    assert "must-not-print" not in json.dumps(value)
 
 
 @pytest.mark.parametrize("bad", ["page_limit", "duplicate", "missing_member", "total_drift", "worker_failed"])
