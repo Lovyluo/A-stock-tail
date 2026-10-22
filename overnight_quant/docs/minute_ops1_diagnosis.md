@@ -101,13 +101,12 @@ normal exit. A local socket fixture cannot bound those real network stages, and
 the historical first call had only 113ms left. This PR does not claim to make
 that budget feasible or schedule another real attempt to prove it.
 
-The smallest separate contract proposal is a bounded per-wave pre-start /
-pre-connect phase, with its own absolute deadline, connection age and failure
-policy explicitly approved by PM. Request times/counts, no reconnect/fallback
-and window cleanup rules would remain explicit. That moves real cost into a
-new audited execution phase, not out of accounting, and is **not implemented or
-authorized here**. Persistent or cross-wave workers and budget changes are also
-outside this fix. Await PM's decision; do not supplement today's waves.
+The subsequent [MINUTE-OPS-2 proposal](minute_ops2_ci_and_contract.md) narrows
+this to bounded **pure-local** per-wave preparation, with network connection and
+all handshakes forbidden until the original target. It replaces the earlier
+pre-connect suggestion, is not implemented or authorized, and needs a new
+explicit contract approval. Persistent/cross-wave workers and budget changes
+remain outside this fix. Do not supplement today's waves.
 
 Qualification stays 0/3; data_ready=false, hard_gate_authorized=false. Formal
 records, research ranking, candidates, tickets and orders remain empty.
