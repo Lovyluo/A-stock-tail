@@ -42,8 +42,11 @@ function global:Get-CimInstance {
     }
     if ($ClassName -eq 'Win32_OperatingSystem') { return [pscustomobject]@{LastBootUpTime=[datetime]::Parse('2026-10-15T04:00:00+08:00')} }
     if ($MinuteCapture -and $ClassName -eq 'Win32_Process') {
-        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact')) {
+        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact','prepared-worker','prepared-cli','prepared-module')) {
             $command = if($Mode -eq 'worker') {'python -m overnight_quant.data.minute_capture_worker'} `
+                elseif($Mode -eq 'prepared-worker') {'python -m overnight_quant.data.minute_local_prepare_worker'} `
+                elseif($Mode -eq 'prepared-cli') {'python overnight_quant/scripts/run_minute_local_prepare_audit.py --network'} `
+                elseif($Mode -eq 'prepared-module') {'python -movernight_quant.scripts.run_minute_local_prepare_audit --network'} `
                 elseif($Mode -eq 'cli') {'python overnight_quant/scripts/run_minute_capture_audit.py --network'} `
                 elseif($Mode -eq 'module-cli') {'python -m overnight_quant.scripts.run_minute_capture_audit --network'} `
                 elseif($Mode -eq 'module-cli-compact') {'python -movernight_quant.scripts.run_minute_capture_audit --network'} `
@@ -62,11 +65,13 @@ function global:Get-ScheduledTask {
         return [pscustomobject]@{TaskPath='\';TaskName='AStockHistoricalDisabled';State='Disabled';
             Settings=[pscustomobject]@{Enabled=$false};Actions=@()}
     }
-    if ($Mode -in @('minute-task','minute-task-disabled')) {
-        return [pscustomobject]@{TaskPath='\';TaskName='DailyMinuteCapture';
+    if ($Mode -in @('minute-task','minute-task-disabled','prepared-task')) {
+        return [pscustomobject]@{TaskPath='\';TaskName=$(if($Mode -eq 'prepared-task'){'OrdinaryResearch'}else{'DailyMinuteCapture'});
             State=$(if($Mode -eq 'minute-task'){'Ready'}else{'Disabled'});
-            Settings=[pscustomobject]@{Enabled=($Mode -eq 'minute-task')};
-            Actions=@([pscustomobject]@{Execute='python.exe';Arguments='-m overnight_quant.scripts.run_minute_capture_audit';WorkingDirectory=''})}
+            Settings=[pscustomobject]@{Enabled=($Mode -in @('minute-task','prepared-task'))};
+            Actions=@([pscustomobject]@{Execute='python.exe';
+                Arguments=$(if($Mode -eq 'prepared-task'){'-m overnight_quant.scripts.run_minute_local_prepare_audit'}else{'-m overnight_quant.scripts.run_minute_capture_audit'});
+                WorkingDirectory=''})}
     }
 }
 function global:Get-WinEvent {

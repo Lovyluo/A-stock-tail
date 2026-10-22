@@ -27,6 +27,22 @@ function Write-Result($Path,$Value) {
     $f = [IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
     try { $f.Write($bytes,0,$bytes.Length);$f.Flush($true) } finally { $f.Dispose() }
 }
+function Test-EquivalentJson($Left,$Right) {
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+    if ($Left -is [pscustomobject] -and $Right -is [pscustomobject]) {
+        $a = @($Left.PSObject.Properties.Name | Sort-Object)
+        $b = @($Right.PSObject.Properties.Name | Sort-Object)
+        if (($a -join "`n") -cne ($b -join "`n")) { return $false }
+        foreach ($name in $a) { if (!(Test-EquivalentJson $Left.$name $Right.$name)) { return $false } }
+        return $true
+    }
+    if ($Left -is [array] -and $Right -is [array]) {
+        if ($Left.Count -ne $Right.Count) { return $false }
+        for ($i=0;$i -lt $Left.Count;$i++) { if (!(Test-EquivalentJson $Left[$i] $Right[$i])) { return $false } }
+        return $true
+    }
+    return $Left.Equals($Right)
+}
 try {
     if ($MinuteCapture) {
         [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -49,10 +65,10 @@ try {
         if (!$ProjectRoot -or !$MinuteCaptureRoot -or !$TradeDate) { throw 'Minute environment arguments missing' }
         # Match actual entry/module tokens, not every Python process or a word in a note.
         $pattern = '(?:[\\/]|^|[\s"])' +
-            '(?:run_minute_capture_audit|minute_capture_worker|minute_probe_worker|run_minute_probe_watchdog|' +
+            '(?:run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|' +
             'run_market_source_validation|run_complete_industry_audit|market_source_worker)\.(?:py|ps1)(?:["\s]|$)' +
-            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_capture_worker|minute_probe_worker|market_source_worker)' +
-            '|scripts\.(?:run_minute_capture_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
+            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)' +
+            '|scripts\.(?:run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
             '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
         $ids = @($allProcesses | Where-Object {
             $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
@@ -70,10 +86,36 @@ try {
         $_.TaskName -match 'AStock|A-stock|MarketSource|IndustryAudit' -or
         (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'A-stock|market_source|complete_industry' -or
         ($MinuteCapture -and ($_.TaskName -match 'MinuteCapture' -or
-            (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture'))
+            (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture|minute_local_prepare'))
     } | ForEach-Object { [ordered]@{TaskPath=$_.TaskPath;TaskName=$_.TaskName;State=[string]$_.State;Enabled=[bool]$_.Settings.Enabled} })
     if ($workers.Count) { $issues += 'Residual worker present' }
     if (@($tasks | Where-Object { $_.Enabled -or $_.State -eq 'Running' }).Count) { $issues += 'Active project task present' }
+    $pendingPreparations = @()
+    if ($MinuteCapture -and (Test-Path -LiteralPath $MinuteCaptureRoot)) {
+        foreach ($dir in Get-ChildItem -LiteralPath $MinuteCaptureRoot -Directory -ErrorAction Stop) {
+            foreach ($started in Get-ChildItem -LiteralPath $dir.FullName -Filter 'wave-*.started.json' -File -ErrorAction Stop) {
+                try {
+                    $opening = Get-Content -LiteralPath $started.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($opening.task.worker_version -cne 'mootdx_local_prepare_worker_v2' -or
+                        $opening.task.code_sha -notmatch '^[0-9a-f]{40}$' -or
+                        $opening.task.plan_hash -notmatch '^[0-9a-f]{64}$' -or
+                        !$opening.task.batch_id -or ($opening.task.wave -isnot [int] -and $opening.task.wave -isnot [long]) -or
+                        $opening.task.wave -lt 0 -or $opening.task.wave -gt 3 -or
+                        $dir.Name -cne $opening.task.trade_date -or
+                        $started.Name -cne "wave-$($opening.task.wave).started.json") { throw 'Unknown preparation receipt identity' }
+                    $closingPath = Join-Path $dir.FullName $started.Name.Replace('.started.json','.json')
+                    $closing = Get-Content -LiteralPath $closingPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                    $closedTask = $closing.result.task | Select-Object * -ExcludeProperty launch_root_pid
+                    if ($closing.result.cleanup_complete -isnot [bool] -or !$closing.result.cleanup_complete -or
+                        $closing.start_receipt_sha256 -cne (Get-FileSha256 $started.FullName) -or
+                        !(Test-EquivalentJson $opening.task $closedTask)) { throw 'Unconfirmed cleanup receipt' }
+                } catch {
+                    $pendingPreparations += $started.FullName
+                    $issues += "Pending minute preparation receipt: $($started.FullName)"
+                }
+            }
+        }
+    }
     $locks = @()
     $journals = @()
     $temp = [IO.Path]::GetTempPath()
@@ -145,6 +187,7 @@ try {
         $record.capture_root = [IO.Path]::GetFullPath($MinuteCaptureRoot)
         $record.cleanup_incomplete_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot 'cleanup-incomplete.json')
         $record.date_output_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot $TradeDate)
+        $record.pending_preparations = $pendingPreparations
         $record.git_head = (& git -C $ProjectRoot rev-parse HEAD | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) { throw 'Git HEAD query failed' }
         $record.git_status = @(& git -C $ProjectRoot status --porcelain=v1)

@@ -29,6 +29,15 @@ CHECKS = frozenset({"correct_date", "fixed_head", "clean_worktree", "environment
     "service_clock_contract", "source_unchanged", "one_fresh_measurement", "real_dual_contracts"})
 
 
+def execution_profile(name="legacy_v1"):
+    if name == "legacy_v1":
+        return audit, VERSION, VERIFIER
+    if name == "local_prepare_v2":
+        from . import minute_local_prepare_contract as prepared
+        return prepared, prepared.PREFLIGHT_VERSION, prepared.PREFLIGHT_VERIFIER
+    raise ValueError("unknown_minute_execution_contract")
+
+
 def now():
     return datetime.now(audit.CN)
 
@@ -136,13 +145,14 @@ def _reject_test(value):
             _reject_test(child)
 
 
-def _basic(trade_date, approved_sha, plan_ref, current):
+def _basic(trade_date, approved_sha, plan_ref, current, *, execution_contract="legacy_v1"):
     if current.utcoffset() != timedelta(hours=8) or current.date().isoformat() != trade_date:
         raise ValueError("current_date_or_timezone_mismatch")
     if not re.fullmatch(r"[0-9a-f]{40}", approved_sha):
         raise ValueError("approved_code_sha_invalid")
     plan = read(plan_ref)
-    audit.check_plan(plan)
+    profile, _, _ = execution_profile(execution_contract)
+    profile.check_plan(plan)
     for package, expected in plan["client_versions"].items():
         try:
             actual = installed_version(package)
@@ -150,7 +160,10 @@ def _basic(trade_date, approved_sha, plan_ref, current):
             raise ValueError("frozen_client_package_missing:" + package) from exc
         if actual != expected:
             raise ValueError("frozen_client_version_mismatch:" + package)
-    if current >= stamp(f"{trade_date}T{audit.CLOCKS[0]}+08:00"):
+    first_start = stamp(f"{trade_date}T{audit.CLOCKS[0]}+08:00")
+    if execution_contract == "local_prepare_v2":
+        first_start -= timedelta(seconds=5)
+    if current >= first_start:
         raise ValueError("first_observation_window_already_started")
     return plan
 
@@ -179,8 +192,9 @@ def _environment(reference, trade_date, approved_sha, root, current, test_only):
     return environment, status
 
 
-def evaluate(inputs, trade_date, approved_sha, root, current, *, test_only=False):
-    plan = _basic(trade_date, approved_sha, inputs["plan"], current)
+def evaluate(inputs, trade_date, approved_sha, root, current, *, test_only=False, execution_contract="legacy_v1"):
+    plan = _basic(trade_date, approved_sha, inputs["plan"], current, execution_contract=execution_contract)
+    profile, _, _ = execution_profile(execution_contract)
     environment, service = _environment(inputs["environment"], trade_date, approved_sha, root, current, test_only)
     baseline, before_service = _environment(inputs["before_environment"], trade_date, approved_sha, root,
                                            stamp(_query_record(inputs["before_environment"])["checked_at"]), test_only)
@@ -219,7 +233,7 @@ def evaluate(inputs, trade_date, approved_sha, root, current, *, test_only=False
         "environment": not any(environment[key] for key in ("workers", "locks", "blockers", "clock_or_power_events")),
         "no_reboot_or_service_restart": environment["service_process_id"] == baseline["service_process_id"]
             and environment["system_boot_time"] == baseline["system_boot_time"],
-        "frozen_plan": plan == audit.frozen_plan(),
+        "frozen_plan": plan == profile.frozen_plan(),
         "plan_file_anchor": ref(inputs["plan"]["path"])["sha256"] == inputs["plan"]["sha256"],
         "unused_outputs": environment["cleanup_incomplete_exists"] is False and environment["date_output_exists"] is False,
         "service_clock_contract": environment["service_running"] is True and service["leap"] == service["error"] == 0
@@ -258,19 +272,21 @@ def _query(output, trade_date, root, prepared_at, *, test=None):
     return ref(output / "environment-query.json")
 
 
-def prepare(*, trade_date, approved_sha, plan_ref, output, inputs=None, environment_only=False, _test=None):
+def prepare(*, trade_date, approved_sha, plan_ref, output, inputs=None, environment_only=False,
+            execution_contract="legacy_v1", _test=None):
     """Private injection is only used by the isolated harness, never a CLI option."""
+    _, schema, verifier = execution_profile(execution_contract)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     clock = _test["clock"] if _test else now
     root = _test["root"] if _test else ROOT
     current = clock()
-    result = audit.safe(schema=VERSION, verifier=VERIFIER, status="MINUTE_PREFLIGHT_NO_GO",
+    result = audit.safe(schema=schema, verifier=verifier, status="MINUTE_PREFLIGHT_NO_GO",
                         test_only=bool(_test), code_sha=approved_sha, trade_date=trade_date, project_root=str(root),
                         started_at=current.isoformat(), checks={}, failure_reasons=[], inputs={"plan": plan_ref},
                         pm_approval_generated=False, capture_started=False, network_requests_made=0, ntp_measurements=0)
     try:
-        _basic(trade_date, approved_sha, plan_ref, current)
+        _basic(trade_date, approved_sha, plan_ref, current, execution_contract=execution_contract)
         result["runtime"] = {"executable": sys.executable, "python_version": sys.version,
                              "packages": {key: installed_version(key) for key in ("mootdx", "tdxpy")}}
         query_ref = _query(output, trade_date, root, current.isoformat() if environment_only else
@@ -283,7 +299,7 @@ def prepare(*, trade_date, approved_sha, plan_ref, output, inputs=None, environm
             result["inputs"].update(inputs)
             result["checked_at"] = clock().isoformat()
             result["evaluation"] = evaluate(result["inputs"], trade_date, approved_sha, root,
-                                             stamp(result["checked_at"]), test_only=bool(_test))
+                stamp(result["checked_at"]), test_only=bool(_test), execution_contract=execution_contract)
             result["checks"] = result["evaluation"]["checks"]
             result["status"] = "MINUTE_PREFLIGHT_PASSED_NOT_AUTHORIZED"
     except (OSError, ValueError, KeyError, TypeError, UnicodeError, OverflowError) as exc:
@@ -295,12 +311,14 @@ def prepare(*, trade_date, approved_sha, plan_ref, output, inputs=None, environm
     return result, path
 
 
-def verify_file(path, expected_sha, *, trade_date, approved_sha, current=None, root=None, _test_only=False):
+def verify_file(path, expected_sha, *, trade_date, approved_sha, current=None, root=None,
+                execution_contract="legacy_v1", _test_only=False):
     """Re-read anchored raw inputs and recompute; internal re-signing grants no authority."""
+    _, schema, verifier = execution_profile(execution_contract)
     errors, evaluation = [], None
     try:
         value = audit.read_anchored(path, expected_sha)
-        if value.get("schema") != VERSION or value.get("verifier") != VERIFIER:
+        if value.get("schema") != schema or value.get("verifier") != verifier:
             raise ValueError("minute_preflight_schema_rejected_legacy_audit_only")
         if value.get("test_only") is not _test_only:
             raise ValueError("preflight_scope_mismatch")
@@ -315,14 +333,15 @@ def verify_file(path, expected_sha, *, trade_date, approved_sha, current=None, r
             if value.get(key) != safe_value:
                 raise ValueError("unsafe_preflight_output:" + key)
         checked = stamp(value["checked_at"])
-        evaluation = evaluate(value["inputs"], trade_date, approved_sha, root or ROOT, checked, test_only=_test_only)
+        evaluation = evaluate(value["inputs"], trade_date, approved_sha, root or ROOT, checked,
+                              test_only=_test_only, execution_contract=execution_contract)
         if value.get("evaluation") != evaluation or value.get("checks") != evaluation["checks"]:
             raise ValueError("preflight_derived_checks_mismatch")
         fresh_at(value, current or now())
     except (OSError, ValueError, KeyError, TypeError, UnicodeError, OverflowError) as exc:
         errors.append(f"{type(exc).__name__}:{exc}")
     return audit.safe(status="MINUTE_PREFLIGHT_VERIFIED_NOT_AUTHORIZED" if not errors else "MINUTE_PREFLIGHT_INVALID",
-                      integrity_verified=not errors, verifier=VERIFIER, errors=errors, evaluation=evaluation,
+                      integrity_verified=not errors, verifier=verifier, errors=errors, evaluation=evaluation,
                       test_only=_test_only, pm_approval_generated=False, capture_started=False)
 
 
