@@ -34,6 +34,8 @@
 
 ## 无日期冻结候选计划
 
+MINUTE-OPS-1离线诊断及最小加固见[阶段报告](minute_ops1_diagnosis.md)。固定依赖的本地配置加载原有隐式选点分支已在此隔离worker中封堵；错误配置直接拒绝，不生成配置或扫描节点。新增异常链及同worker阶段计时仅作诊断，不改变原始字段、完整性/资格判定、执行计划或截止。真实TCP及冷启动总预算仍为`CAPTURE_BUDGET_FEASIBILITY_UNPROVEN`，不得把本地fixture通过作为执行授权或延长当前预算。
+
 | 阶段 | 请求、依赖与最坏预算（待审核，不是执行许可） |
 | --- | --- |
 | 前置 | 人工批准日期/代码SHA/计划hash；当日日历、session、环境与时钟预检必须先核验，不占用到点后的工作预算。计划文件自身trade_date=null/execution_authorized=false |

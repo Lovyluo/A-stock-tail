@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from datetime import date, datetime, timezone, timedelta
 from hashlib import sha256
 import json
 import math
+from pathlib import Path
 import sys
 import time
+import traceback
 
 CODES = ("000001", "000333", "600000", "600519", "601318")
 ENDPOINT = {"host": "59.36.5.11", "port": 7709,
@@ -29,6 +32,46 @@ def now():
     return datetime.now(CN).isoformat(timespec="microseconds")
 
 
+def exception_chain(exc):
+    chain, seen = [], set()
+    relation = "raised"
+    while isinstance(exc, BaseException) and id(exc) not in seen and len(chain) < 8:
+        seen.add(id(exc))
+        chain.append({"relation": relation,
+                      "type": f"{type(exc).__module__}.{type(exc).__name__}",
+                      "message": str(exc)[:512],
+                      "frames": [{"file": Path(frame.filename).name, "line": frame.lineno,
+                                  "function": frame.name}
+                                 for frame in traceback.extract_tb(exc.__traceback__, limit=-8)]})
+        original = getattr(exc, "original_exception", None)
+        if isinstance(original, BaseException):
+            exc, relation = original, "original_exception"
+        elif exc.__cause__ is not None:
+            exc, relation = exc.__cause__, "cause"
+        elif not exc.__suppress_context__:
+            exc, relation = exc.__context__, "context"
+        else:
+            break
+    return chain
+
+
+@contextmanager
+def client_stage(emit, stage):
+    started = time.perf_counter()
+    emit({"kind": "client_stage", "stage": stage, "state": "started",
+          "at": now(), "monotonic": started})
+    try:
+        yield
+    except BaseException as exc:
+        emit({"kind": "client_stage", "stage": stage, "state": "failed", "at": now(),
+              "monotonic": time.perf_counter(), "elapsed_ms": (time.perf_counter() - started) * 1000,
+              "exception_chain": exception_chain(exc)})
+        raise
+    else:
+        emit({"kind": "client_stage", "stage": stage, "state": "completed", "at": now(),
+              "monotonic": time.perf_counter(), "elapsed_ms": (time.perf_counter() - started) * 1000})
+
+
 def json_value(value):
     if value is None or type(value) in (str, bool, int):
         return value
@@ -47,12 +90,16 @@ def json_value(value):
 
 
 class NativeClient:
-    def __init__(self):
-        from importlib.metadata import version
-        if version("mootdx") != "0.11.7" or version("tdxpy") != "0.2.7":
-            raise ValueError("native_client_version_mismatch")
-        from tdxpy.parser.std.get_security_bars import GetSecurityBarsCmd
-        from mootdx.quotes import Quotes
+    def __init__(self, *, emit=None):
+        emit = emit or (lambda value: print(encoded(value), flush=True))
+        with client_stage(emit, "dependency_versions"):
+            from importlib.metadata import version
+            if version("mootdx") != "0.11.7" or version("tdxpy") != "0.2.7":
+                raise ValueError("native_client_version_mismatch")
+        with client_stage(emit, "dependency_imports"):
+            from tdxpy.parser.std.get_security_bars import GetSecurityBarsCmd
+            from mootdx.quotes import Quotes
+            from mootdx import config
         self.bodies = []
         self.body_times = []
         self.parser = GetSecurityBarsCmd
@@ -65,13 +112,35 @@ class NativeClient:
             return original(parser, body)
 
         self.parser.parseResponse = capture
+        original_setup = config.setup
+
+        def local_config_only():
+            # The vendor loader scans servers on missing/corrupt configuration,
+            # even when Quotes.factory(bestip=False). Never enter that fallback.
+            try:
+                raw = Path(config.CONF).read_bytes()
+                options = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ValueError("native_local_config_unavailable_no_discovery") from exc
+            if (not isinstance(options, dict) or not isinstance(options.get("SERVER"), dict)
+                    or not isinstance(options["SERVER"].get("HQ"), list) or not options["SERVER"]["HQ"]):
+                raise ValueError("native_local_config_invalid_no_discovery")
+            config.settings.update(options)
+            emit({"kind": "client_config", "raw_hash": sha256(raw).hexdigest(),
+                  "automatic_discovery_allowed": False})
+            return True
+
         try:
-            self.client = Quotes.factory(market="std", server=(ENDPOINT["host"], ENDPOINT["port"]),
-                                         bestip=False, heartbeat=False, auto_retry=False,
-                                         raise_exception=True, timeout=2.0)
+            config.setup = local_config_only
+            with client_stage(emit, "factory_config_connect_handshake"):
+                self.client = Quotes.factory(market="std", server=(ENDPOINT["host"], ENDPOINT["port"]),
+                                             bestip=False, heartbeat=False, auto_retry=False,
+                                             raise_exception=True, timeout=2.0)
         except BaseException:
             self.parser.parseResponse = self.original
             raise
+        finally:
+            config.setup = original_setup
 
     def bars(self, **request):
         self.bodies.clear()
@@ -100,7 +169,7 @@ def capture_wave(task, *, client_factory=NativeClient, emit=None):
     try:
         if time.perf_counter() >= deadline:
             raise TimeoutError("wave_budget_exhausted_before_client")
-        client = client_factory()
+        client = client_factory(emit=emit) if client_factory is NativeClient else client_factory()
         emit({"kind": "client_ready", "at": now(), "monotonic": time.perf_counter()})
         for code in CODES:
             if time.perf_counter() >= deadline:
@@ -141,6 +210,9 @@ def capture_wave(task, *, client_factory=NativeClient, emit=None):
             except Exception as exc:
                 emit({**receipt, "kind": "request_failed", "completed_at": now(),
                       "error_type": type(exc).__name__, "error": str(exc),
+                      "failed_monotonic": time.perf_counter(),
+                      "remaining_io_ms_at_failure": max(0, (deadline - time.perf_counter()) * 1000),
+                      "exception_chain": exception_chain(exc),
                       "wire_bodies": [{"base64": base64.b64encode(b).decode("ascii"),
                                        "sha256": sha256(b).hexdigest(), "size": len(b)}
                                       for b in client.bodies]})
@@ -148,7 +220,8 @@ def capture_wave(task, *, client_factory=NativeClient, emit=None):
         return {"network_requests_made": called, "completed_at": now(), "worker_version": VERSION}
     finally:
         if client is not None:
-            client.close()
+            with client_stage(emit, "client_close"):
+                client.close()
 
 
 def main():
@@ -159,7 +232,8 @@ def main():
         return 0
     except Exception as exc:
         print(encoded({"ok": False, "error_code": "MINUTE_CAPTURE_WORKER_FAILED",
-                       "error": f"{type(exc).__name__}:{exc}"}), flush=True)
+                       "error": f"{type(exc).__name__}:{exc}",
+                       "exception_chain": exception_chain(exc)}), flush=True)
         return 2
 
 

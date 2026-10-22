@@ -1,10 +1,12 @@
 """Real isolated PowerShell/HttpClient calls to an in-memory handler, no internet."""
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -27,17 +29,74 @@ def test_python_and_dotnet_monotonic_counters_share_windows_epoch():
     assert before <= float(value.strip()) <= after
 
 
-def _spawn(tmp, key, **scenario):
+def _spawn(tmp, key, *, _processes=None, **scenario):
     marker = tmp / f"{key}.call"
     payload = {"test_only": True, "url": "https://push2.eastmoney.com/test-only",
                "http_start_state_directory": str(tmp / "state"),
-               "test_response": {"call_marker": str(marker), **scenario}}
+               "test_response": {"call_marker": str(marker),
+                                 "diagnostic_path": str(tmp / f"{key}.diagnostic.json"), **scenario}}
+    started = time.perf_counter()
     p = subprocess.Popen(COMMAND, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
+    if _processes is not None:
+        _processes.append((p, tmp, key, started))
     p.stdin.write(json.dumps(payload))
     p.stdin.close()
     p.stdin = None
     return p, marker
+
+
+@contextmanager
+def _client_process_scope(processes):
+    try:
+        yield
+    finally:
+        # A failed ready barrier must not leave clients waiting for release in
+        # later tests. These in-memory handlers never create descendant workers.
+        deadline = time.perf_counter() + 5
+        failures = []
+        for process, directory, key, started in processes:
+            was_alive = process.poll() is None
+            if was_alive:
+                process.kill()
+            try:
+                stdout, stderr = process.communicate(timeout=max(.001, deadline - time.perf_counter()))
+            except subprocess.TimeoutExpired:
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                failures.append({"request_id": key, "pid": process.pid,
+                                 "stage": "fixture_cleanup_incomplete", "returncode": process.poll()})
+                continue
+            phase_path = directory / f"{key}.diagnostic.json"
+            try:
+                phases = json.loads(phase_path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as exc:
+                # Termination can interrupt a checkpoint write. A diagnostic
+                # read failure must not prevent the other clients being reaped.
+                phases = {"diagnostic_read_error": f"{type(exc).__name__}:{exc}"}
+            details = {"test_only": True, "request_id": key, "pid": process.pid,
+                       "elapsed_ms": (time.perf_counter() - started) * 1000,
+                       "terminated_at_teardown": was_alive, "returncode": process.returncode,
+                       "phases": phases, "stdout": stdout, "stderr": stderr}
+            (directory / f"{key}.process.json").write_text(json.dumps(details, indent=2), encoding="utf-8")
+            if was_alive or process.returncode != 0:
+                # Only failures print fixture metadata, never market responses.
+                print("PHASE101_CLIENT_FAILURE " + json.dumps(details, ensure_ascii=True))
+        assert not failures, failures
+
+
+@pytest.fixture(autouse=True)
+def isolated_client_processes(monkeypatch):
+    original = _spawn
+    processes = []
+
+    def tracked_spawn(tmp, key, **scenario):
+        return original(tmp, key, _processes=processes, **scenario)
+
+    monkeypatch.setattr(sys.modules[__name__], "_spawn", tracked_spawn)
+    with _client_process_scope(processes):
+        yield original
 
 
 def _finish(process):
@@ -50,7 +109,9 @@ def _barrier(tmp, count=2):
     end = time.perf_counter() + 15
     while len(list(tmp.glob("*.ready"))) < count and time.perf_counter() < end:
         time.sleep(.01)
-    assert len(list(tmp.glob("*.ready"))) == count
+    diagnostics = {path.name: json.loads(path.read_text(encoding="utf-8-sig"))
+                   for path in tmp.glob("*.diagnostic.json")}
+    assert len(list(tmp.glob("*.ready"))) == count, diagnostics
     (tmp / "release").touch()
 
 
@@ -74,6 +135,34 @@ def test_three_competing_clients_do_not_burst(tmp_path):
     assert all(r["ok"] for r in results), results
     starts = sorted(float(marker.read_text()) for _, marker in processes)
     assert all(b - a >= .5 for a, b in zip(starts, starts[1:]))
+
+
+@pytest.mark.parametrize("corrupt_checkpoint", [False, True])
+def test_failed_ready_barrier_scope_reaps_real_client_and_retains_diagnostics(
+        tmp_path, isolated_client_processes, corrupt_checkpoint):
+    processes = []
+    # Use the original implementation so this explicitly exercises nested
+    # failure cleanup, independently of the enclosing autouse fixture.
+    with pytest.raises(RuntimeError, match="synthetic_barrier_failure"):
+        with _client_process_scope(processes):
+            process, marker = isolated_client_processes(
+                tmp_path, "unreleased", _processes=processes,
+                ready_marker=str(tmp_path / "unreleased.ready"), release_marker=str(tmp_path / "never-release"))
+            deadline = time.perf_counter() + 15
+            while not (tmp_path / "unreleased.ready").exists() and time.perf_counter() < deadline:
+                time.sleep(.01)
+            assert (tmp_path / "unreleased.ready").exists()
+            if corrupt_checkpoint:
+                (tmp_path / "unreleased.diagnostic.json").write_text("{interrupted", encoding="utf-8")
+            raise RuntimeError("synthetic_barrier_failure")
+    assert process.poll() is not None and not marker.exists()
+    assert process.stdout.closed and process.stderr.closed
+    saved = json.loads((tmp_path / "unreleased.process.json").read_bytes())
+    assert saved["terminated_at_teardown"] is True
+    if corrupt_checkpoint:
+        assert saved["phases"]["diagnostic_read_error"].startswith("JSONDecodeError:")
+    else:
+        assert saved["phases"]["phases"][-1]["stage"] == "fixture_initialized"
 
 
 def test_wait_exhausts_budget_zero_http_calls_then_no_burst(tmp_path):
@@ -156,7 +245,7 @@ def test_killed_client_pending_marker_prevents_subsequent_call(tmp_path):
     finally:
         if p.poll() is None:
             p.kill()
-            p.communicate()
+            p.communicate(timeout=5)
 
 
 def test_torn_post_call_journal_never_allows_a_new_http_call(tmp_path):
