@@ -238,7 +238,7 @@ def test_legal_failed_capture_preserves_integrity_and_double_replay(captured, tm
 def test_v1_integrity_audit_does_not_authorize_current_plan(captured):
     value = deepcopy(captured)
     old = contract.frozen_plan(audit_only_v1=True)
-    value.update(verifier=contract.AUDIT_ONLY_VERIFIER_VERSION, plan=old)
+    value.update(schema="mootdx_protocol_diagnostic_evidence_v1", verifier=contract.AUDIT_ONLY_VERIFIER_VERSION, plan=old)
     result = value["result"]
     result["task"]["plan_hash"] = old["plan_hash"]
     result["task_hash"] = store.digest(result["task"])

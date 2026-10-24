@@ -18,12 +18,13 @@ def main(argv=None):
     mode.add_argument("--verify", type=Path)
     mode.add_argument("--validate-only", action="store_true")
     parser.add_argument("--date")
+    parser.add_argument("--target-at")
     parser.add_argument("--approved-code-sha")
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--expected-file-sha256")
-    parser.add_argument("--execution-contract", choices=("legacy_v1", "local_prepare_v2"), default="legacy_v1")
+    parser.add_argument("--execution-contract", choices=("legacy_v1", "local_prepare_v2", "single_bars_protocol_diagnostic_v1"), default="legacy_v1")
     for name in ("calendar", "session", "before-environment", "clock-raw"):
         parser.add_argument("--" + name, type=Path)
         parser.add_argument("--" + name + "-sha256")
@@ -33,7 +34,8 @@ def main(argv=None):
             if not args.date or not args.approved_code_sha:
                 raise ValueError("explicit_date_and_approved_code_required")
             result = preflight.verify_file(args.verify, args.expected_file_sha256,
-                trade_date=args.date, approved_sha=args.approved_code_sha, execution_contract=args.execution_contract)
+                trade_date=args.date, approved_sha=args.approved_code_sha, execution_contract=args.execution_contract,
+                target_at=args.target_at)
             code = 0 if result["integrity_verified"] else 2
         elif not args.prepare and not args.inspect_environment:
             if args.plan:
@@ -56,7 +58,7 @@ def main(argv=None):
             result, path = preflight.prepare(trade_date=args.date, approved_sha=args.approved_code_sha,
                 plan_ref={"path": str(args.plan.resolve()), "sha256": args.expected_plan_sha256},
                 output=args.output_dir, inputs=inputs, environment_only=args.inspect_environment,
-                execution_contract=args.execution_contract)
+                execution_contract=args.execution_contract, target_at=args.target_at)
             result = {**result, "result_path": str(path)}
             code = 2 if result["status"] == "MINUTE_PREFLIGHT_NO_GO" else 0
     except (OSError, ValueError, KeyError, TypeError) as exc:

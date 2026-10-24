@@ -227,7 +227,7 @@ def test_real_child_prepare_GO_capture_and_bounded_cleanup(tmp_path, mode):
             cli = subprocess.run([sys.executable, str(CLI), "--verify", str(path),
                 "--expected-file-sha256", anchor, "--replay-output", str(replay)],
                 capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            assert cli.returncode == (0 if mode == "complete" else 2), cli.stderr
+            assert cli.returncode == 2, cli.stderr  # Raw component alone has no authorization/seal proof.
             assert sha256(path.read_bytes()).hexdigest() == anchor
             replays.append(replay.read_bytes())
         assert replays[0] == replays[1]
@@ -277,9 +277,7 @@ def test_default_and_validate_only_cli_never_start_workers(tmp_path, monkeypatch
     assert contract.frozen_plan()["codes"] == ["000001"]
     assert legacy.frozen_plan()["bars_requests_total"] == 20
     assert 'source_requests' in capsys.readouterr().out
-    with pytest.raises(SystemExit) as stopped:
-        main(["--network"])
-    assert stopped.value.code == 2  # no real-network route is shipped in this draft
+    assert main(["--network"]) == 2  # Explicit mode alone never grants authorization.
 
 
 def test_old_authorization_plan_and_tasks_cannot_select_diagnostic(tmp_path):

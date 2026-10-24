@@ -21,11 +21,11 @@ class SealWriteError(RuntimeError):
         super().__init__(f"seal_write_unconfirmed:{stage}:{type(error).__name__}:{error}")
 
 
-def binding(evidence, file_sha):
+def binding(evidence, file_sha, *, profile=contract):
     return {"batch_id": evidence["batch_id"], "trade_date": evidence["trade_date"],
         "code_sha": evidence["code_sha"], "plan_hash": evidence["plan"]["plan_hash"],
         "evidence_version": evidence["schema"], "verifier": evidence["verifier"],
-        "evidence_file": EVIDENCE_NAME, "evidence_file_sha256": file_sha,
+        "evidence_file": getattr(profile, "EVIDENCE_NAME", EVIDENCE_NAME), "evidence_file_sha256": file_sha,
         "evidence_hash": evidence["evidence_hash"], "test_only": evidence["test_only"]}
 
 
@@ -33,7 +33,7 @@ def signed(value, name):
     return {**value, name: legacy.digest(value)}
 
 
-def seal(directory, evidence, *, clock, write):
+def seal(directory, evidence, *, clock, write, profile=contract, _started=None):
     """Measure through receipt close/readback, not a pre-write success timestamp.
 
     The completion witness is an after-the-boundary verification artifact. It
@@ -41,17 +41,17 @@ def seal(directory, evidence, *, clock, write):
     is not a source available_at. Failure to publish/read it never returns GO.
     """
     directory = Path(directory)
-    path = directory / EVIDENCE_NAME
-    started_at, started = clock(), time.perf_counter()
+    path = directory / getattr(profile, "EVIDENCE_NAME", EVIDENCE_NAME)
+    started_at, started = _started if _started is not None else (clock(), time.perf_counter())
     stage = "evidence"
     try:
         write(path, evidence)
         raw_sha = sha256(path.read_bytes()).hexdigest()
-        identity = binding(evidence, raw_sha)
+        identity = binding(evidence, raw_sha, profile=profile)
         stage = "file_anchor"
-        write(directory / "file-anchor-v3.json", {"file": path.name, "sha256": raw_sha})
+        write(directory / getattr(profile, "FILE_ANCHOR_NAME", "file-anchor-v3.json"), {"file": path.name, "sha256": raw_sha})
         stage = "receipt"
-        receipt = signed(legacy.safe(schema=contract.SEAL_RECEIPT_VERSION, **identity,
+        receipt = signed(legacy.safe(schema=profile.SEAL_RECEIPT_VERSION, **identity,
             seal_started_at=started_at.isoformat(), seal_started_monotonic=started,
             seal_budget_ms=evidence["plan"]["seal_budget_ms"],
             collection_deadline=f"{evidence['trade_date']}T{evidence['plan']['collection_deadline']}+08:00",
@@ -66,7 +66,7 @@ def seal(directory, evidence, *, clock, write):
         elapsed = (completed - started) * 1000
         late = completed_at > datetime.fromisoformat(receipt["collection_deadline"])
         over = elapsed > receipt["seal_budget_ms"]
-        completion = signed(legacy.safe(schema=contract.SEAL_COMPLETION_VERSION, **identity,
+        completion = signed(legacy.safe(schema=profile.SEAL_COMPLETION_VERSION, **identity,
             receipt_file=RECEIPT_NAME, receipt_file_sha256=sha256(receipt_raw).hexdigest(),
             receipt_persisted_and_readback_confirmed=True,
             seal_completed_at=completed_at.isoformat(), seal_completed_monotonic=completed,
@@ -88,7 +88,7 @@ def _anchor(expected, actual):
 
 
 def verify(evidence, file_sha, receipt, receipt_expected, receipt_actual,
-           completion, completion_expected, completion_actual):
+           completion, completion_expected, completion_actual, *, profile=contract):
     errors, seal_status = [], "SEAL_UNCONFIRMED"
     for name, value, expected, actual in (("receipt", receipt, receipt_expected, receipt_actual),
                                          ("completion", completion, completion_expected, completion_actual)):
@@ -97,9 +97,9 @@ def verify(evidence, file_sha, receipt, receipt_expected, receipt_actual,
     if errors:
         return errors, seal_status
     try:
-        identity = binding(evidence, file_sha)
-        for value, version, hash_name in ((receipt, contract.SEAL_RECEIPT_VERSION, "receipt_hash"),
-                                          (completion, contract.SEAL_COMPLETION_VERSION, "completion_hash")):
+        identity = binding(evidence, file_sha, profile=profile)
+        for value, version, hash_name in ((receipt, profile.SEAL_RECEIPT_VERSION, "receipt_hash"),
+                                          (completion, profile.SEAL_COMPLETION_VERSION, "completion_hash")):
             if value.get("schema") != version or value.get(hash_name) != legacy.digest(
                     {k: v for k, v in value.items() if k != hash_name}):
                 errors.append("seal_version_or_internal_hash_invalid")

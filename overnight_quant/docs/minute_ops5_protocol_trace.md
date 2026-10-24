@@ -4,10 +4,10 @@
 
 仅固定 `59.36.5.11:7709`、`000001`、`frequency="1m"/start=0/offset=800`；一次bars及原客户端三次必要握手，最多4组交互，无扫描、重试、fallback、逐笔或其他股票。
 
-- 计划/worker/evidence/授权仍为 `mootdx_protocol_diagnostic_*_v1`，独立verifier升级 `mootdx_protocol_diagnostic_verifier_v2`，执行合同仍为 `single_bars_protocol_diagnostic_v1`。计划内验证规则身份变化，须新建计划并独立重算双hash，不能覆盖旧计划。
+- PR #44已合并；独立执行入口现以计划/授权/evidence v2、verifier v3及preflight v1隔离，worker v1和执行预算 `single_bars_protocol_diagnostic_v1` 不变。v1/v2验证身份仅历史审计；新计划须独立重算双hash，不覆盖旧文件。
 - 与原四波20请求计划、授权、证据及来源资格隔离。日期和目标时点未指定；只生成 `DRAFT_NOT_AUTHORIZED`，不能生成PM批准。
-- 本轮CLI仅冻结、审核和独立重放，**不提供 `--network` 或真实执行模式**。内部worker仅由隔离测试调度验证；今后真实操作仍须单独批准并审核实际运维入口/前置，不能临场直接调用内部worker。
-- 授权绑定校验函数仅核对独立身份、日期/窗口、代码/计划及外部SHA；它不是前置逻辑验收或采集许可。旧四波授权、DRAFT及空值均不通过。
+- CLI默认/validate-only仍零网络、零worker，新增显式`--network`须当日PM批准及实际前置；本轮只离线开发和fixture演练，不批准真实执行。[人工清单/完整命令](protocol_diagnostic_manual_entry.md)是唯一当前操作说明；内部worker不能绕过新intent/启动回执/实际前置，禁止另写启动器。
+- 原绑定helper仍不授予许可；新执行入口另行重算日历/session、时钟、环境/Git/依赖与配置外部SHA，运行前再次真实只读环境复核。旧四波/旧独立授权、DRAFT、合成材料或空值均不能授权真实执行。
 
 ## 不改变接收行为
 
@@ -40,11 +40,9 @@
 ```powershell
 $py = 'D:\A-stock\.venv\Scripts\python.exe'
 & $py overnight_quant/scripts/run_minute_protocol_diagnostic.py --validate-only `
-  --plan-output '<新的仓库外目录>\protocol-plan-v1.json' `
-  --authorization-draft-output '<新的仓库外目录>\authorization-draft-v1.json'
-& $py overnight_quant/scripts/run_minute_protocol_diagnostic.py `
-  --verify '<已捕获的独立诊断原件>' --expected-file-sha256 '<原件外部SHA>' `
-  --replay-output '<新的不可覆盖replay文件>'
+  --plan-output '<新的仓库外目录>\protocol-plan-v2.json' `
+  --authorization-draft-output '<新的仓库外目录>\authorization-draft-v2.json'
+# 实际前置及三份材料重放命令统一见人工清单，不直接调用内部worker。
 ```
 
 默认/validate-only零网络、零worker。重放只输出完整性与诊断结果，不表示PM批准或来源资格；合法短体失败可以完整性通过，但CLI仍退出2，不把重放一致升级为执行成功。缺失回执/部分输出不能形成完整诊断成功。

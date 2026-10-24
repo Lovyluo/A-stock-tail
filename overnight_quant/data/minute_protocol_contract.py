@@ -13,16 +13,25 @@ from .minute_protocol_trace import MAX_OUTPUT_BYTES
 
 WORKER_VERSION = "mootdx_protocol_diagnostic_worker_v1"
 WORKER_MODULE = "overnight_quant.data.minute_protocol_worker"
-PLAN_VERSION = "mootdx_protocol_diagnostic_plan_v1"
-AUTHORIZATION_VERSION = "mootdx_protocol_diagnostic_authorization_v1"
-EVIDENCE_VERSION = "mootdx_protocol_diagnostic_evidence_v1"
+PLAN_VERSION = "mootdx_protocol_diagnostic_plan_v2"
+AUTHORIZATION_VERSION = "mootdx_protocol_diagnostic_authorization_v2"
+EVIDENCE_VERSION = "mootdx_protocol_diagnostic_evidence_v2"
 AUDIT_ONLY_VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v1"
-VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v2"
+AUDIT_ONLY_V2 = "mootdx_protocol_diagnostic_verifier_v2"
+VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v3"
+PREFLIGHT_VERSION = "protocol_diagnostic_preflight_v1"
+PREFLIGHT_VERIFIER = "protocol_diagnostic_preflight_verifier_v1"
+ENV_SCOPE = "protocol_diagnostic_environment_v1"
+SEAL_RECEIPT_VERSION = "protocol_diagnostic_seal_receipt_v1"
+SEAL_COMPLETION_VERSION = "protocol_diagnostic_seal_completion_v1"
+EVIDENCE_NAME = "protocol-evidence-v2.json"
+FILE_ANCHOR_NAME = "file-anchor-v2.json"
 EXECUTION_CONTRACT = "single_bars_protocol_diagnostic_v1"
 CODES = ["000001"]
 
 
-def frozen_plan(*, audit_only_v1=False):
+def frozen_plan(*, audit_only_v1=False, audit_only_v2=False):
+    historical = audit_only_v1 or audit_only_v2
     value = {"schema": PLAN_VERSION, "execution_contract": EXECUTION_CONTRACT,
         "worker_version": WORKER_VERSION, "evidence_version": EVIDENCE_VERSION,
         "authorization_version": AUTHORIZATION_VERSION,
@@ -38,12 +47,22 @@ def frozen_plan(*, audit_only_v1=False):
         "date": None, "target_at": None, "execution_authorized": False,
         "purpose": "protocol_evidence_only_not_coverage_or_source_qualification",
         "root_cause": "ROOT_CAUSE_UNCONFIRMED", "budget": "CAPTURE_BUDGET_FEASIBILITY_UNPROVEN"}
+    if historical:
+        value.update(schema="mootdx_protocol_diagnostic_plan_v1",
+            evidence_version="mootdx_protocol_diagnostic_evidence_v1",
+            authorization_version="mootdx_protocol_diagnostic_authorization_v1",
+            verifier=AUDIT_ONLY_VERIFIER_VERSION if audit_only_v1 else AUDIT_ONLY_V2)
+    else:
+        value.update(preflight_version=PREFLIGHT_VERSION, preflight_verifier=PREFLIGHT_VERIFIER,
+            seal_receipt_version=SEAL_RECEIPT_VERSION, seal_completion_version=SEAL_COMPLETION_VERSION,
+            seal_budget_ms=legacy.frozen_plan()["seal_budget_ms"],
+            collection_deadline=legacy.frozen_plan()["collection_deadline"])
     value = deepcopy(value)
     return {**value, "plan_hash": legacy.digest(value)}
 
 
-def check_plan(value, *, audit_only_v1=False):
-    if value != frozen_plan(audit_only_v1=audit_only_v1):
+def check_plan(value, *, audit_only_v1=False, audit_only_v2=False):
+    if value != frozen_plan(audit_only_v1=audit_only_v1, audit_only_v2=audit_only_v2):
         raise ValueError("protocol_diagnostic_plan_mismatch")
 
 
@@ -51,9 +70,9 @@ def worker_file_sha256():
     return sha256(Path(__file__).with_name("minute_protocol_worker.py").read_bytes()).hexdigest()
 
 
-def check_task(task, *, audit_only_v1=False):
+def check_task(task, *, audit_only_v1=False, audit_only_v2=False):
     if (task.get("worker_version") != WORKER_VERSION
-            or task.get("plan_hash") != frozen_plan(audit_only_v1=audit_only_v1)["plan_hash"]
+            or task.get("plan_hash") != frozen_plan(audit_only_v1=audit_only_v1, audit_only_v2=audit_only_v2)["plan_hash"]
             or task.get("codes") != CODES or task.get("endpoint") != legacy.ENDPOINT
             or task.get("dependencies") != prepared.DEPENDENCIES or task.get("source_version") != legacy.SOURCE_VERSION
             or type(task.get("wave")) is not int or task["wave"] != 0 or type(task.get("parent_pid")) is not int or task["parent_pid"] <= 0
