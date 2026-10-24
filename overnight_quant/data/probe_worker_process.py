@@ -302,10 +302,13 @@ class _ProcessScope:
 class _PipeDrain:
     """One caller, raw unbuffered handles, no blocked communicate/reader threads."""
 
-    def __init__(self, process):
+    def __init__(self, process, *, max_output_bytes=None):
         self.streams = {"stdout": process.stdout, "stderr": process.stderr}
         self.chunks = {name: [] for name in self.streams}
         self.eof = {name: False for name in self.streams}
+        self.max_output_bytes = max_output_bytes
+        self.retained_bytes = 0
+        self.output_limit_exceeded = False
         if os.name == "nt":
             import ctypes
             import msvcrt
@@ -343,7 +346,13 @@ class _PipeDrain:
             except BlockingIOError:
                 continue
             if data:
-                self.chunks[name].append(data)
+                keep = len(data) if self.max_output_bytes is None else max(0, self.max_output_bytes - self.retained_bytes)
+                if keep < len(data):
+                    self.output_limit_exceeded = True
+                saved = data[:keep]
+                if saved:
+                    self.chunks[name].append(saved)
+                    self.retained_bytes += len(saved)
                 received = True
             else:
                 self.eof[name] = True
