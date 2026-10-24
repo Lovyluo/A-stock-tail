@@ -3,6 +3,7 @@ import base64
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import math
 import re
 
 from . import minute_capture_audit as legacy
@@ -57,19 +58,128 @@ def _blob(value):
     return raw
 
 
+def _number(value, name):
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError("protocol_time_missing_or_invalid:" + name)
+    return value
+
+
+def _absolute_timing(result, events):
+    """Assess execution separately: a well-preserved timeout is still evidence."""
+    measured = {}
+    try:
+        task = result["task"]
+        def number(mapping, name):
+            return _number(mapping.get(name), name)
+        target = number(task, "target_monotonic")
+        work_deadline = number(task, "io_deadline_monotonic")
+        hard_deadline = number(task, "hard_deadline_monotonic")
+        start = number(task, "preparation_started_monotonic")
+        prep_deadline = number(task, "preparation_work_deadline")
+        process_start = number(result, "process_started_monotonic")
+        entered = number(result, "controller_entered_monotonic")
+        ready_checked = number(result, "ready_checked_monotonic")
+        sent = number(result, "go_sent_monotonic")
+        completed = number(result, "normal_exit_checked_monotonic")
+        finished = number(result, "finished_monotonic")
+        cleanup_deadline = number(result, "cleanup_deadline_monotonic")
+        ready = [event for event in events if event.get("kind") == "READY_LOCAL_ONLY"]
+        go = [event for event in events if event.get("kind") == "GO_ACCEPTED"]
+        if len(ready) != 1 or len(go) != 1:
+            raise ValueError("protocol_timing_READY_GO_required")
+        ready_at = number(ready[0], "ready_monotonic")
+        go_sent = number(go[0], "sent_monotonic")
+        received = number(go[0], "received_monotonic")
+        accepted = number(go[0], "monotonic")
+        # In the unchanged controller this finally-entry marker is sampled
+        # AFTER normal-exit checks AND successful output decode/hash/freeze.
+        # It is a conservative upper bound, not an invented freeze timestamp.
+        measured = {"preparation_elapsed_ms": (ready_checked - start) * 1000,
+            "waiting_after_ready_ms": (sent - ready_checked) * 1000,
+            "work_elapsed_ms": (completed - sent) * 1000,
+            "cleanup_ms": (finished - completed) * 1000,
+            "total_residence_ms": (finished - start) * 1000,
+            "elapsed_ms": (finished - start) * 1000,
+            "wave_elapsed_ms": (finished - target) * 1000,
+            "normal_exit_and_freeze_completed_by_monotonic": completed,
+            "absolute_work_deadline_monotonic": work_deadline,
+            "absolute_cleanup_deadline_monotonic": hard_deadline}
+        if not (process_start == start <= entered <= ready_at <= ready_checked < prep_deadline
+                and target <= sent == go_sent <= received <= accepted <= completed <= finished):
+            raise ValueError("protocol_absolute_stage_order_invalid")
+        if completed >= work_deadline:
+            raise ValueError("protocol_normal_exit_or_output_freeze_absolute_deadline_exceeded")
+        if (cleanup_deadline != min(hard_deadline, completed + .5)
+                or not finished < cleanup_deadline <= hard_deadline):
+            raise ValueError("protocol_shared_cleanup_absolute_deadline_exceeded")
+        for name in ("preparation_elapsed_ms", "waiting_after_ready_ms", "work_elapsed_ms", "cleanup_ms",
+                     "total_residence_ms", "elapsed_ms", "wave_elapsed_ms"):
+            declared = number(result, name)
+            # Arithmetic consistency only; no tolerance is added to deadlines.
+            if not math.isclose(declared, measured[name], rel_tol=1e-9, abs_tol=1e-6):
+                raise ValueError("protocol_declared_duration_mismatch:" + name)
+        freeze_ms = number(result, "output_freeze_ms")
+        startup_ms = number(result, "process_startup_and_scope_ms")
+        if (result.get("output_frozen_before_work_deadline") is not True
+                or freeze_ms > measured["work_elapsed_ms"]
+                or startup_ms > measured["preparation_elapsed_ms"]):
+            raise ValueError("protocol_output_freeze_or_startup_evidence_invalid")
+        cleanup_parts = sum(number(result, name) for name in
+            ("termination_ms", "drain_and_exit_ms", "pipe_and_scope_close_ms"))
+        if cleanup_parts > measured["cleanup_ms"]:
+            raise ValueError("protocol_cleanup_stage_durations_exceed_shared_budget")
+        cursor = start
+        released = False
+        for event in events:
+            kind = event.get("kind")
+            if kind == "READY_LOCAL_ONLY":
+                at = number(event, "ready_monotonic")
+            elif kind == "GO_ACCEPTED":
+                released = True
+                at = number(event, "monotonic")
+            elif kind == "client_stage":
+                at = number(event, "monotonic")
+                if not released and at > ready_at:
+                    raise ValueError("protocol_local_stage_after_READY")
+                if "elapsed_ms" in event:
+                    number(event, "elapsed_ms")
+            elif kind == "protocol_io":
+                if not released:
+                    raise ValueError("protocol_request_before_GO")
+                record, operation = event["record"], event["operation"]
+                if operation == "parser_input":
+                    at = number(record, "at_monotonic")
+                else:
+                    began = number(record, "started_monotonic")
+                    at = number(record, "completed_monotonic") if operation.endswith("_result") else began
+                    if not accepted <= began <= at:
+                        raise ValueError("protocol_request_time_order_invalid")
+            else:
+                continue
+            if not cursor <= at <= completed or (released and at < accepted):
+                raise ValueError("protocol_raw_stage_order_or_completion_invalid")
+            cursor = at
+        return {"timing_contract_verified": True, "timing_errors": [], "recomputed_timing": measured}
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        return {"timing_contract_verified": False, "timing_errors": [str(exc)], "recomputed_timing": measured}
+
+
 def verify(value):
     errors = []
     result, terminal, trace = {}, None, None
     malformed_stream = False
+    events = []
+    audit_only_v1 = value.get("verifier") == contract.AUDIT_ONLY_VERIFIER_VERSION
     try:
-        if (value.get("schema") != contract.EVIDENCE_VERSION or value.get("verifier") != contract.VERIFIER_VERSION
+        if (value.get("schema") != contract.EVIDENCE_VERSION
+                or value.get("verifier") not in (contract.VERIFIER_VERSION, contract.AUDIT_ONLY_VERIFIER_VERSION)
                 or value.get("execution_contract") != contract.EXECUTION_CONTRACT
                 or value.get("evidence_hash") != legacy.digest({k: v for k, v in value.items() if k != "evidence_hash"})):
             raise ValueError("protocol_evidence_identity_or_hash_invalid")
-        contract.check_plan(value["plan"])
+        contract.check_plan(value["plan"], audit_only_v1=audit_only_v1)
         result = value["result"]
         task = result["task"]
-        contract.check_task(task)
+        contract.check_task(task, audit_only_v1=audit_only_v1)
         if result.get("task_hash") != legacy.digest(task) or value.get("test_only") is not task.get("test_only", False):
             raise ValueError("protocol_task_hash_or_test_scope_invalid")
         if any(value[name] != task[name] for name in ("batch_id", "code_sha", "trade_date")):
@@ -91,6 +201,7 @@ def verify(value):
                 continue
             if event.get("execution_worker_version") != contract.WORKER_VERSION:
                 raise ValueError("protocol_stream_version_invalid")
+            events.append(event)
             if "ok" in event:
                 terminal = event
             if event.get("kind") != "protocol_io":
@@ -153,7 +264,6 @@ def verify(value):
         if result.get("ok") is True:
             if malformed_stream:
                 raise ValueError("protocol_success_stream_contains_invalid_JSON")
-            events = [json.loads(line) for line in result["stdout"].splitlines()]
             ready = [e for e in events if e.get("kind") == "READY_LOCAL_ONLY"]
             go = [e for e in events if e.get("kind") == "GO_ACCEPTED"]
             if len(ready) != 1 or len(go) != 1:
@@ -177,17 +287,17 @@ def verify(value):
         errors.append(str(exc))
     if trace is not None and (terminal is None or result.get("output_complete") is False):
         trace.failure = trace.failure or "protocol_terminal_missing_or_output_incomplete"
-    success = bool(not errors and result.get("ok") is True and terminal and terminal.get("ok") is True)
+    timing = _absolute_timing(result, events)
+    success = bool(not errors and not audit_only_v1 and timing["timing_contract_verified"]
+                   and result.get("ok") is True and terminal and terminal.get("ok") is True)
     if success:
         claimed = terminal["payload"]["trace_summary"]
         success = (claimed["complete"] and claimed["hooks_restored"] and len(trace.interactions) == 4
                    and len(trace.interactions[-1]["parser_inputs"]) == 1
                    and result.get("cleanup_complete") is True and result.get("tree_empty_observed") is True
-                   and result.get("output_frozen_before_work_deadline") is True
-                   and result.get("work_elapsed_ms", float("inf")) < 1500
-                   and result.get("cleanup_ms", float("inf")) < 500
-                   and result["finished_monotonic"] < result["task"]["hard_deadline_monotonic"])
+                   and result.get("output_complete") is True and result.get("pipes_closed") is True)
     return legacy.safe(verifier=contract.VERIFIER_VERSION, evidence_integrity_verified=not errors,
+        evidence_verifier=value.get("verifier"), legacy_verifier_audit_only=audit_only_v1, **timing,
         errors=errors, diagnostic_result="PROTOCOL_DIAGNOSTIC_CAPTURED" if success else "PROTOCOL_DIAGNOSTIC_FAILED",
         trace_summary=trace.summary() if trace else None, evidence_hash=value.get("evidence_hash"),
         test_only=value.get("test_only"), raw_stream_complete=not malformed_stream and terminal is not None,

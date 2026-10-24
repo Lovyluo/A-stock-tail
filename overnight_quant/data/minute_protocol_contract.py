@@ -16,15 +16,17 @@ WORKER_MODULE = "overnight_quant.data.minute_protocol_worker"
 PLAN_VERSION = "mootdx_protocol_diagnostic_plan_v1"
 AUTHORIZATION_VERSION = "mootdx_protocol_diagnostic_authorization_v1"
 EVIDENCE_VERSION = "mootdx_protocol_diagnostic_evidence_v1"
-VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v1"
+AUDIT_ONLY_VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v1"
+VERIFIER_VERSION = "mootdx_protocol_diagnostic_verifier_v2"
 EXECUTION_CONTRACT = "single_bars_protocol_diagnostic_v1"
 CODES = ["000001"]
 
 
-def frozen_plan():
+def frozen_plan(*, audit_only_v1=False):
     value = {"schema": PLAN_VERSION, "execution_contract": EXECUTION_CONTRACT,
         "worker_version": WORKER_VERSION, "evidence_version": EVIDENCE_VERSION,
-        "authorization_version": AUTHORIZATION_VERSION, "verifier": VERIFIER_VERSION,
+        "authorization_version": AUTHORIZATION_VERSION,
+        "verifier": AUDIT_ONLY_VERIFIER_VERSION if audit_only_v1 else VERIFIER_VERSION,
         "endpoint": legacy.ENDPOINT, "codes": CODES, "request": {"symbol": "000001", "frequency": "1m", "start": 0, "offset": 800},
         "source_version": legacy.SOURCE_VERSION, "dependencies": prepared.DEPENDENCIES,
         "handshake_requests": 3, "bars_requests": 1, "transaction_requests": 0,
@@ -40,8 +42,8 @@ def frozen_plan():
     return {**value, "plan_hash": legacy.digest(value)}
 
 
-def check_plan(value):
-    if value != frozen_plan():
+def check_plan(value, *, audit_only_v1=False):
+    if value != frozen_plan(audit_only_v1=audit_only_v1):
         raise ValueError("protocol_diagnostic_plan_mismatch")
 
 
@@ -49,8 +51,9 @@ def worker_file_sha256():
     return sha256(Path(__file__).with_name("minute_protocol_worker.py").read_bytes()).hexdigest()
 
 
-def check_task(task):
-    if (task.get("worker_version") != WORKER_VERSION or task.get("plan_hash") != frozen_plan()["plan_hash"]
+def check_task(task, *, audit_only_v1=False):
+    if (task.get("worker_version") != WORKER_VERSION
+            or task.get("plan_hash") != frozen_plan(audit_only_v1=audit_only_v1)["plan_hash"]
             or task.get("codes") != CODES or task.get("endpoint") != legacy.ENDPOINT
             or task.get("dependencies") != prepared.DEPENDENCIES or task.get("source_version") != legacy.SOURCE_VERSION
             or type(task.get("wave")) is not int or task["wave"] != 0 or type(task.get("parent_pid")) is not int or task["parent_pid"] <= 0
