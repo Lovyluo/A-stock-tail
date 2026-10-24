@@ -141,16 +141,17 @@ def parent_chain():
         kernel.CloseHandle(handle)
 
 
-def prepare_local(task, guard):
+def prepare_local(task, guard, *, emit_fn=None, codes=None):
+    output = emit_fn or emit
     from importlib.metadata import version
-    with native.client_stage(emit, "local_dependency_imports"):
+    with native.client_stage(output, "local_dependency_imports"):
         actual = {package: version(package) for package in contract.DEPENDENCIES}
         if actual != contract.DEPENDENCIES:
             raise ValueError("prepared_dependency_version_mismatch")
         from mootdx import config
         from mootdx.quotes import Quotes  # Import only; factory connects and is forbidden here.
         from tdxpy.parser.std.get_security_bars import GetSecurityBarsCmd
-    with native.client_stage(emit, "local_config_and_parser_validation"):
+    with native.client_stage(output, "local_config_and_parser_validation"):
         if Path(config.CONF).resolve() != Path(task["config"]["path"]).resolve():
             raise ValueError("prepared_config_path_mismatch")
         raw = Path(config.CONF).read_bytes()
@@ -160,7 +161,7 @@ def prepare_local(task, guard):
         if (not isinstance(value, dict) or not isinstance(value.get("SERVER"), dict)
                 or not isinstance(value["SERVER"].get("HQ"), list) or not value["SERVER"]["HQ"]):
             raise ValueError("prepared_local_config_invalid_no_discovery")
-        for code in native.CODES:
+        for code in (native.CODES if codes is None else codes):
             parser = GetSecurityBarsCmd(None)
             parser.setParams(8, 1 if code.startswith("6") else 0, code, 0, 800)
     guard.assert_clean()
@@ -168,16 +169,17 @@ def prepare_local(task, guard):
 
 
 @contextmanager
-def connection_stages():
+def connection_stages(*, emit_fn=None):
+    output = emit_fn or emit
     from tdxpy.hq import TdxHq_API
     original_connect, original_setup = TdxHq_API.connect, TdxHq_API.setup
 
     def connect(self, *args, **kwargs):
-        with native.client_stage(emit, "connect_including_handshakes"):
+        with native.client_stage(output, "connect_including_handshakes"):
             return original_connect(self, *args, **kwargs)
 
     def setup(self):
-        with native.client_stage(emit, "three_handshakes"):
+        with native.client_stage(output, "three_handshakes"):
             return original_setup(self)
 
     TdxHq_API.connect, TdxHq_API.setup = connect, setup
