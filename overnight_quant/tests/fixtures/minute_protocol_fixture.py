@@ -116,6 +116,20 @@ def child():
             if event == "socket.connect" and not isinstance(args[0], NativeSocket):
                 raise AssertionError("fixture_external_network_forbidden")
         sys.addaudithook(external_guard)
+        if "launch" in task:
+            # Exercise the same launch bindings and deep preflight validation
+            # with an explicit synthetic clock/scope, never a production bypass.
+            from datetime import timedelta
+            import json
+            from overnight_quant.data import minute_protocol_execution as execution
+            from overnight_quant.data.minute_capture_preflight import stamp
+            root = Path(task["launch"]["path"]).parents[5]
+            auth = execution._launch_materials(task, root)
+            actual = stamp(task["scheduled_at"]) + timedelta(seconds=time.perf_counter() - task["target_monotonic"])
+            execution.authorize(auth, trade_date=task["trade_date"], target_at=task["scheduled_at"],
+                code_sha=task["code_sha"], root=root, current=actual, test_only=True, during_preparation=True, check_git=False)
+            print(json.dumps({"kind": "fixture_launch_validated", "test_only": True,
+                "worker_cwd": os.getcwd(), "execution_worker_version": worker.contract.WORKER_VERSION}), flush=True)
         import mootdx.config as config
         import tdxpy.base_socket_client as sockets
         config.CONF = task["config"]["path"]

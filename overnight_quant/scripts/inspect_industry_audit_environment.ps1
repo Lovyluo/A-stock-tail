@@ -2,6 +2,9 @@ param(
     [Parameter(Mandatory=$true)][string]$OpsDirectory,
     [Parameter(Mandatory=$true)][string]$OutputPath,
     [switch]$MinuteCapture,
+    [switch]$ProtocolDiagnostic,
+    [string]$ProtocolDiagnosticRoot,
+    [int]$AllowedControllerPid = 0,
     [string]$ProjectRoot,
     [string]$MinuteCaptureRoot,
     [string]$TradeDate
@@ -44,6 +47,7 @@ function Test-EquivalentJson($Left,$Right) {
     return $Left.Equals($Right)
 }
 try {
+    if ($ProtocolDiagnostic) { $MinuteCapture = $true }
     if ($MinuteCapture) {
         [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
         $OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -65,13 +69,29 @@ try {
         if (!$ProjectRoot -or !$MinuteCaptureRoot -or !$TradeDate) { throw 'Minute environment arguments missing' }
         # Match actual entry/module tokens, not every Python process or a word in a note.
         $pattern = '(?:[\\/]|^|[\s"])' +
-            '(?:run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|' +
+            '(?:run_minute_protocol_diagnostic|minute_protocol_worker|run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|' +
             'run_market_source_validation|run_complete_industry_audit|market_source_worker)\.(?:py|ps1)(?:["\s]|$)' +
-            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)' +
-            '|scripts\.(?:run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
+            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_protocol_worker|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)' +
+            '|scripts\.(?:run_minute_protocol_diagnostic|run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
             '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
+        $allowed = @()
+        if ($ProtocolDiagnostic -and $AllowedControllerPid -gt 0) {
+            $controller = @($allProcesses | Where-Object { $_.ProcessId -eq $AllowedControllerPid })
+            if ($controller.Count -ne 1) { throw 'Protocol controller PID unavailable' }
+            $item = $controller[0]
+            do {
+                if ($item.Name -notmatch '^python(w)?(\.exe)?$' -or
+                    $item.CommandLine -notmatch 'run_minute_protocol_diagnostic(?:\.py)?["\s].*--network') {
+                    throw 'Protocol controller command identity invalid'
+                }
+                $allowed += [int]$item.ProcessId
+                $parent = @($allProcesses | Where-Object { $_.ProcessId -eq $item.ParentProcessId })
+                if ($parent.Count -ne 1 -or $parent[0].CommandLine -notmatch 'run_minute_protocol_diagnostic(?:\.py)?["\s].*--network') { break }
+                $item = $parent[0]
+            } while ($item.ProcessId -notin $allowed)
+        }
         $ids = @($allProcesses | Where-Object {
-            $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
+            $_.ProcessId -ne $PID -and $_.ProcessId -notin $allowed -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
             $_.CommandLine -match $pattern
         } | ForEach-Object { [int]$_.ProcessId })
         do {
@@ -86,7 +106,7 @@ try {
         $_.TaskName -match 'AStock|A-stock|MarketSource|IndustryAudit' -or
         (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'A-stock|market_source|complete_industry' -or
         ($MinuteCapture -and ($_.TaskName -match 'MinuteCapture' -or
-            (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture|minute_local_prepare'))
+            (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture|minute_local_prepare|minute_protocol'))
     } | ForEach-Object { [ordered]@{TaskPath=$_.TaskPath;TaskName=$_.TaskName;State=[string]$_.State;Enabled=[bool]$_.Settings.Enabled} })
     if ($workers.Count) { $issues += 'Residual worker present' }
     if (@($tasks | Where-Object { $_.Enabled -or $_.State -eq 'Running' }).Count) { $issues += 'Active project task present' }
@@ -112,6 +132,31 @@ try {
                 } catch {
                     $pendingPreparations += $started.FullName
                     $issues += "Pending minute preparation receipt: $($started.FullName)"
+                }
+            }
+        }
+    }
+    if ($ProtocolDiagnostic) {
+        if (!$ProtocolDiagnosticRoot) { throw 'Protocol diagnostic root missing' }
+        if (Test-Path -LiteralPath (Join-Path $ProtocolDiagnosticRoot 'cleanup-incomplete.json')) { $issues += 'Protocol cleanup incomplete' }
+        if (Test-Path -LiteralPath $ProtocolDiagnosticRoot) {
+            foreach ($dir in Get-ChildItem -LiteralPath $ProtocolDiagnosticRoot -Directory -ErrorAction Stop) {
+                if (!(Test-Path -LiteralPath (Join-Path $dir.FullName 'intent.json')) -and
+                    !(Test-Path -LiteralPath (Join-Path $dir.FullName 'request.started.json'))) { continue }
+                try {
+                    $null = Get-Content -LiteralPath (Join-Path $dir.FullName 'intent.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                    $startPath = Join-Path $dir.FullName 'request.started.json'
+                    $opening = Get-Content -LiteralPath $startPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                    $closed = Get-Content -LiteralPath (Join-Path $dir.FullName 'request.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                    $closedTask = $closed.result.task | Select-Object * -ExcludeProperty launch_root_pid,launch
+                    if ($opening.task.worker_version -cne 'mootdx_protocol_diagnostic_worker_v1' -or
+                        $opening.task.trade_date -cne $dir.Name -or $closed.result.cleanup_complete -isnot [bool] -or
+                        !$closed.result.cleanup_complete -or
+                        $closed.start_receipt_sha256 -cne (Get-FileSha256 $startPath) -or
+                        !(Test-EquivalentJson $opening.task $closedTask)) { throw 'Protocol cleanup receipt invalid' }
+                } catch {
+                    $pendingPreparations += $dir.FullName
+                    $issues += "Pending protocol preparation receipt: $($dir.FullName)"
                 }
             }
         }
@@ -187,6 +232,14 @@ try {
         $record.capture_root = [IO.Path]::GetFullPath($MinuteCaptureRoot)
         $record.cleanup_incomplete_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot 'cleanup-incomplete.json')
         $record.date_output_exists = Test-Path -LiteralPath (Join-Path $MinuteCaptureRoot $TradeDate)
+        if ($ProtocolDiagnostic) {
+            $record.scope = 'protocol_diagnostic_environment_v1'
+            $record.diagnostic_root = [IO.Path]::GetFullPath($ProtocolDiagnosticRoot)
+            $record.shared_date_output_exists = $record.date_output_exists
+            $record.date_output_exists = Test-Path -LiteralPath (Join-Path $ProtocolDiagnosticRoot $TradeDate)
+            $record.cleanup_incomplete_exists = $record.cleanup_incomplete_exists -or
+                (Test-Path -LiteralPath (Join-Path $ProtocolDiagnosticRoot 'cleanup-incomplete.json'))
+        }
         $record.pending_preparations = $pendingPreparations
         $record.git_head = (& git -C $ProjectRoot rev-parse HEAD | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) { throw 'Git HEAD query failed' }

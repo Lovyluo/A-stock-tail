@@ -15,10 +15,10 @@ def authorization_draft(code_sha=None):
     return {"schema": contract.AUTHORIZATION_VERSION, "execution_contract": contract.EXECUTION_CONTRACT,
             "status": "DRAFT_NOT_AUTHORIZED", "code_sha": code_sha, "trade_date": None,
             "target_at": None, "plan_hash": contract.frozen_plan()["plan_hash"], "single_use": True,
-            "approval_source": None, "preflight": None, "local_config": None}
+            "plan_file_sha256": None, "approval_source": None, "preflight": None, "local_config": None}
 
 
-def validate_authorization(value, *, code_sha, now):
+def validate_authorization(value, *, code_sha, now, _during_preparation=False):
     if (value.get("schema") != contract.AUTHORIZATION_VERSION
             or value.get("execution_contract") != contract.EXECUTION_CONTRACT
             or value.get("status") != "PM_APPROVED_SINGLE_PROTOCOL_DIAGNOSTIC"
@@ -28,7 +28,8 @@ def validate_authorization(value, *, code_sha, now):
         raise ValueError("independent_protocol_PM_authorization_required")
     target = datetime.fromisoformat(value["target_at"])
     if (target.utcoffset() != timedelta(hours=8) or target.date().isoformat() != value.get("trade_date")
-            or now.date() != target.date() or now.utcoffset() != timedelta(hours=8) or now >= target - timedelta(seconds=5)):
+            or now.date() != target.date() or now.utcoffset() != timedelta(hours=8)
+            or now >= target - timedelta(seconds=0 if _during_preparation else 5)):
         raise ValueError("protocol_authorization_date_or_preparation_window_invalid")
     for name in ("preflight", "local_config"):
         reference = value[name]
@@ -170,16 +171,18 @@ def verify(value):
     malformed_stream = False
     events = []
     audit_only_v1 = value.get("verifier") == contract.AUDIT_ONLY_VERIFIER_VERSION
+    audit_only_v2 = value.get("verifier") == contract.AUDIT_ONLY_V2
+    historical = audit_only_v1 or audit_only_v2
     try:
-        if (value.get("schema") != contract.EVIDENCE_VERSION
-                or value.get("verifier") not in (contract.VERIFIER_VERSION, contract.AUDIT_ONLY_VERIFIER_VERSION)
+        if (value.get("schema") != ("mootdx_protocol_diagnostic_evidence_v1" if historical else contract.EVIDENCE_VERSION)
+                or value.get("verifier") not in (contract.VERIFIER_VERSION, contract.AUDIT_ONLY_VERIFIER_VERSION, contract.AUDIT_ONLY_V2)
                 or value.get("execution_contract") != contract.EXECUTION_CONTRACT
                 or value.get("evidence_hash") != legacy.digest({k: v for k, v in value.items() if k != "evidence_hash"})):
             raise ValueError("protocol_evidence_identity_or_hash_invalid")
-        contract.check_plan(value["plan"], audit_only_v1=audit_only_v1)
+        contract.check_plan(value["plan"], audit_only_v1=audit_only_v1, audit_only_v2=audit_only_v2)
         result = value["result"]
         task = result["task"]
-        contract.check_task(task, audit_only_v1=audit_only_v1)
+        contract.check_task(task, audit_only_v1=audit_only_v1, audit_only_v2=audit_only_v2)
         if result.get("task_hash") != legacy.digest(task) or value.get("test_only") is not task.get("test_only", False):
             raise ValueError("protocol_task_hash_or_test_scope_invalid")
         if any(value[name] != task[name] for name in ("batch_id", "code_sha", "trade_date")):
@@ -288,7 +291,7 @@ def verify(value):
     if trace is not None and (terminal is None or result.get("output_complete") is False):
         trace.failure = trace.failure or "protocol_terminal_missing_or_output_incomplete"
     timing = _absolute_timing(result, events)
-    success = bool(not errors and not audit_only_v1 and timing["timing_contract_verified"]
+    success = bool(not errors and not historical and timing["timing_contract_verified"]
                    and result.get("ok") is True and terminal and terminal.get("ok") is True)
     if success:
         claimed = terminal["payload"]["trace_summary"]
@@ -297,7 +300,7 @@ def verify(value):
                    and result.get("cleanup_complete") is True and result.get("tree_empty_observed") is True
                    and result.get("output_complete") is True and result.get("pipes_closed") is True)
     return legacy.safe(verifier=contract.VERIFIER_VERSION, evidence_integrity_verified=not errors,
-        evidence_verifier=value.get("verifier"), legacy_verifier_audit_only=audit_only_v1, **timing,
+        evidence_verifier=value.get("verifier"), legacy_verifier_audit_only=historical, **timing,
         errors=errors, diagnostic_result="PROTOCOL_DIAGNOSTIC_CAPTURED" if success else "PROTOCOL_DIAGNOSTIC_FAILED",
         trace_summary=trace.summary() if trace else None, evidence_hash=value.get("evidence_hash"),
         test_only=value.get("test_only"), raw_stream_complete=not malformed_stream and terminal is not None,

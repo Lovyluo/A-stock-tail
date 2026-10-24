@@ -15,7 +15,7 @@ from .probe_worker_process import _ProcessScope, _PipeDrain, _bounded_cleanup, _
 
 
 def run_prepared_wave(task, *, worker_command=None, cancel_event=None, before_go=None, _test=None,
-                      contract_profile=None):
+                      contract_profile=None, worker_cwd=None):
     profile = contract_profile or contract
     task = dict(task)
     profile.check_task(task)
@@ -78,7 +78,8 @@ def run_prepared_wave(task, *, worker_command=None, cancel_event=None, before_go
             raise ValueError("prepared_task_exceeds_4096_bytes")
         cancelled()
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW | 0x4)  # CREATE_SUSPENDED
+            bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW | 0x4,
+            **({"cwd": str(worker_cwd)} if worker_cwd is not None else {}))  # CREATE_SUSPENDED
         scope = _ProcessScope(process, kill_on_parent_close=True)
         drain = _PipeDrain(process, max_output_bytes=output_limit) if output_limit is not None else _PipeDrain(process)
         _resume_suspended_primary(process)

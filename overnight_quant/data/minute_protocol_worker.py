@@ -36,6 +36,10 @@ def main(*, _test=None):
             raise ValueError("protocol_diagnostic_test_scope_mismatch")
         if contract.worker_file_sha256() != task["worker_sha256"]:
             raise ValueError("protocol_diagnostic_worker_sha_mismatch")
+        permitted = None
+        if not _test:
+            from .minute_protocol_execution import verify_worker_launch
+            permitted = verify_worker_launch(task)
         deadline[0] = task["preparation_work_deadline"]
         if _test:
             _test["configure"](task, guard)
@@ -52,6 +56,9 @@ def main(*, _test=None):
         contract.check_go(message, task, received)
         stream.require_eof(task["io_deadline_monotonic"])
         guard.assert_clean()
+        if permitted is not None:
+            from .minute_capture_preflight import fresh_at, now
+            fresh_at(permitted, now())
         deadline[0] = task["io_deadline_monotonic"]
         guard.released = True
         emit({"kind": "GO_ACCEPTED", "task_hash": native.digest(task), "monotonic": time.perf_counter(),
