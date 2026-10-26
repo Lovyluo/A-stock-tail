@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from overnight_quant.data import minute_capture_preflight as preflight
+from overnight_quant.data.minute_protocol_differential_contract import CONTRACT_NAMES
 
 
 def main(argv=None):
@@ -24,7 +25,7 @@ def main(argv=None):
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--expected-file-sha256")
-    parser.add_argument("--execution-contract", choices=("legacy_v1", "local_prepare_v2", "single_bars_protocol_diagnostic_v1"), default="legacy_v1")
+    parser.add_argument("--execution-contract", choices=("legacy_v1", "local_prepare_v2", "single_bars_protocol_diagnostic_v1", *CONTRACT_NAMES), default="legacy_v1")
     for name in ("calendar", "session", "before-environment", "clock-raw"):
         parser.add_argument("--" + name, type=Path)
         parser.add_argument("--" + name + "-sha256")

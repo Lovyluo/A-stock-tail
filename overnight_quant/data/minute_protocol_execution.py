@@ -20,9 +20,9 @@ AUDIT_RELATIVE = "overnight_quant/data/cache/minute_protocol_diagnostic"
 SHARED_RELATIVE = "overnight_quant/data/cache/minute_capture_audit"
 
 
-def blockers(root):
+def blockers(root, *, audit_relative=AUDIT_RELATIVE):
     """Never repair, rename or ignore a pre-existing incomplete owner."""
-    shared, own = Path(root) / SHARED_RELATIVE, Path(root) / AUDIT_RELATIVE
+    shared, own = Path(root) / SHARED_RELATIVE, Path(root) / audit_relative
     if any((path / "cleanup-incomplete.json").exists() for path in (shared, own)):
         raise ValueError("shared_or_protocol_cleanup_incomplete_preserve_no_launch")
     if store.pending_preparation_receipts(shared):
@@ -46,8 +46,10 @@ def blockers(root):
 
 
 def authorize(auth, *, trade_date, target_at, code_sha, root, current, test_only=False,
-              check_git=True, during_preparation=False):
-    audit.validate_authorization(auth, code_sha=code_sha, now=current, _during_preparation=during_preparation)
+              check_git=True, during_preparation=False, profile=contract):
+    contract = profile
+    audit.validate_authorization(auth, code_sha=code_sha, now=current,
+        _during_preparation=during_preparation, profile=contract)
     if (auth.get("trade_date") != trade_date or auth.get("target_at") != target_at
             or auth.get("test_only", False) is not test_only
             or type(auth.get("approval_source")) is not str or not auth["approval_source"].strip()):
@@ -57,6 +59,8 @@ def authorize(auth, *, trade_date, target_at, code_sha, root, current, test_only
         dirty = subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=root, text=True, timeout=5).strip()
         if head != code_sha or dirty:
             raise ValueError("protocol_fixed_code_or_clean_worktree_mismatch")
+    if hasattr(contract, "check_parent_authorization"):
+        contract.check_parent_authorization(auth, root, controller=check_git)
     reference = auth["preflight"]
     verified = preflight.verify_file(reference["path"], reference["sha256"], trade_date=trade_date,
         approved_sha=code_sha, current=current, root=root, execution_contract=contract.EXECUTION_CONTRACT,
@@ -69,12 +73,12 @@ def authorize(auth, *, trade_date, target_at, code_sha, root, current, test_only
     return permitted
 
 
-def _launch_materials(task, root):
+def _launch_materials(task, root, *, profile=contract):
     opening = preflight.read(task["launch"])
     basic_task = {k: v for k, v in task.items() if k not in ("launch", "launch_root_pid")}
     if opening.get("schema") != "protocol_launch_receipt_v1" or opening.get("task") != basic_task:
         raise ValueError("protocol_launch_receipt_task_mismatch")
-    directory = Path(root) / AUDIT_RELATIVE / task["trade_date"]
+    directory = Path(root) / getattr(profile, "AUDIT_RELATIVE", AUDIT_RELATIVE) / task["trade_date"]
     if Path(task["launch"]["path"]).resolve() != (directory / "request.started.json").resolve():
         raise ValueError("protocol_launch_path_mismatch")
     if Path(opening["intent"]["path"]).resolve() != (directory / "intent.json").resolve():
@@ -87,20 +91,23 @@ def _launch_materials(task, root):
     auth = preflight.read(opening["authorization"])
     if auth["local_config"] != task["config"]:
         raise ValueError("protocol_launch_config_mismatch")
+    if hasattr(profile, "check_parent_launch"):
+        profile.check_parent_launch(task, auth, root)
     return auth
 
 
-def verify_worker_launch(task):
+def verify_worker_launch(task, *, profile=contract):
     """A direct internal-worker invocation cannot skip the real preflight."""
-    auth = _launch_materials(task, store.ROOT)
+    auth = _launch_materials(task, store.ROOT, profile=profile)
     # The controller already queried current Git and the live environment.
     # Replay those anchored checks here; spawning git would violate the
     # unchanged local-preparation boundary which forbids helper processes.
     return authorize(auth, trade_date=task["trade_date"], target_at=task["scheduled_at"], code_sha=task["code_sha"],
-        root=store.ROOT, current=preflight.now(), during_preparation=True, check_git=False)
+        root=store.ROOT, current=preflight.now(), during_preparation=True, check_git=False, profile=profile)
 
 
-def capture(plan, trade_date, target_at, *, authorization, _test=None):
+def capture(plan, trade_date, target_at, *, authorization, _test=None, profile=contract):
+    contract = profile
     contract.check_plan(plan)
     if _test is not None and _test.get("test_only") is not True:
         raise ValueError("explicit_protocol_test_context_required")
@@ -110,10 +117,11 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None):
     writer = _test.get("write", store.write) if _test else store.write
     auth = preflight.read(authorization)
     current, target = clock(), preflight.stamp(target_at)
-    blockers(root)
+    check_blockers = getattr(contract, "blockers", blockers)
+    check_blockers(root)
     permitted = authorize(auth, trade_date=trade_date, target_at=target_at, code_sha=auth["code_sha"],
-                          root=root, current=current, test_only=bool(_test))
-    directory = root / AUDIT_RELATIVE / trade_date
+                          root=root, current=current, test_only=bool(_test), profile=contract)
+    directory = root / getattr(contract, "AUDIT_RELATIVE", AUDIT_RELATIVE) / trade_date
     if directory.exists():
         raise ValueError("protocol_date_output_already_exists_no_second_intent")
     # A live query is still mandatory after validating the anchored preflight.
@@ -129,7 +137,7 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None):
     preflight.fresh_at(permitted, clock())
     if clock() >= target - timedelta(seconds=5):
         raise ValueError("protocol_first_preparation_window_missed")
-    blockers(root)
+    check_blockers(root)
     batch_id = uuid.uuid4().hex
     intent = writer(directory / "intent.json", store.safe(schema="protocol_diagnostic_intent_v1",
         batch_id=batch_id, code_sha=auth["code_sha"], trade_date=trade_date, target_at=target_at,
@@ -140,7 +148,8 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None):
     actual, started = clock(), time.perf_counter()
     preflight.fresh_at(permitted, actual)
     task = contract.task_for(target, actual=actual, started=started, batch_id=batch_id,
-                             code_sha=auth["code_sha"], config=auth["local_config"], test_only=bool(_test))
+        code_sha=auth["code_sha"], config=auth["local_config"], test_only=bool(_test),
+        **(contract.task_context(root, trade_date) if hasattr(contract, "task_context") else {}))
     opening = writer(directory / "request.started.json", {"schema": "protocol_launch_receipt_v1",
         "task": deepcopy(task), "authorization": authorization, "intent": preflight.ref(intent)})
     task["launch"] = preflight.ref(opening)
@@ -169,7 +178,7 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None):
                 "stderr_sha256": sha256(b"").hexdigest(), "cleanup_complete": False, "output_complete": False}
             writer(root / SHARED_RELATIVE / "cleanup-incomplete.json", store.safe(
                 status="PROTOCOL_CONTROLLER_RESULT_UNCONFIRMED", batch_id=batch_id, automatic_reset_allowed=False))
-    evidence = audit.make_evidence(result, test_only=bool(_test))
+    evidence = audit.make_evidence(result, test_only=bool(_test), profile=contract)
     evidence.update(authorization=auth, authorization_reference=authorization,
         project_root=str(root), preparation_started_at=actual.isoformat(),
         authorization_checked_at=current.isoformat(), live_environment=live, execution_error=error)
@@ -179,22 +188,24 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None):
 
 
 def verify_files(path, expected_sha, *, receipt_path=None, expected_receipt_sha256=None,
-                 completion_path=None, expected_completion_sha256=None):
+                 completion_path=None, expected_completion_sha256=None, profile=contract):
+    contract = profile
     errors, capture_result, seal_status = [], None, "SEAL_UNCONFIRMED"
     raw_integrity, evidence, raw = False, None, {}
     try:
         evidence = store.read_anchored(path, expected_sha)
-        raw = audit.verify(evidence)
+        raw = audit.verify(evidence, profile=contract)
         raw_integrity, capture_result = raw["evidence_integrity_verified"], raw["diagnostic_result"]
         errors.extend(raw["errors"])
         auth = preflight.read(evidence["authorization_reference"])
         if auth != evidence["authorization"]:
             raise ValueError("protocol_authorization_reference_mismatch")
-        if _launch_materials(evidence["result"]["task"], evidence["project_root"]) != auth:
+        if _launch_materials(evidence["result"]["task"], evidence["project_root"], profile=contract) != auth:
             raise ValueError("protocol_launch_authorization_mismatch")
         authorize(auth, trade_date=evidence["trade_date"], target_at=evidence["result"]["task"]["scheduled_at"],
             code_sha=evidence["code_sha"], root=evidence["project_root"],
-            current=preflight.stamp(evidence["authorization_checked_at"]), test_only=evidence["test_only"], check_git=False)
+            current=preflight.stamp(evidence["authorization_checked_at"]), test_only=evidence["test_only"],
+            check_git=False, profile=contract)
         preflight._environment(evidence["live_environment"], evidence["trade_date"], evidence["code_sha"],
             evidence["project_root"], preflight.stamp(evidence["preparation_started_at"]), evidence["test_only"],
             execution_contract=contract.EXECUTION_CONTRACT)

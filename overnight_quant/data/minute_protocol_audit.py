@@ -11,17 +11,22 @@ from . import minute_protocol_contract as contract
 from .minute_protocol_trace import MAX_BODY_BYTES, MAX_INTERACTIONS, MAX_OUTPUT_BYTES, MAX_RECV_CALLS, ProtocolTrace
 
 
-def authorization_draft(code_sha=None):
+def authorization_draft(code_sha=None, *, profile=contract):
+    contract = profile
     return {"schema": contract.AUTHORIZATION_VERSION, "execution_contract": contract.EXECUTION_CONTRACT,
             "status": "DRAFT_NOT_AUTHORIZED", "code_sha": code_sha, "trade_date": None,
             "target_at": None, "plan_hash": contract.frozen_plan()["plan_hash"], "single_use": True,
-            "plan_file_sha256": None, "approval_source": None, "preflight": None, "local_config": None}
+            "plan_file_sha256": None, "approval_source": None, "preflight": None, "local_config": None,
+            **({"experiment_id": contract.experiment_id,
+                "matrix_plan_hash": contract.frozen_plan()["matrix_plan_hash"], "matrix_authorization_id": None}
+               if hasattr(contract, "experiment_id") else {})}
 
 
-def validate_authorization(value, *, code_sha, now, _during_preparation=False):
+def validate_authorization(value, *, code_sha, now, _during_preparation=False, profile=contract):
+    contract = profile
     if (value.get("schema") != contract.AUTHORIZATION_VERSION
             or value.get("execution_contract") != contract.EXECUTION_CONTRACT
-            or value.get("status") != "PM_APPROVED_SINGLE_PROTOCOL_DIAGNOSTIC"
+            or value.get("status") != getattr(contract, "APPROVAL_STATUS", "PM_APPROVED_SINGLE_PROTOCOL_DIAGNOSTIC")
             or value.get("code_sha") != code_sha or not re.fullmatch(r"[0-9a-f]{40}", code_sha)
             or value.get("plan_hash") != contract.frozen_plan()["plan_hash"]
             or value.get("single_use") is not True or not value.get("approval_source")):
@@ -34,13 +39,16 @@ def validate_authorization(value, *, code_sha, now, _during_preparation=False):
     for name in ("preflight", "local_config"):
         reference = value[name]
         legacy.read_anchored(reference["path"], reference["sha256"])
+    if hasattr(contract, "check_authorization_scope"):
+        contract.check_authorization_scope(value)
     # This validates bindings only. It does not grant approval or validate the
     # future operational preflight's logic, service, calendar or clock freshness.
     return {"bindings_valid": True, "sampling_authorized": False,
             "operational_preflight_review_still_required": True}
 
 
-def make_evidence(result, *, test_only):
+def make_evidence(result, *, test_only, profile=contract):
+    contract = profile
     value = legacy.safe(schema=contract.EVIDENCE_VERSION, verifier=contract.VERIFIER_VERSION,
         execution_contract=contract.EXECUTION_CONTRACT, plan=contract.frozen_plan(),
         batch_id=result["task"]["batch_id"], code_sha=result["task"]["code_sha"],
@@ -165,7 +173,8 @@ def _absolute_timing(result, events):
         return {"timing_contract_verified": False, "timing_errors": [str(exc)], "recomputed_timing": measured}
 
 
-def verify(value):
+def verify(value, *, profile=contract):
+    contract = profile
     errors = []
     result, terminal, trace = {}, None, None
     malformed_stream = False
@@ -290,6 +299,11 @@ def verify(value):
         errors.append(str(exc))
     if trace is not None and (terminal is None or result.get("output_complete") is False):
         trace.failure = trace.failure or "protocol_terminal_missing_or_output_incomplete"
+    if trace is not None and hasattr(contract, "check_trace_request"):
+        try:
+            contract.check_trace_request(trace)
+        except (ValueError, KeyError, TypeError) as exc:
+            errors.append(str(exc))
     timing = _absolute_timing(result, events)
     success = bool(not errors and not historical and timing["timing_contract_verified"]
                    and result.get("ok") is True and terminal and terminal.get("ok") is True)

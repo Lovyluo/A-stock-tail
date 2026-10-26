@@ -9,7 +9,8 @@ from . import minute_protocol_contract as contract
 from .minute_protocol_trace import BoundedEmitter, ProtocolTrace
 
 
-def main(*, _test=None):
+def main(*, _test=None, contract_profile=contract):
+    contract = contract_profile
     guard = prepared.NetworkBoundary()
     sys.addaudithook(guard.audit)
     task, trace = None, None
@@ -27,6 +28,8 @@ def main(*, _test=None):
     try:
         stream = prepared.ProtocolInput()
         task = stream.line(deadline[0])
+        if hasattr(contract, "for_task"):
+            contract = contract.for_task(task)
         contract.check_task(task)
         ancestry = prepared.parent_chain()
         if (task["parent_pid"] not in ancestry[1:] or task.get("launch_root_pid") not in ancestry
@@ -39,11 +42,12 @@ def main(*, _test=None):
         permitted = None
         if not _test:
             from .minute_protocol_execution import verify_worker_launch
-            permitted = verify_worker_launch(task)
+            permitted = verify_worker_launch(task, profile=contract)
         deadline[0] = task["preparation_work_deadline"]
         if _test:
             _test["configure"](task, guard)
-        versions = prepared.prepare_local(task, guard, emit_fn=emit, codes=contract.CODES)
+        versions = prepared.prepare_local(task, guard, emit_fn=emit, codes=contract.CODES,
+            **({"parser_requests": [contract.request]} if hasattr(contract, "request") else {}))
         guard.assert_clean()
         emit({"kind": "READY_LOCAL_ONLY", "worker_version": contract.WORKER_VERSION,
             "task_hash": native.digest(task), "pid": os.getpid(),
@@ -71,8 +75,9 @@ def main(*, _test=None):
             client = None
             try:
                 client = native.NativeClient(emit=emit)
-                frame = client.bars(**contract.frozen_plan()["request"])
-                if frame is None or frame.empty or len(frame) > 800:
+                request = contract.frozen_plan()["request"]
+                frame = client.bars(**request)
+                if frame is None or frame.empty or len(frame) > request["offset"]:
                     raise ValueError("protocol_diagnostic_empty_or_oversized_rows")
                 row_count = len(frame)
             finally:
