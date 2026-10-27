@@ -38,7 +38,16 @@ def execution_profile(name="legacy_v1"):
     if name == "single_bars_protocol_diagnostic_v1":
         from . import minute_protocol_contract as protocol
         return protocol, protocol.PREFLIGHT_VERSION, protocol.PREFLIGHT_VERIFIER
+    from . import minute_protocol_differential_contract as differential
+    if name in differential.CONTRACT_NAMES:
+        profile = differential.profile_for_name(name)
+        return profile, profile.PREFLIGHT_VERSION, profile.PREFLIGHT_VERIFIER
     raise ValueError("unknown_minute_execution_contract")
+
+
+def _protocol_contract(name):
+    from .minute_protocol_differential_contract import CONTRACT_NAMES
+    return name == "single_bars_protocol_diagnostic_v1" or name in CONTRACT_NAMES
 
 
 def now():
@@ -156,7 +165,7 @@ def _basic(trade_date, approved_sha, plan_ref, current, *, execution_contract="l
     plan = read(plan_ref)
     profile, _, _ = execution_profile(execution_contract)
     profile.check_plan(plan)
-    protocol = execution_contract == "single_bars_protocol_diagnostic_v1"
+    protocol = _protocol_contract(execution_contract)
     for package, expected in plan["dependencies" if protocol else "client_versions"].items():
         try:
             actual = installed_version(package)
@@ -169,6 +178,8 @@ def _basic(trade_date, approved_sha, plan_ref, current, *, execution_contract="l
         first_start -= timedelta(seconds=5)
     if protocol:
         target = stamp(target_at)
+        if hasattr(profile, "target_clock") and target_at != f"{trade_date}T{profile.target_clock}+08:00":
+            raise ValueError("differential_frozen_target_mismatch")
         remaining_ms = plan["absolute_network_and_cleanup_ms"] + plan["seal_budget_ms"]
         if (target.date().isoformat() != trade_date or
                 target + timedelta(milliseconds=remaining_ms) > stamp(f"{trade_date}T{plan['collection_deadline']}+08:00")):
@@ -184,15 +195,16 @@ def _environment(reference, trade_date, approved_sha, root, current, test_only, 
     if not test_only:
         _reject_test(environment)
     _verify_environment(environment)
-    protocol = execution_contract == "single_bars_protocol_diagnostic_v1"
-    from . import minute_protocol_contract
-    if (environment.get("scope") != (minute_protocol_contract.ENV_SCOPE if protocol else ENV_SCOPE)
+    protocol = _protocol_contract(execution_contract)
+    profile, _, _ = execution_profile(execution_contract)
+    if (environment.get("scope") != (profile.ENV_SCOPE if protocol else ENV_SCOPE)
             or environment.get("trade_date") != trade_date
             or Path(environment["project_root"]).resolve() != Path(root).resolve()
             or Path(environment["capture_root"]).resolve() != (Path(root) / "overnight_quant/data/cache/minute_capture_audit").resolve()
             or environment.get("timezone") != "China Standard Time"):
         raise ValueError("minute_environment_identity_mismatch")
-    if protocol and Path(environment["diagnostic_root"]).resolve() != (Path(root) / "overnight_quant/data/cache/minute_protocol_diagnostic").resolve():
+    relative = getattr(profile, "AUDIT_RELATIVE", "overnight_quant/data/cache/minute_protocol_diagnostic")
+    if protocol and Path(environment["diagnostic_root"]).resolve() != (Path(root) / relative).resolve():
         raise ValueError("protocol_environment_root_mismatch")
     if environment.get("git_head") != approved_sha or environment.get("git_status") != []:
         raise ValueError("fixed_head_or_clean_worktree_mismatch")
@@ -268,7 +280,7 @@ def evaluate(inputs, trade_date, approved_sha, root, current, *, test_only=False
             "last_sample_age_seconds": age, "service": service, "measurement": samples,
             "source_matches_system_sync_name": samples["source"].lower() == service["source"].split(",")[0].lower(),
             "hold_not_a_standalone_rejection": True,
-            "first_wave_at": target_at if execution_contract == "single_bars_protocol_diagnostic_v1" else f"{trade_date}T{audit.CLOCKS[0]}+08:00"}
+            "first_wave_at": target_at if _protocol_contract(execution_contract) else f"{trade_date}T{audit.CLOCKS[0]}+08:00"}
 
 
 def _query(output, trade_date, root, prepared_at, *, test=None, execution_contract="legacy_v1", controller_pid=None):
@@ -276,13 +288,17 @@ def _query(output, trade_date, root, prepared_at, *, test=None, execution_contra
         "-NoProfile", "-NonInteractive", "-File", str(ENV_SCRIPT), "-OpsDirectory", str(output),
         "-OutputPath", str(output / "environment-native.json"), "-MinuteCapture", "-ProjectRoot", str(root),
         "-MinuteCaptureRoot", str(Path(root) / "overnight_quant/data/cache/minute_capture_audit"), "-TradeDate", trade_date])
-    if not test and execution_contract == "single_bars_protocol_diagnostic_v1":
-        command += ["-ProtocolDiagnostic", "-ProtocolDiagnosticRoot", str(Path(root) / "overnight_quant/data/cache/minute_protocol_diagnostic")]
+    if not test and _protocol_contract(execution_contract):
+        profile, _, _ = execution_profile(execution_contract)
+        relative = getattr(profile, "AUDIT_RELATIVE", "overnight_quant/data/cache/minute_protocol_diagnostic")
+        command += ["-ProtocolDiagnostic", "-ProtocolDiagnosticRoot", str(Path(root) / relative)]
+        if hasattr(profile, "experiment_id"):
+            command += ["-ProtocolDiagnosticWorkerVersion", profile.WORKER_VERSION]
         if controller_pid is not None:
             command += ["-AllowedControllerPid", str(controller_pid)]
     started = (test["clock"]() if test else now()).isoformat()
     audit.write(output / "intent.json", {"created_at": started, "environment_observation_since": prepared_at, "trade_date": trade_date,
-        "purpose": execution_profile(execution_contract)[1] if execution_contract == "single_bars_protocol_diagnostic_v1" else VERSION,
+        "purpose": execution_profile(execution_contract)[1] if _protocol_contract(execution_contract) else VERSION,
         "sampling_authorized": False})
     result = run_probe_worker_process({}, test.get("query_timeout_ms", 10500) if test else 10500,
         worker_command=command, retain_streams=True, bounded_cleanup_ms=500)
@@ -309,7 +325,7 @@ def prepare(*, trade_date, approved_sha, plan_ref, output, inputs=None, environm
                         test_only=bool(_test), code_sha=approved_sha, trade_date=trade_date, project_root=str(root),
                         started_at=current.isoformat(), checks={}, failure_reasons=[], inputs={"plan": plan_ref},
                         pm_approval_generated=False, capture_started=False, network_requests_made=0, ntp_measurements=0)
-    if execution_contract == "single_bars_protocol_diagnostic_v1":
+    if _protocol_contract(execution_contract):
         result["target_at"] = target_at
     try:
         _basic(trade_date, approved_sha, plan_ref, current, execution_contract=execution_contract, target_at=target_at)
@@ -352,7 +368,7 @@ def verify_file(path, expected_sha, *, trade_date, approved_sha, current=None, r
         if (value.get("trade_date") != trade_date or value.get("code_sha") != approved_sha
                 or value.get("project_root") != str(root or ROOT)):
             raise ValueError("preflight_date_code_or_root_mismatch")
-        if execution_contract == "single_bars_protocol_diagnostic_v1" and value.get("target_at") != target_at:
+        if _protocol_contract(execution_contract) and value.get("target_at") != target_at:
             raise ValueError("protocol_preflight_target_mismatch")
         if value.get("evidence_hash") != audit.digest({k: v for k, v in value.items() if k != "evidence_hash"}):
             raise ValueError("preflight_evidence_hash_mismatch")

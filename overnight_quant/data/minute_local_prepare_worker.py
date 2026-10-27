@@ -141,7 +141,7 @@ def parent_chain():
         kernel.CloseHandle(handle)
 
 
-def prepare_local(task, guard, *, emit_fn=None, codes=None):
+def prepare_local(task, guard, *, emit_fn=None, codes=None, parser_requests=None):
     output = emit_fn or emit
     from importlib.metadata import version
     with native.client_stage(output, "local_dependency_imports"):
@@ -161,9 +161,13 @@ def prepare_local(task, guard, *, emit_fn=None, codes=None):
         if (not isinstance(value, dict) or not isinstance(value.get("SERVER"), dict)
                 or not isinstance(value["SERVER"].get("HQ"), list) or not value["SERVER"]["HQ"]):
             raise ValueError("prepared_local_config_invalid_no_discovery")
-        for code in (native.CODES if codes is None else codes):
+        requests = parser_requests if parser_requests is not None else [
+            {"symbol": code, "frequency": "1m", "start": 0, "offset": 800}
+            for code in (native.CODES if codes is None else codes)]
+        for request in requests:
+            code = request["symbol"]
             parser = GetSecurityBarsCmd(None)
-            parser.setParams(8, 1 if code.startswith("6") else 0, code, 0, 800)
+            parser.setParams(8, 1 if code.startswith("6") else 0, code, request["start"], request["offset"])
     guard.assert_clean()
     return actual
 

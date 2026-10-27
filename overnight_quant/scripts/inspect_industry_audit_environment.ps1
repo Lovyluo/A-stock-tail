@@ -4,6 +4,8 @@ param(
     [switch]$MinuteCapture,
     [switch]$ProtocolDiagnostic,
     [string]$ProtocolDiagnosticRoot,
+    [ValidateSet('mootdx_protocol_diagnostic_worker_v1','mootdx_protocol_differential_worker_v1')]
+    [string]$ProtocolDiagnosticWorkerVersion = 'mootdx_protocol_diagnostic_worker_v1',
     [int]$AllowedControllerPid = 0,
     [string]$ProjectRoot,
     [string]$MinuteCaptureRoot,
@@ -69,9 +71,9 @@ try {
         if (!$ProjectRoot -or !$MinuteCaptureRoot -or !$TradeDate) { throw 'Minute environment arguments missing' }
         # Match actual entry/module tokens, not every Python process or a word in a note.
         $pattern = '(?:[\\/]|^|[\s"])' +
-            '(?:run_minute_protocol_diagnostic|minute_protocol_worker|run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|' +
+            '(?:run_minute_protocol_diagnostic|minute_protocol_differential_worker|minute_protocol_worker|run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|' +
             'run_market_source_validation|run_complete_industry_audit|market_source_worker)\.(?:py|ps1)(?:["\s]|$)' +
-            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_protocol_worker|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)' +
+            '|(?:^|[\s"])-m"?\s*"?overnight_quant\.(?:data\.(?:minute_protocol_differential_worker|minute_protocol_worker|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)' +
             '|scripts\.(?:run_minute_protocol_diagnostic|run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
             '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
         $allowed = @()
@@ -149,7 +151,7 @@ try {
                     $opening = Get-Content -LiteralPath $startPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
                     $closed = Get-Content -LiteralPath (Join-Path $dir.FullName 'request.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
                     $closedTask = $closed.result.task | Select-Object * -ExcludeProperty launch_root_pid,launch
-                    if ($opening.task.worker_version -cne 'mootdx_protocol_diagnostic_worker_v1' -or
+                    if ($opening.task.worker_version -cne $ProtocolDiagnosticWorkerVersion -or
                         $opening.task.trade_date -cne $dir.Name -or $closed.result.cleanup_complete -isnot [bool] -or
                         !$closed.result.cleanup_complete -or
                         $closed.start_receipt_sha256 -cne (Get-FileSha256 $startPath) -or

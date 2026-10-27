@@ -13,11 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def body():
+def body(count=12):
     day = datetime(2026, 10, 24)
     packed = ((day.year - 2004) << 11) + day.month * 100 + day.day
-    result = bytearray(struct.pack("<H", 12))
-    for index, minute in enumerate(range(39, 51)):
+    result = bytearray(struct.pack("<H", count))
+    for index, minute in enumerate(range(39, 39 + count)):
         result.extend(struct.pack("<HH", packed, 14 * 60 + minute))
         number, encoded = (10000 if index == 0 else 0), bytearray()
         encoded.append(number & 0x3f)
@@ -90,7 +90,14 @@ class NativeSocket:
         if len(self.sent) == 4 and self.mode == "flood":
             sys.stderr.buffer.write(b"X" * (2 * 1048576))
             sys.stderr.buffer.flush()
-        value = b"\x01" if len(self.sent) <= 3 else (b"\x20\x03" if self.mode == "short" else body())
+        if len(self.sent) <= 3:
+            value = b"\x01"
+        else:
+            symbol = raw[14:20].decode("ascii")
+            count = struct.unpack("<H", raw[26:28])[0]
+            short = (self.mode == "short" or self.mode == "large-count-short" and count == 800
+                     or self.mode == "shanghai-short" and symbol == "600000")
+            value = b"\x20\x03" if short else body(min(count, 12))
         if len(self.sent) == 4 and self.mode == "large":
             value += b"\x00" * (65535-len(value))
         self.buffer = bytearray(struct.pack("<IIIHH", 0, 0, 0, len(value), len(value)) + value)
@@ -110,6 +117,9 @@ class NativeSocket:
 
 def child():
     from overnight_quant.data import minute_protocol_worker as worker
+    from overnight_quant.data import minute_protocol_contract as single_profile
+    from overnight_quant.data import minute_protocol_differential_contract as differential
+    is_differential = len(sys.argv) > 2 and sys.argv[2] == "differential"
     NativeSocket.mode = sys.argv[1]
     def configure(task, guard):
         def external_guard(event, args):
@@ -123,13 +133,15 @@ def child():
             import json
             from overnight_quant.data import minute_protocol_execution as execution
             from overnight_quant.data.minute_capture_preflight import stamp
-            root = Path(task["launch"]["path"]).parents[5]
-            auth = execution._launch_materials(task, root)
+            profile = differential.for_task(task) if is_differential else single_profile
+            root = Path(task["launch"]["path"]).parents[6 if is_differential else 5]
+            auth = execution._launch_materials(task, root, profile=profile)
             actual = stamp(task["scheduled_at"]) + timedelta(seconds=time.perf_counter() - task["target_monotonic"])
             execution.authorize(auth, trade_date=task["trade_date"], target_at=task["scheduled_at"],
-                code_sha=task["code_sha"], root=root, current=actual, test_only=True, during_preparation=True, check_git=False)
+                code_sha=task["code_sha"], root=root, current=actual, test_only=True,
+                during_preparation=True, check_git=False, profile=profile)
             print(json.dumps({"kind": "fixture_launch_validated", "test_only": True,
-                "worker_cwd": os.getcwd(), "execution_worker_version": worker.contract.WORKER_VERSION}), flush=True)
+                "worker_cwd": os.getcwd(), "execution_worker_version": profile.WORKER_VERSION}), flush=True)
         import mootdx.config as config
         import tdxpy.base_socket_client as sockets
         config.CONF = task["config"]["path"]
@@ -137,7 +149,8 @@ def child():
             raise AssertionError("fixture_discovery_forbidden")
         config.bestip = forbidden
         sockets.TrafficStatSocket = NativeSocket
-    return worker.main(_test={"configure": configure})
+    return worker.main(_test={"configure": configure},
+        contract_profile=differential if is_differential else single_profile)
 
 
 if __name__ == "__main__":

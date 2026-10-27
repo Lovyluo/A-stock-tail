@@ -43,12 +43,13 @@ function global:Get-CimInstance {
     }
     if ($ClassName -eq 'Win32_OperatingSystem') { return [pscustomobject]@{LastBootUpTime=[datetime]::Parse('2026-10-15T04:00:00+08:00')} }
     if ($MinuteCapture -and $ClassName -eq 'Win32_Process') {
-        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact','prepared-worker','prepared-cli','prepared-module','protocol-worker','protocol-cli','protocol-controller-worker')) {
+        if ($Mode -in @('worker','cli','quoted-cli','module-cli','module-cli-compact','prepared-worker','prepared-cli','prepared-module','protocol-worker','protocol-differential-worker','protocol-cli','protocol-controller-worker')) {
             $command = if($Mode -eq 'worker') {'python -m overnight_quant.data.minute_capture_worker'} `
                 elseif($Mode -eq 'prepared-worker') {'python -m overnight_quant.data.minute_local_prepare_worker'} `
                 elseif($Mode -eq 'prepared-cli') {'python overnight_quant/scripts/run_minute_local_prepare_audit.py --network'} `
                 elseif($Mode -eq 'prepared-module') {'python -movernight_quant.scripts.run_minute_local_prepare_audit --network'} `
                 elseif($Mode -eq 'protocol-worker') {'python -m overnight_quant.data.minute_protocol_worker'} `
+                elseif($Mode -eq 'protocol-differential-worker') {'python -m overnight_quant.data.minute_protocol_differential_worker'} `
                 elseif($Mode -in @('protocol-cli','protocol-controller-worker')) {'python -m overnight_quant.scripts.run_minute_protocol_diagnostic --network'} `
                 elseif($Mode -eq 'cli') {'python overnight_quant/scripts/run_minute_capture_audit.py --network'} `
                 elseif($Mode -eq 'module-cli') {'python -m overnight_quant.scripts.run_minute_capture_audit --network'} `
