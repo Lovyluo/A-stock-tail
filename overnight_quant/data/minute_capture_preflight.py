@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 from importlib.metadata import PackageNotFoundError, version as installed_version
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -295,7 +296,12 @@ def _query(output, trade_date, root, prepared_at, *, test=None, execution_contra
         if hasattr(profile, "experiment_id"):
             command += ["-ProtocolDiagnosticWorkerVersion", profile.WORKER_VERSION]
         if controller_pid is not None:
-            command += ["-AllowedControllerPid", str(controller_pid)]
+            if type(controller_pid) is not int or controller_pid <= 0:
+                raise ValueError("protocol_controller_pid_invalid")
+            command += ["-AllowedControllerPid", str(controller_pid),
+                "-ControllerPythonPath", sys.executable,
+                "-ControllerBasePythonPath", getattr(sys, "_base_executable", None) or sys.executable,
+                "-ControllerWorkingDirectory", os.getcwd()]
     started = (test["clock"]() if test else now()).isoformat()
     audit.write(output / "intent.json", {"created_at": started, "environment_observation_since": prepared_at, "trade_date": trade_date,
         "purpose": execution_profile(execution_contract)[1] if _protocol_contract(execution_contract) else VERSION,

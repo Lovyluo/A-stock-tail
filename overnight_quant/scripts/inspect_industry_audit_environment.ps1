@@ -7,6 +7,9 @@ param(
     [ValidateSet('mootdx_protocol_diagnostic_worker_v1','mootdx_protocol_differential_worker_v1')]
     [string]$ProtocolDiagnosticWorkerVersion = 'mootdx_protocol_diagnostic_worker_v1',
     [int]$AllowedControllerPid = 0,
+    [string]$ControllerPythonPath,
+    [string]$ControllerBasePythonPath,
+    [string]$ControllerWorkingDirectory,
     [string]$ProjectRoot,
     [string]$MinuteCaptureRoot,
     [string]$TradeDate
@@ -15,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 $code = 2
 $serviceRunning = $null
 $serviceCheckStatus = 'NOT_QUERIED'
+$controllerDiagnostics = @()
 function Get-FileSha256([string]$Path) {
     $stream = $null
     $algorithm = $null
@@ -62,7 +66,12 @@ try {
         $since = [DateTimeOffset]::Parse([string]$intent.environment_observation_since).LocalDateTime
     }
     $issues = @()
-    $allProcesses = @(Get-CimInstance Win32_Process)
+    try { $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+    catch {
+        $controllerDiagnostics = @(@{stage='process_query';pid=$AllowedControllerPid;parent_pid=$null
+            process_name=$null;failed_item='PROCESS_QUERY_FAILED';classification='REJECTED'})
+        throw 'Process inventory query failed'
+    }
     $workers = @($allProcesses | Where-Object {
         $_.ProcessId -ne $PID -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
         $_.CommandLine -match 'market_httpclient_worker\.ps1|market_source_worker\.py|run_complete_industry_audit\.py|run_market_source_validation\.py|pytest|run_minute_probe_watchdog\.ps1'
@@ -77,25 +86,34 @@ try {
             '|scripts\.(?:run_minute_protocol_diagnostic|run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))(?:[\s"]|$)' +
             '|inspect_industry_audit_environment\.ps1.*-MinuteCapture'
         $allowed = @()
+        $ordinaryBoundary = @()
+        if ($ProtocolDiagnostic) { . (Join-Path $PSScriptRoot 'protocol_controller_identity.ps1') }
         if ($ProtocolDiagnostic -and $AllowedControllerPid -gt 0) {
-            $controller = @($allProcesses | Where-Object { $_.ProcessId -eq $AllowedControllerPid })
-            if ($controller.Count -ne 1) { throw 'Protocol controller PID unavailable' }
-            $item = $controller[0]
-            do {
-                if ($item.Name -notmatch '^python(w)?(\.exe)?$' -or
-                    $item.CommandLine -notmatch 'run_minute_protocol_diagnostic(?:\.py)?["\s].*--network') {
-                    throw 'Protocol controller command identity invalid'
-                }
-                $allowed += [int]$item.ProcessId
-                $parent = @($allProcesses | Where-Object { $_.ProcessId -eq $item.ParentProcessId })
-                if ($parent.Count -ne 1 -or $parent[0].CommandLine -notmatch 'run_minute_protocol_diagnostic(?:\.py)?["\s].*--network') { break }
-                $item = $parent[0]
-            } while ($item.ProcessId -notin $allowed)
+            $roles = Resolve-ProtocolControllers $allProcesses $AllowedControllerPid $ControllerPythonPath `
+                $ControllerBasePythonPath $ControllerWorkingDirectory $ProjectRoot
+            $allowed = @($roles.allowed)
+            $ordinaryBoundary = @($roles.ordinary_boundary)
+            $controllerDiagnostics = @($roles.diagnostics)
         }
-        $ids = @($allProcesses | Where-Object {
-            $_.ProcessId -ne $PID -and $_.ProcessId -notin $allowed -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
+        $candidates = @($allProcesses | Where-Object {
+            $_.ProcessId -ne $PID -and $_.ProcessId -notin $allowed -and $_.ProcessId -notin $ordinaryBoundary -and $_.Name -match '^(python|pythonw|powershell|pwsh|dotnet)(\.exe)?$' -and
             $_.CommandLine -match $pattern
-        } | ForEach-Object { [int]$_.ProcessId })
+        })
+        $ids = @(foreach ($candidate in $candidates) {
+            if ($ProtocolDiagnostic -and $candidate.Name -match '^python(w)?\.exe$') {
+                try {
+                    $words = ConvertFrom-ControllerCommandLine $candidate.CommandLine
+                    $entry = Get-ControllerEntry $words $ProjectRoot
+                    $direct = ($entry.kind -eq 'file' -and [IO.Path]::GetFileName($entry.value) -match
+                        '^(run_minute_protocol_diagnostic|minute_protocol_differential_worker|minute_protocol_worker|run_minute_capture_audit|run_minute_local_prepare_audit|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|run_minute_probe_watchdog|run_market_source_validation|run_complete_industry_audit|market_source_worker)\.py$') -or
+                        ($entry.kind -eq 'module' -and $entry.value -match '^overnight_quant\.(data\.(minute_protocol_differential_worker|minute_protocol_worker|minute_capture_worker|minute_local_prepare_worker|minute_probe_worker|market_source_worker)|scripts\.(run_minute_protocol_diagnostic|run_minute_capture_audit|run_minute_local_prepare_audit|run_market_source_validation|run_complete_industry_audit))$')
+                    # Text carried as data is not an invoked project entry. Unknown parsing still blocks.
+                    if (!$direct -and ($entry.kind -in @('file','module') -or
+                            ($entry.kind -eq 'option' -and $entry.value.StartsWith('-c')))) { continue }
+                } catch { }
+            }
+            [int]$candidate.ProcessId
+        })
         do {
             $more = @($allProcesses | Where-Object { $_.ParentProcessId -in $ids -and $_.ProcessId -notin $ids } |
                 ForEach-Object { [int]$_.ProcessId })
@@ -111,6 +129,15 @@ try {
             (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -join ' ') -match 'minute_capture|minute_local_prepare|minute_protocol'))
     } | ForEach-Object { [ordered]@{TaskPath=$_.TaskPath;TaskName=$_.TaskName;State=[string]$_.State;Enabled=[bool]$_.Settings.Enabled} })
     if ($workers.Count) { $issues += 'Residual worker present' }
+    if ($ProtocolDiagnostic) {
+        $workers = @($workers | ForEach-Object {
+            $algorithm = [Security.Cryptography.SHA256]::Create()
+            try { $hash = ([BitConverter]::ToString($algorithm.ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes([string]$_.CommandLine)))).Replace('-','').ToLowerInvariant() }
+            finally { $algorithm.Dispose() }
+            [pscustomobject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;Name=$_.Name;command_line_sha256=$hash}
+        })
+    }
     if (@($tasks | Where-Object { $_.Enabled -or $_.State -eq 'Running' }).Count) { $issues += 'Active project task present' }
     $pendingPreparations = @()
     if ($MinuteCapture -and (Test-Path -LiteralPath $MinuteCaptureRoot)) {
@@ -225,6 +252,8 @@ try {
         service_running=($service.Status -eq 'Running');service_process_id=$svc.ProcessId
         system_boot_time=$os.LastBootUpTime.ToString('o');timezone=[TimeZoneInfo]::Local.Id
         workers=$workers;tasks=$tasks;locks=$locks;journals=$journals;clock_or_power_events=$events;blockers=$issues
+        controller_identity=$controllerDiagnostics
+        controller_identity_version='protocol_controller_identity_v1'
         journal_changes=0;task_changes=0
     }
     if ($MinuteCapture) {
@@ -280,7 +309,8 @@ try {
 } catch {
     $failure = [ordered]@{schema_version='industry_audit_environment_v1';status='ENVIRONMENT_INSPECTION_FAILED'
         blockers=@($_.Exception.Message);inspection_succeeded=$false
-        service_running=$serviceRunning;service_check_status=$serviceCheckStatus}
+        service_running=$serviceRunning;service_check_status=$serviceCheckStatus;controller_identity=$controllerDiagnostics
+        controller_identity_version='protocol_controller_identity_v1'}
     if (!(Test-Path -LiteralPath $OutputPath)) { Write-Result $OutputPath $failure }
     $failure | ConvertTo-Json -Depth 5
 }
