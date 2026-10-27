@@ -27,7 +27,7 @@ def run_controller(args, env, root, timeout):
     return subprocess.CompletedProcess(args, result['returncode'], result['stdout'].encode(), result['stderr'].encode())
 
 
-def run_probe(tmp_path, shell, *, outer=False, differential=False, fault='', form='absolute'):
+def run_probe(tmp_path, shell, *, outer=False, differential=False, fault='', form='absolute', runtime_shape='venv-or-base'):
     root = tmp_path / ('synthetic root' if form == 'quoted' else 'synthetic-root')
     entry = root / 'overnight_quant/scripts/run_minute_protocol_diagnostic.py'
     entry.parent.mkdir(parents=True)
@@ -40,7 +40,7 @@ def run_probe(tmp_path, shell, *, outer=False, differential=False, fault='', for
     temp.mkdir()
     spec = dict(test_only=True, root=str(root), output=str(tmp_path / 'query'),
         shell=shell, harness=str(FIXTURES / 't31_environment_behavior_harness.ps1'),
-        temp=str(temp), network_log=str(tmp_path / 'network.json'), fault=fault)
+        temp=str(temp), network_log=str(tmp_path / 'network.json'), fault=fault, runtime_shape=runtime_shape)
     spec_path = tmp_path / 'spec.json'
     spec_path.write_text(json.dumps(spec), encoding='utf-8')
     plan = tmp_path / 'plan.json'
@@ -148,6 +148,15 @@ def test_real_process_rejections_are_specific_and_redacted(tmp_path, shell, faul
         diagnostic = value['controller_identity'][-1]
         assert diagnostic['stage'] == stage and diagnostic['failed_item'] == item
         assert diagnostic['pid'] > 0
+
+
+@pytest.mark.parametrize('shell', SHELLS)
+def test_base_interpreter_ancestor_negative_model(tmp_path, shell):
+    result, native = run_probe(tmp_path, shell, outer=True, differential=True,
+        fault='ancestor-mismatch', runtime_shape='base-only')
+    assert result['returncode'] == 2
+    diagnostic = native['controller_identity'][-1]
+    assert diagnostic['stage'] == 'parent' and diagnostic['failed_item'] == 'UNPROVEN_PYTHON_ANCESTOR_CHAIN'
 
 
 @pytest.mark.parametrize('shell', SHELLS)

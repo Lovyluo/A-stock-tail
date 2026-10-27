@@ -59,7 +59,12 @@ function global:Get-CimInstance {
                 if ($ProcessFault -eq 'missing-image') { $target[0].ExecutablePath=$null }
                 $parent = @($rows | Where-Object { $_.ProcessId -eq $target[0].ParentProcessId })
                 if ($parent.Count -eq 1 -and $ProcessFault -eq 'parent-command-missing') { $parent[0].CommandLine=$null }
-                if ($parent.Count -eq 1 -and $ProcessFault -eq 'ancestor-mismatch') { $parent[0].CommandLine += ' --secret NEVER_SAVE_THIS' }
+                if ($parent.Count -eq 1 -and $ProcessFault -eq 'ancestor-mismatch') {
+                    # Explicit negative model, even when the real CI launch parent is PowerShell.
+                    $parent[0].Name='python.exe'
+                    $parent[0].ExecutablePath=$ControllerPythonPath
+                    $parent[0].CommandLine=$target[0].CommandLine+' --secret NEVER_SAVE_THIS'
+                }
                 if ($parent.Count -eq 1 -and $ProcessFault -eq 'worker-parent') { $parent[0].CommandLine='python -m overnight_quant.data.minute_protocol_worker' }
             }
             $chain = @(); $next = $AllowedControllerPid

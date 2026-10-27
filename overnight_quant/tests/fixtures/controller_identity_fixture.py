@@ -56,7 +56,7 @@ def install():
             '-MinuteCaptureRoot', str(project / single.SHARED_RELATIVE),
             '-ProtocolDiagnosticRoot', str(project / getattr(profile, 'AUDIT_RELATIVE', single.AUDIT_RELATIVE)),
             '-TradeDate', day, '-AllowedControllerPid', str(selected_pid),
-            '-ControllerPythonPath', sys.executable,
+            '-ControllerPythonPath', sys._base_executable if spec.get('runtime_shape') == 'base-only' else sys.executable,
             '-ControllerBasePythonPath', sys._base_executable,
             '-ControllerWorkingDirectory', os.getcwd()]
         if spec.get('fault'):
