@@ -261,12 +261,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path")
     parser.add_argument("--expected-file-sha256", required=True)
     parser.add_argument("--output")
+    parser.add_argument("--calendar-only", action="store_true")
     args = parser.parse_args(argv)
-    result = verify_file(args.path, expected_file_sha256=args.expected_file_sha256)
+    if args.calendar_only:
+        from overnight_quant.scripts.completed_calendar_preparation import verify_calendar_file
+        result = verify_calendar_file(args.path, expected_file_sha256=args.expected_file_sha256)
+    else:
+        result = verify_file(args.path, expected_file_sha256=args.expected_file_sha256)
     if args.output:
         write_json_atomic(args.output, result)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if result["status"] == EVIDENCE_VERIFIED else 2
+    return 0 if (result["status"] == EVIDENCE_VERIFIED or
+                 (args.calendar_only and result["evidence_integrity_verified"]
+                  and result["provider_validation_passed"])) else 2
 
 
 if __name__ == "__main__":
