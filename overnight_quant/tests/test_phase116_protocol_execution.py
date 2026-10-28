@@ -314,6 +314,8 @@ def test_actual_powershell_recognizes_protocol_processes_and_tasks(tmp_path, she
         "-Script", str(pre.ENV_SCRIPT), "-OpsDirectory", str(ops), "-OutputPath", str(ops / "environment.json"),
         "-TempDirectory", str(temp), "-Mode", {"own-controller": "protocol-cli", "controller-worker": "protocol-controller-worker"}.get(mode, mode),
         "-AllowedControllerPid", "6000" if mode in ("own-controller", "controller-worker") else "0",
+        "-ControllerPythonPath", "C:\\synthetic\\python.exe", "-ControllerBasePythonPath", "C:\\synthetic\\python.exe",
+        "-ControllerWorkingDirectory", str(tmp_path),
         "-MinuteCapture", "-ProtocolDiagnostic", "-ProjectRoot", str(tmp_path),
         "-MinuteCaptureRoot", str(tmp_path / "shared"), "-ProtocolDiagnosticRoot", str(tmp_path / "diagnostic"),
         "-TradeDate", DAY], capture_output=True, timeout=20)
