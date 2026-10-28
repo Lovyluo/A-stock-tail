@@ -251,16 +251,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate S1 static providers")
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--date", required=True)
-    parser.add_argument("--codes", default=",".join(DEFAULT_CODES))
+    parser.add_argument("--codes")
     parser.add_argument("--output")
+    parser.add_argument("--calendar-only", action="store_true")
+    parser.add_argument("--approved-code-sha")
     args = parser.parse_args(argv)
     try:
-        result = run_static_source_validation(
-            network=args.network,
-            trade_date=args.date,
-            codes=tuple(code.strip() for code in args.codes.split(",") if code.strip()),
-            output=args.output,
-        )
+        if args.calendar_only:
+            from overnight_quant.scripts.completed_calendar_preparation import prepare_calendar
+            result = prepare_calendar(
+                network=args.network, trade_date=args.date, codes=args.codes,
+                approved_sha=args.approved_code_sha, output=args.output,
+            )
+        else:
+            result = run_static_source_validation(
+                network=args.network,
+                trade_date=args.date,
+                codes=tuple(code.strip() for code in
+                            (args.codes if args.codes is not None else ",".join(DEFAULT_CODES)).split(",")
+                            if code.strip()),
+                output=args.output,
+            )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result.get("provider_validation_passed") is True else 2
     except Exception as exc:
