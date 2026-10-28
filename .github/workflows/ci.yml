@@ -25,5 +25,16 @@ jobs:
           python -m pip install -r requirements-deploy.txt
 
       - name: Run tests
+        env:
+          PHASE118_DIAGNOSTICS: ${{ runner.temp }}/phase118-failure-diagnostics
         run: python -m pytest overnight_quant/tests -q
+
+      - name: Preserve Phase118 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase118-failure-diagnostics
+          path: ${{ runner.temp }}/phase118-failure-diagnostics/*.json
+          if-no-files-found: ignore
+          retention-days: 14
 
