@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha256
 import math
+import json
 import os
 from pathlib import Path
 import re
@@ -88,14 +89,29 @@ def check_task(task, *, audit_only_v1=False, audit_only_v2=False):
         raise ValueError("protocol_diagnostic_config_invalid")
     names = ("target_monotonic", "preparation_started_monotonic", "preparation_work_deadline",
              "preparation_hard_deadline", "io_deadline_monotonic", "hard_deadline_monotonic")
-    if any(type(task.get(k)) not in (int, float) or not math.isfinite(task[k]) for k in names):
-        raise ValueError("protocol_diagnostic_deadline_invalid")
+    invalid = [k for k in names if type(task.get(k)) not in (int, float) or not math.isfinite(task[k])]
+    if invalid:
+        raise ValueError("protocol_diagnostic_deadline_invalid:" + json.dumps({
+            "invalid_fields": {k: repr(task.get(k)) for k in invalid}}, sort_keys=True))
     target, start = task["target_monotonic"], task["preparation_started_monotonic"]
     expected = {"preparation_work_deadline": min(start + 3.5, target - 1.5),
         "preparation_hard_deadline": min(start + 4, target - 1),
         "io_deadline_monotonic": target + 1.5, "hard_deadline_monotonic": target + 2}
-    if not 0 < target - start <= 5 or any(abs(task[k] - v) > 1e-9 for k, v in expected.items()):
-        raise ValueError("protocol_diagnostic_deadline_contract_mismatch")
+    # Compare against the constructor's boundary without cancellation across a
+    # floating-point exponent boundary. No additional tolerance is granted.
+    failures = []
+    if not start < target <= start + 5:
+        failures.append({"condition": "start < target <= start + 5", "actual": target,
+            "lower_exclusive": start, "upper_inclusive": start + 5,
+            "lead_seconds": target - start, "upper_difference": target - (start + 5)})
+    for key, value in expected.items():
+        difference = task[key] - value
+        if abs(difference) > 1e-9:
+            failures.append({"condition": key, "actual": task[key], "expected": value,
+                "difference": difference})
+    if failures:
+        raise ValueError("protocol_diagnostic_deadline_contract_mismatch:" + json.dumps({
+            "start": start, "target": target, "failures": failures}, sort_keys=True))
 
 
 def go_message(task, sent_monotonic):
@@ -135,5 +151,12 @@ def task_for(target, *, actual, started, batch_id, code_sha, config, test_only=F
         "preparation_work_deadline": min(started + 3.5, t - 1.5),
         "preparation_hard_deadline": min(started + 4, t - 1),
         "io_deadline_monotonic": t + 1.5, "hard_deadline_monotonic": t + 2}
-    check_task(value)
+    try:
+        check_task(value)
+    except ValueError as exc:
+        raise ValueError(str(exc) + ":task_construction=" + json.dumps({
+            "target": target.isoformat(), "actual": actual.isoformat(), "started": started,
+            "lead_seconds": (target - actual).total_seconds(),
+            "wall_clock_source": "caller actual/target datetime",
+            "monotonic_source": "caller started perf_counter"}, sort_keys=True)) from exc
     return value

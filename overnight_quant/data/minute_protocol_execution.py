@@ -147,9 +147,16 @@ def capture(plan, trade_date, target_at, *, authorization, _test=None, profile=c
         sleep(min(.05, (target - timedelta(seconds=5) - clock()).total_seconds()))
     actual, started = clock(), time.perf_counter()
     preflight.fresh_at(permitted, actual)
-    task = contract.task_for(target, actual=actual, started=started, batch_id=batch_id,
-        code_sha=auth["code_sha"], config=auth["local_config"], test_only=bool(_test),
-        **(contract.task_context(root, trade_date) if hasattr(contract, "task_context") else {}))
+    try:
+        task = contract.task_for(target, actual=actual, started=started, batch_id=batch_id,
+            code_sha=auth["code_sha"], config=auth["local_config"], test_only=bool(_test),
+            **(contract.task_context(root, trade_date) if hasattr(contract, "task_context") else {}))
+    except ValueError as exc:
+        # Construction can fail before a worker or request receipt exists.
+        source = type(clock).__module__ + "." + type(clock).__qualname__ if _test else "minute_capture_preflight.now"
+        raise ValueError(str(exc) + ":clock_sources=" + json.dumps({
+            "target": "approved target_at ISO datetime", "actual": source,
+            "started": "time.perf_counter", "test_only": bool(_test)}, sort_keys=True)) from exc
     opening = writer(directory / "request.started.json", {"schema": "protocol_launch_receipt_v1",
         "task": deepcopy(task), "authorization": authorization, "intent": preflight.ref(intent)})
     task["launch"] = preflight.ref(opening)
