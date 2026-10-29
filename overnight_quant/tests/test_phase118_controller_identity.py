@@ -18,6 +18,62 @@ ROOT = Path(__file__).resolve().parents[2]
 CLI = ROOT / 'overnight_quant/scripts/run_minute_protocol_diagnostic.py'
 
 
+def failure_diagnostic(root, value):
+    """Only stage metadata, never authorization bodies or market responses."""
+    rows = []
+    for path in sorted(root.rglob('*.json')):
+        try:
+            material = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(material, dict):
+            continue
+        result = material.get('result', {})
+        row = {'path': str(path)}
+        for key in ('schema', 'error', 'errors', 'execution_error', 'diagnostic_result',
+                    'seal_status', 'seal_completed_at', 'seal_elapsed_ms', 'cleanup_complete'):
+            if key in material:
+                row[key] = material[key]
+        if isinstance(result, dict):
+            row['stages'] = {key: item for key, item in result.items()
+                if key.endswith('_monotonic') or key in ('error', 'error_code', 'stage',
+                    'returncode', 'cleanup_complete', 'tree_empty_observed', 'pipes_closed',
+                    'request_timed_out', 'output_complete')}
+            task = result.get('task', {})
+            row['deadlines'] = {key: task[key] for key in
+                ('scheduled_at', 'io_deadline_monotonic', 'hard_deadline_monotonic') if key in task}
+        payload = material.get('payload', material)
+        if isinstance(payload, dict) and 'controller_identity' in payload:
+            row['environment'] = {key: payload[key] for key in
+                ('controller_identity', 'ok', 'error', 'errors') if key in payload}
+        if 'items' in material:
+            row['experiments'] = [{**{key: item.get(key) for key in
+                ('id', 'continuation_allowed', 'continuation_checked_at')},
+                'verdict': {key: item.get('verdict', {}).get(key) for key in
+                    ('diagnostic_result', 'errors', 'seal_status', 'execution_materials_integrity_verified')}}
+                for item in material['items']]
+        if len(row) > 2 or row.get('stages'):
+            rows.append(row)
+    return {'test_only': True, 'summary': value, 'materials': rows}
+
+
+def test_failure_diagnostic_keeps_stage_evidence_not_authorization_or_raw(tmp_path):
+    material = {'schema': 'test-only', 'authorization': {'secret': 'DO_NOT_EXPORT'},
+        'raw_response': 'DO_NOT_EXPORT', 'result': {'stage': 'GO', 'error_code': 'REJECTED',
+            'cleanup_complete': True, 'finished_monotonic': 10.0,
+            'stdout': 'DO_NOT_EXPORT', 'task': {'io_deadline_monotonic': 9.0}},
+        'items': [{'id': 'B', 'continuation_allowed': False,
+            'verdict': {'diagnostic_result': 'FAILED', 'trace_summary': 'DO_NOT_EXPORT'}}]}
+    (tmp_path / 'evidence.json').write_text(json.dumps(material))
+    (tmp_path / 'broken.json').write_text('{')
+    value = failure_diagnostic(tmp_path, {'diagnostic_result': 'FAILED'})
+    row = value['materials'][0]
+    assert row['stages']['stage'] == 'GO'
+    assert row['deadlines']['io_deadline_monotonic'] == 9.0
+    assert row['experiments'][0]['id'] == 'B'
+    assert 'DO_NOT_EXPORT' not in json.dumps(value)
+
+
 def run_controller(args, env, root, timeout):
     from overnight_quant.data.probe_worker_process import run_probe_worker_process
     with patch.dict(os.environ, env), chdir(root):
@@ -210,7 +266,14 @@ def test_actual_cli_live_inspection_to_test_only_READY_GO(case, monkeypatch, cap
     value = json.loads(completed.stdout)
     network = json.loads((c['tmp']/'network.json').read_bytes())
     assert network['external_attempts'] == []
-    assert completed.returncode == (2 if fault else 0), (value,completed.stderr)
+    if completed.returncode != (2 if fault else 0):
+        diagnostic = failure_diagnostic(c['root'], value)
+        destination = Path(os.environ.get('PHASE118_DIAGNOSTICS', c['tmp'] / 'failure-diagnostics'))
+        destination.mkdir(parents=True, exist_ok=True)
+        import uuid
+        path = destination / (uuid.uuid4().hex + '.json')
+        path.write_text(json.dumps(diagnostic, indent=2), encoding='utf-8')
+        pytest.fail(json.dumps({'diagnostic_path': str(path), **diagnostic}, default=str))
     assert network['protocol_workers'] == (0 if fault else (4 if differential else 1))
     raw_files = list(c['root'].rglob('*evidence*v*.json'))
     actual = [json.loads(p.read_bytes()) for p in raw_files if 'result' in json.loads(p.read_bytes())]
