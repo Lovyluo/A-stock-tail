@@ -41,6 +41,15 @@ batch_id先确定，原子独占目录/活动锁及intent在网络前持久化�
 失败保留既有原件/部分材料；不覆盖成功文件或补旧批次。若全局截止或清理失败，
 已有文件不作为成功执行依据，必须使用最终外部锚点重放；不能只读取生产者success标志。
 
+父控制器异常回执按派发边界区分：尚未进入协调worker调用为`REQUEST_REJECTED`、
+`requests_dispatched=0`及`KNOWN_ZERO_BEFORE_DISPATCH`；一旦尝试派发则为`CONTROLLER_FAILED`、
+`requests_dispatched=null`及`UNKNOWN_AFTER_DISPATCH`，不推断实际HTTP请求数或worker是否已启动。
+保存原始error、failure_stage及已返回的process诊断；未取得清理回执时cleanup_complete=null。
+在原90秒剩余预算内仅尝试一次不可覆盖的`controller-failure.json`；返回值只在写完后标记
+failure_receipt_persisted=true。写失败或预算耗尽明确报告，文件本身不自证已落盘；
+后续guard/锁异常不能掩盖首个错误，未确认清理仍保留活动锁，不增加预算或解除阻断。
+此项为异常报告修复，不改变请求计划/许可/源件/观察合同身份，不改写旧失败材料或请求计数。
+
 最终锚点包含全部材料文件SHA、源文件/清单/intent/执行回执SHA和全部发布及重读后的单调完成时点。
 独立验证核对完整文件集合、原始字节、六请求计划/批次/版本、父Provider与HTTP时间顺序、
 单调绝对截止、源件重放、60日完整覆盖及最终执行状态；重新调用既有R20观察逻辑。

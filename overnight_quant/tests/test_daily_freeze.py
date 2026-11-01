@@ -242,3 +242,86 @@ def test_final_absolute_time_cannot_be_resigned_as_success(tmp_path):
     replay = daily.verify(output, anchors)
     assert not replay['evidence_integrity_verified']
     assert replay['observation_ranking'] == []
+
+
+@pytest.mark.parametrize('failure_receipt_writable,expired', [(True, False), (False, False), (True, True)])
+def test_cli_parent_receipt_error_after_real_workers_is_unknown_not_zero(tmp_path, monkeypatch, capsys,
+                                                                       failure_receipt_writable, expired):
+    fixture, day = fixtures(tmp_path)
+    output = tmp_path/'batch'
+    original_write = daily.write
+    original_clock = time.perf_counter
+    after_error = [False]
+    monkeypatch.setattr(daily.time, 'perf_counter', lambda: original_clock() + (100 if after_error[0] and expired else 0))
+    saved_hashes, attempts = {}, []
+
+    def fail_parent_receipt(path, value):
+        path = Path(path)
+        if path.name == 'execution.json':
+            saved_hashes.update({p.name: daily.sha(p) for p in output.glob('raw-*.json')})
+            after_error[0] = True
+            raise OSError('fixture_parent_execution_write_failed')
+        if path.name == 'controller-failure.json':
+            attempts.append(path.name)
+            if not failure_receipt_writable:
+                raise OSError('fixture_failure_receipt_write_failed')
+        return original_write(path, value)
+
+    monkeypatch.setattr(daily, 'write', fail_parent_receipt)
+    code = main(['--test-fixture', str(fixture), '--test-batch-id', 'parent-failure', '--date', day,
+                 '--codes', ','.join(daily.FIXED_CODES), '--approved-sha', daily.head(), '--output', str(output)])
+    result = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert result['status'] == 'CONTROLLER_FAILED'
+    assert result['dispatch_attempted'] is True
+    assert result['requests_dispatched'] is None
+    assert result['request_count_status'] == 'UNKNOWN_AFTER_DISPATCH'
+    assert result['cleanup_complete'] is True
+    assert result['failure_receipt_persisted'] is (failure_receipt_writable and not expired)
+    assert result['observation_ranking'] == []
+    assert result['observation_input_ready'] is False
+    assert 'fixture_parent_execution_write_failed' in result['error']
+    assert len(list(output.glob('request-*.json'))) == 6
+    assert saved_hashes == {p.name: daily.sha(p) for p in output.glob('raw-*.json')}
+    assert attempts == ([] if expired else ['controller-failure.json'])
+    if failure_receipt_writable and not expired:
+        receipt = json.loads((output/'controller-failure.json').read_text())
+        assert receipt['requests_dispatched'] is None
+        assert receipt['error'] == result['error']
+    else:
+        assert not (output/'controller-failure.json').exists()
+        assert ('budget_exhausted' if expired else 'fixture_failure_receipt_write_failed') in result['failure_receipt_error']
+
+
+def test_before_dispatch_exception_is_still_known_zero(tmp_path, monkeypatch):
+    fixture, day = fixtures(tmp_path)
+    monkeypatch.setattr(daily, 'run_probe_worker_process', lambda *a, **k: pytest.fail('dispatch forbidden'))
+    result = daily.capture(day=day, codes='', approved_sha=daily.head(), output=tmp_path/'batch',
+                           fixture=fixture, authorization={'batch_id': 'preflight'})
+    assert result['status'] == 'REQUEST_REJECTED'
+    assert result['dispatch_attempted'] is False
+    assert result['requests_dispatched'] == 0
+    assert result['request_count_status'] == 'KNOWN_ZERO_BEFORE_DISPATCH'
+
+
+def test_dispatch_exception_with_guard_write_failure_retains_lock(tmp_path, monkeypatch):
+    fixture, day = fixtures(tmp_path)
+    original_write = daily.write
+
+    def dispatch_error(*args, **kwargs):
+        raise OSError('fixture_dispatch_return_unavailable')
+
+    def guard_error(path, value):
+        if Path(path).name == 'cleanup-incomplete.json':
+            raise OSError('fixture_guard_write_failed')
+        return original_write(path, value)
+
+    monkeypatch.setattr(daily, 'run_probe_worker_process', dispatch_error)
+    monkeypatch.setattr(daily, 'write', guard_error)
+    result = daily.capture(day=day, codes=','.join(daily.FIXED_CODES), approved_sha=daily.head(),
+                           output=tmp_path/'batch', fixture=fixture, authorization={'batch_id': 'unknown'})
+    assert result['status'] == 'CONTROLLER_FAILED'
+    assert result['requests_dispatched'] is None and result['cleanup_complete'] is None
+    assert 'fixture_dispatch_return_unavailable' in result['error']
+    assert 'fixture_guard_write_failed' in result['cleanup_guard_error']
+    assert (tmp_path/'state/active.lock').exists()

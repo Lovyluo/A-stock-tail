@@ -324,6 +324,8 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
     target = None
     lock = None
     owned, cleaned = False, True
+    dispatch_attempted, cleanup_known = False, False
+    stage, result, reported = "input_validation", None, None
     state = Path(fixture).resolve().parent / "state" if test_only else STATE
     try:
         if network and test_only:
@@ -343,20 +345,25 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
                 "contract_hash": IDENTITY, "budget": BUDGET, "started_monotonic": started,
                 "work_deadline": started + 85, "controller_pid": os.getpid()}
         write(target / "intent.json", {**task, "created_at": now(), "authorization": authorization})
+        stage = "coordinator_dispatch"
         cleaned = False
+        dispatch_attempted = True
         result = run_probe_worker_process(task, max(0, int((started + 87 - time.perf_counter()) * 1000)),
             bounded_cleanup_ms=2000, hard_deadline_monotonic=started + 87, retain_streams=True,
             worker_command=[sys.executable, "-m", "overnight_quant.scripts.run_daily_freeze_worker"])
         cleaned = result["cleanup_complete"]
+        cleanup_known = True
         if not cleaned:
             write(state / "cleanup-incomplete.json", safe(batch_id=task["batch_id"], process=result))
         status = "EXECUTION_COMPLETE" if result["ok"] and result["cleanup_complete"] and time.perf_counter() < started + 90 else "EXECUTION_FAILED"
         execution = safe(status=status, batch_id=task["batch_id"], process=result,
                          synthetic_test_only=test_only,
                          elapsed_ms=(time.perf_counter() - started) * 1000, completed_at=now())
+        stage = "execution_receipt"
         write(target / "execution.json", execution)
         if time.perf_counter() >= started + 90:
             return safe(status="FINAL_WRITE_BUDGET_EXCEEDED", observation_input_ready=False)
+        stage = "final_verification_and_output"
         anchors = {"intent": sha(target / "intent.json"), "execution": sha(target / "execution.json"), "files": file_anchors(target)}
         if status == "EXECUTION_COMPLETE":
             anchors.update({k: v for k, v in result["payload"]["anchors"].items() if k != "files"})
@@ -379,10 +386,36 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
             return safe(status="FINAL_VERIFICATION_BUDGET_EXCEEDED", observation_input_ready=False)
         return {**final, "status": status, "anchors": anchors, "output": str(target)}
     except Exception as exc:
-        return safe(status="REQUEST_REJECTED", error=f"{type(exc).__name__}:{exc}", requests_dispatched=0, synthetic_test_only=test_only)
+        reported = safe(status="CONTROLLER_FAILED" if dispatch_attempted else "REQUEST_REJECTED",
+            error=f"{type(exc).__name__}:{exc}", failure_stage=stage,
+            dispatch_attempted=dispatch_attempted,
+            requests_dispatched=None if dispatch_attempted else 0,
+            request_count_status="UNKNOWN_AFTER_DISPATCH" if dispatch_attempted else "KNOWN_ZERO_BEFORE_DISPATCH",
+            cleanup_complete=cleaned if cleanup_known else None, process=result,
+            observation_input_ready=False, synthetic_test_only=test_only,
+            failure_receipt_persisted=False)
+        if owned and target is not None:
+            try:
+                if time.perf_counter() >= started + 90:
+                    raise TimeoutError("controller_failure_receipt_budget_exhausted")
+                path = target / "controller-failure.json"
+                write(path, reported)
+                reported["failure_receipt_persisted"] = True
+                reported["failure_receipt_path"] = str(path)
+            except Exception as receipt_error:
+                reported["failure_receipt_error"] = f"{type(receipt_error).__name__}:{receipt_error}"
+        return reported
     finally:
         # Never release a lock owned by a different controller, or an unconfirmed tree.
-        if owned and not cleaned and not (state / "cleanup-incomplete.json").exists():
-            write(state / "cleanup-incomplete.json", safe(status="CLEANUP_UNCONFIRMED", output=str(target)))
-        if owned and cleaned and lock and lock.exists() and lock.read_text() == str(target) and not (state / "cleanup-incomplete.json").exists():
-            lock.unlink()
+        cleanup_stage = "cleanup_guard"
+        try:
+            if owned and not cleaned and not (state / "cleanup-incomplete.json").exists():
+                write(state / "cleanup-incomplete.json", safe(status="CLEANUP_UNCONFIRMED", output=str(target)))
+            cleanup_stage = "lock_release"
+            if owned and cleaned and lock and lock.exists() and lock.read_text() == str(target) and not (state / "cleanup-incomplete.json").exists():
+                lock.unlink()
+        except Exception as cleanup_error:
+            if reported is None:
+                raise
+            # Preserve the first failure. An uncertain tree retains its activity lock.
+            reported[f"{cleanup_stage}_error"] = f"{type(cleanup_error).__name__}:{cleanup_error}"
