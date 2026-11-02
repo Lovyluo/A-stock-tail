@@ -63,6 +63,18 @@ def _unique(rows):
     return sorted({stable_hash(row): row for row in rows}.values(), key=stable_hash)
 
 
+def compute_r20(prices):
+    """The fixed 20-trading-session close ratio, shared by offline profiles."""
+    if len(prices) < 21:
+        raise ValueError("r20_requires_21_closes")
+    with localcontext() as context:
+        context.prec = 34
+        r20 = float(100 * (Decimal(str(prices[-1])) / Decimal(str(prices[-21])) - 1))
+    if not math.isfinite(r20):
+        raise ValueError("r20_non_finite")
+    return r20
+
+
 def _replay(evidence: dict, run_date: str):
     if evidence.get("evidence_schema_version") != STATIC_SOURCE_EVIDENCE_SCHEMA_VERSION:
         raise ValueError("source_evidence_schema_invalid")
@@ -200,11 +212,7 @@ def observe(evidence: dict, *, source_file_sha256: str, manifest: dict | None,
                 if type(price) not in (float, int) or not math.isfinite(price) or price <= 0:
                     raise ValueError("close_price_invalid")
                 prices.append(price)
-            with localcontext() as context:
-                context.prec = 34
-                r20 = float(100 * (Decimal(str(prices[-1])) / Decimal(str(prices[-21])) - 1))
-            if not math.isfinite(r20):
-                raise ValueError("r20_non_finite")
+            r20 = compute_r20(prices)
             refs = [{k: r[k] for k in ("event_time", "observed_at", "available_at", "raw_hash",
                                       "request_hash", "source_version")} for r in (rows[-21], rows[-1])]
             ranking.append({"security_identity": security_identity(code), "code": code,
