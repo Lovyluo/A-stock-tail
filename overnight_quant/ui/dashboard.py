@@ -1940,6 +1940,12 @@ def main() -> None:
         return
 
     st.set_page_config(page_title="Overnight Quant Dashboard", layout="wide", initial_sidebar_state="expanded")
+    workspace = st.sidebar.radio("工作区", ["历史/离线观察", "原有研究工作台"], key="workspace_mode")
+    if workspace == "历史/离线观察":
+        from overnight_quant.ui.offline_observation import render_offline_observation
+        render_offline_observation(st)
+        return
+
     st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
 
     language_label = st.radio("语言 / Language", list(LANGUAGES.values()), horizontal=True, key="dashboard_language")
