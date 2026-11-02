@@ -2,7 +2,7 @@
 import argparse
 import json
 
-from overnight_quant.data.daily_freeze import capture, read_anchored_json, verify
+from overnight_quant.data.daily_freeze import capture, final_success, read_anchored_json, rejected_final, verify
 
 
 def main(argv=None):
@@ -28,14 +28,18 @@ def main(argv=None):
             if "anchors" in anchors:
                 anchors = anchors["anchors"]
             result = verify(args.verify, anchors)
-            code = 0 if result["evidence_integrity_verified"] and result["observation_input_ready"] else 2
+            code = 0 if result.get('status') == 'EXECUTION_COMPLETE' and final_success(result) else 2
         else:
             authorization = ({"batch_id": args.test_batch_id} if args.test_fixture else
                              read_anchored_json(args.authorization, args.authorization_sha256) if args.network else {})
             result = capture(day=args.date, codes=args.codes, approved_sha=args.approved_sha,
                              output=args.output, authorization=authorization,
                              network=args.network, fixture=args.test_fixture)
-            code = 0 if result["status"] in ("NETWORK_NOT_REQUESTED", "EXECUTION_COMPLETE") else 2
+            idle = not args.network and not args.test_fixture and result['status'] == 'NETWORK_NOT_REQUESTED'
+            success = result['status'] == 'EXECUTION_COMPLETE' and final_success(result)
+            code = 0 if idle or success else 2
+            if result['status'] == 'EXECUTION_COMPLETE' and not success:
+                result = {**rejected_final(result), 'status': 'FINAL_VERIFICATION_FAILED'}
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return code
     except Exception as exc:

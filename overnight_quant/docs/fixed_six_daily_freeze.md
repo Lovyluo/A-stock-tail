@@ -50,6 +50,23 @@ failure_receipt_persisted=true。写失败或预算耗尽明确报告，文件�
 后续guard/锁异常不能掩盖首个错误，未确认清理仍保留活动锁，不增加预算或解除阻断。
 此项为异常报告修复，不改变请求计划/许可/源件/观察合同身份，不改写旧失败材料或请求计数。
 
+## 最终状态与退出码
+
+capture两次最终验证均严格要求`evidence_integrity_verified is True`、
+`capture_execution_result == PASSED`、`observation_input_ready is True`，不接受1等truthy值。
+第二次任一条件失败，返回FINAL_VERIFICATION_FAILED，清空观察排序和decision_hash，保留原错误及可取得锚点。
+真实/fixture CLI必须同时满足EXECUTION_COMPLETE及上述三条件才退出0，否则退出2；
+独立验证CLI执行同样检查，默认NETWORK_NOT_REQUESTED仍零网络/零worker退出0。
+
+`execution.json`记录进程执行/清理，`observation.json`可能是在第一次验证之后写出的中间观察文件，
+两者都不是最终验收权威。收尾追加不可覆盖的`final-outcome.json`，契约
+`fixed_six_daily_final_outcome_v1`，绑定批次、日期、intent/execution/source/manifest文件SHA及最终验证结论。
+其自身文件SHA及写完/重读后的全目录SHA进入最终外部anchors；仍受原90秒截止约束。
+正式独立重放必须读取该回执并检查身份和外部SHA：缺失、写失败、篡改或最终结论失败均不能通过。
+原始文件和中间观察不回写；无法完成回执时只保留失败、诊断和已取得的非完整锚点，不能补造成功回执。
+最终执行失败材料的原件完整性可能单独通过，但capture_execution_result必须FAILED、排序为空。
+没有该回执的旧材料不得补造或重判为最终成功；源件、请求计划、许可和资格身份不变。
+
 最终锚点包含全部材料文件SHA、源文件/清单/intent/执行回执SHA和全部发布及重读后的单调完成时点。
 独立验证核对完整文件集合、原始字节、六请求计划/批次/版本、父Provider与HTTP时间顺序、
 单调绝对截止、源件重放、60日完整覆盖及最终执行状态；重新调用既有R20观察逻辑。

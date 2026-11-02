@@ -325,3 +325,97 @@ def test_dispatch_exception_with_guard_write_failure_retains_lock(tmp_path, monk
     assert 'fixture_dispatch_return_unavailable' in result['error']
     assert 'fixture_guard_write_failed' in result['cleanup_guard_error']
     assert (tmp_path/'state/active.lock').exists()
+
+
+@pytest.mark.parametrize('field,bad', [('evidence_integrity_verified', False),
+    ('capture_execution_result', 'FAILED'), ('observation_input_ready', False)])
+def test_second_final_verify_failure_actual_capture_cli_and_replay(tmp_path, monkeypatch, capsys, field, bad):
+    fixture, day = fixtures(tmp_path)
+    output = tmp_path/'batch'
+    original_verify = daily.verify
+    calls, snapshots = [], {}
+
+    def second_verification_fails(*args, **kwargs):
+        value = original_verify(*args, **kwargs)
+        calls.append(deepcopy(value))
+        if len(calls) == 2:
+            snapshots.update({p.name: daily.sha(p) for p in output.iterdir() if p.is_file()})
+            value[field] = bad
+            value['errors'] = ['fixture_second_final_verification_failed']
+        return value
+
+    monkeypatch.setattr(daily, 'verify', second_verification_fails)
+    code = main(['--test-fixture', str(fixture), '--test-batch-id', 'final-failure', '--date', day,
+        '--codes', ','.join(daily.FIXED_CODES), '--approved-sha', daily.head(), '--output', str(output)])
+    result = json.loads(capsys.readouterr().out)
+    assert len(calls) == 2 and calls[0]['observation_input_ready'] is True
+    assert code == 2
+    assert result['status'] != 'EXECUTION_COMPLETE'
+    assert result['capture_execution_result'] == 'FAILED'
+    assert result['observation_input_ready'] is False and result['observation_ranking'] == []
+    assert 'fixture_second_final_verification_failed' in result['errors']
+    assert len(list(output.glob('request-*.json'))) == 6
+    assert all(daily.sha(output/name) == digest for name, digest in snapshots.items())
+    assert (output/'observation.json').exists()  # Intermediate file is not final authority.
+    monkeypatch.setattr(daily, 'verify', original_verify)
+    replay = daily.verify(output, result['anchors'])
+    assert replay['status'] == result['status']
+    assert replay['capture_execution_result'] == 'FAILED'
+    assert replay['observation_input_ready'] is False and replay['observation_ranking'] == []
+    anchor_path = tmp_path/'anchors.json'
+    anchor_path.write_text(json.dumps(result['anchors']))
+    assert main(['--verify', str(output), '--anchors', str(anchor_path), '--anchors-sha256', daily.sha(anchor_path)]) == 2
+
+
+@pytest.mark.parametrize('field,bad', [('evidence_integrity_verified', False),
+    ('evidence_integrity_verified', 1), ('capture_execution_result', 'FAILED'),
+    ('observation_input_ready', False), ('observation_input_ready', 1)])
+def test_cli_success_status_alone_never_suffices(monkeypatch, capsys, field, bad):
+    from overnight_quant.scripts import run_daily_freeze as cli
+    result = daily.safe(status='EXECUTION_COMPLETE', evidence_integrity_verified=True,
+                        capture_execution_result='PASSED', observation_input_ready=True)
+    result[field] = bad
+    monkeypatch.setattr(cli, 'capture', lambda **kwargs: result)
+    assert cli.main(['--test-fixture', 'not-read-because-test-stub']) == 2
+
+
+def test_default_cli_remains_successful_zero_dispatch(monkeypatch, capsys):
+    monkeypatch.setattr(daily, 'run_probe_worker_process', lambda *a, **k: pytest.fail('dispatch'))
+    assert main([]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['status'] == 'NETWORK_NOT_REQUESTED' and result['requests_dispatched'] == 0
+
+
+def test_missing_final_outcome_cannot_use_intermediate_observation(tmp_path):
+    result, output = invoke(tmp_path)
+    assert result['status'] == 'EXECUTION_COMPLETE'
+    assert json.loads((output/'observation.json').read_text())['observation_input_ready'] is True
+    anchors = deepcopy(result['anchors'])
+    anchors.pop('final_outcome')
+    replay = daily.verify(output, anchors)
+    assert replay['status'] == 'FINAL_VERIFICATION_FAILED'
+    assert replay['observation_input_ready'] is False and replay['observation_ranking'] == []
+    outcome = json.loads((output/'final-outcome.json').read_text())
+    outcome['batch_id'] = 'other-batch'
+    (output/'final-outcome.json').write_text(json.dumps(outcome))
+    anchors['final_outcome'] = daily.sha(output/'final-outcome.json')
+    anchors['files']['final-outcome.json'] = anchors['final_outcome']
+    assert daily.verify(output, anchors)['capture_execution_result'] == 'FAILED'
+
+
+def test_final_outcome_write_failure_retains_materials_and_count_unknown(tmp_path, monkeypatch):
+    original_write = daily.write
+    def fail_final(path, value):
+        if Path(path).name == 'final-outcome.json':
+            raise OSError('fixture_final_outcome_write_failed')
+        return original_write(path, value)
+    monkeypatch.setattr(daily, 'write', fail_final)
+    result, output = invoke(tmp_path)
+    assert result['status'] == 'CONTROLLER_FAILED'
+    assert result['requests_dispatched'] is None
+    assert result['request_count_status'] == 'UNKNOWN_AFTER_DISPATCH'
+    assert result['observation_ranking'] == []
+    assert 'fixture_final_outcome_write_failed' in result['error']
+    assert result['anchors'] and result['anchors_complete'] is False
+    assert (output/'observation.json').exists() and not (output/'final-outcome.json').exists()
+    assert daily.verify(output, result['anchors'])['observation_input_ready'] is False

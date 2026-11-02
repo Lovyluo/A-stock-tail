@@ -30,6 +30,7 @@ from overnight_quant.scripts.run_static_source_validation import compute_evidenc
 
 SCHEMA = "fixed_six_daily_freeze_v1"
 AUTH = "fixed_six_daily_authorization_v1"
+FINAL_OUTCOME = "fixed_six_daily_final_outcome_v1"
 PLAN = ["sh000001,day,,,260,qfq"] + [
     f"{'sh' if c.startswith('6') else 'sz'}{c},day,,,120,qfq" for c in FIXED_CODES]
 BUDGET = {"request_ms": 10000, "request_cleanup_ms": 1000,
@@ -54,6 +55,18 @@ def safe(**fields):
     return {"schema_version": SCHEMA, "qualification": "0/3", "data_ready": False,
             "hard_gate_authorized": False, "records": [], "candidates": [], "tickets": [],
             "orders": [], "risk_assessment": "NOT_ASSESSED", "observation_ranking": [], **fields}
+
+
+def final_success(value):
+    return (isinstance(value, dict) and value.get('evidence_integrity_verified') is True
+            and value.get('capture_execution_result') == 'PASSED'
+            and value.get('observation_input_ready') is True)
+
+
+def rejected_final(value):
+    return {**value, 'capture_execution_result': 'FAILED', 'observation_input_ready': False,
+            'observation_ranking': [], 'decision_hash': None,
+            'errors': value.get('errors') or ['final_success_conditions_not_met']}
 
 
 def head():
@@ -205,7 +218,7 @@ def coordinate(task):
         return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
 
-def verify(directory, anchors, *, require_execution=True):
+def verify(directory, anchors, *, require_execution=True, require_final=True):
     """Independent replay of captured bytes; never accepts the producer's score."""
     directory = Path(directory)
     errors, records, observation = [], [], None
@@ -300,16 +313,32 @@ def verify(directory, anchors, *, require_execution=True):
                     raise ValueError("final_wall_time_order_invalid")
         else:
             success = True
+        outcome = None
+        if require_execution and require_final:
+            outcome = read_anchored_json(directory / 'final-outcome.json', anchors['final_outcome'])
+            if (outcome.get('schema_version') != FINAL_OUTCOME or outcome.get('batch_id') != batch
+                    or outcome.get('run_date') != intent['day']
+                    or outcome.get('input_anchors') != {k: anchors.get(k) for k in ('intent', 'execution', 'source', 'manifest')}):
+                raise ValueError('final_outcome_identity_mismatch')
+            success = (success and outcome.get('status') == 'EXECUTION_COMPLETE'
+                       and final_success(outcome.get('verification')))
         if not success:
             observation = None
-        return safe(evidence_integrity_verified=True, capture_execution_result="PASSED" if success and observation else "FAILED",
+        verdict = safe(evidence_integrity_verified=True, capture_execution_result="PASSED" if success and observation else "FAILED",
                     observation_input_ready=bool(success and observation),
                     observation_ranking=observation["observation_ranking"] if success and observation else [],
                     decision_hash=observation["decision_hash"] if success and observation else None,
                     synthetic_test_only=intent["test_only"], errors=[])
+        if outcome is not None:
+            verdict['status'] = ('EXECUTION_COMPLETE' if final_success(verdict) else
+                                 outcome['status'] if outcome['status'] != 'EXECUTION_COMPLETE' else 'FINAL_VERIFICATION_FAILED')
+            if not final_success(verdict):
+                verdict['errors'] = outcome.get('verification', {}).get('errors') or ['final_execution_not_successful']
+        return verdict
     except Exception as exc:
         errors.append(f"{type(exc).__name__}:{exc}")
-    return safe(evidence_integrity_verified=False, capture_execution_result="FAILED", observation_input_ready=False, errors=errors)
+    return safe(status='FINAL_VERIFICATION_FAILED', evidence_integrity_verified=False,
+                capture_execution_result="FAILED", observation_input_ready=False, errors=errors)
 
 
 def sha_bytes(body):
@@ -325,7 +354,7 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
     lock = None
     owned, cleaned = False, True
     dispatch_attempted, cleanup_known = False, False
-    stage, result, reported = "input_validation", None, None
+    stage, result, reported, anchors = "input_validation", None, None, None
     state = Path(fixture).resolve().parent / "state" if test_only else STATE
     try:
         if network and test_only:
@@ -369,21 +398,40 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
             anchors.update({k: v for k, v in result["payload"]["anchors"].items() if k != "files"})
         anchors["finished_monotonic"] = time.perf_counter()
         if status == "EXECUTION_COMPLETE":
-            verified = verify(target, anchors)
-            if not verified['observation_input_ready']:
-                return safe(status='FINAL_VERIFICATION_FAILED', anchors=anchors, output=str(target), errors=verified['errors'])
+            verified = verify(target, anchors, require_final=False)
+            if not final_success(verified):
+                return {**rejected_final(verified), 'status': 'FINAL_VERIFICATION_FAILED',
+                        'anchors': anchors, 'output': str(target)}
             write(target / 'observation.json', verified)
             anchors['files'] = file_anchors(target)
             anchors['finished_monotonic'] = time.perf_counter()
         if anchors["finished_monotonic"] >= started + 90:
             return safe(status="FINAL_ANCHOR_BUDGET_EXCEEDED", observation_input_ready=False)
-        final = verify(target, anchors)
+        final = verify(target, anchors, require_final=False)
+        if not final_success(final):
+            final = rejected_final(final)
+            if status == 'EXECUTION_COMPLETE':
+                status = 'FINAL_VERIFICATION_FAILED'
         if owned and cleaned and not (state / 'cleanup-incomplete.json').exists():
             lock.unlink()
             owned = False
         anchors['finished_monotonic'] = time.perf_counter()
         if time.perf_counter() >= started + 90:
-            return safe(status="FINAL_VERIFICATION_BUDGET_EXCEEDED", observation_input_ready=False)
+            return safe(status="FINAL_VERIFICATION_BUDGET_EXCEEDED", observation_input_ready=False,
+                        anchors=anchors, output=str(target), errors=final.get('errors', []))
+        stage = 'final_outcome_receipt'
+        write(target / 'final-outcome.json', {
+            'schema_version': FINAL_OUTCOME, 'batch_id': task['batch_id'], 'run_date': day,
+            'status': status, 'input_anchors': {k: anchors.get(k) for k in ('intent', 'execution', 'source', 'manifest')},
+            'verification': {k: final.get(k) for k in ('evidence_integrity_verified', 'capture_execution_result',
+                                                     'observation_input_ready', 'errors')},
+            'recorded_at': now(), 'synthetic_test_only': test_only})
+        anchors['final_outcome'] = sha(target / 'final-outcome.json')
+        anchors['files'] = file_anchors(target)
+        anchors['finished_monotonic'] = time.perf_counter()
+        if anchors['finished_monotonic'] >= started + 90:
+            return {**rejected_final(final), 'status': 'FINAL_OUTCOME_BUDGET_EXCEEDED',
+                    'anchors': anchors, 'output': str(target)}
         return {**final, "status": status, "anchors": anchors, "output": str(target)}
     except Exception as exc:
         reported = safe(status="CONTROLLER_FAILED" if dispatch_attempted else "REQUEST_REJECTED",
@@ -394,6 +442,9 @@ def capture(*, day, codes, approved_sha, output, authorization=None, network=Fal
             cleanup_complete=cleaned if cleanup_known else None, process=result,
             observation_input_ready=False, synthetic_test_only=test_only,
             failure_receipt_persisted=False)
+        if anchors is not None:
+            reported['anchors'] = anchors
+            reported['anchors_complete'] = False
         if owned and target is not None:
             try:
                 if time.perf_counter() >= started + 90:
