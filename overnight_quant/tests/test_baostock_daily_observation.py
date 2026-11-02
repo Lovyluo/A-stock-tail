@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -279,3 +280,42 @@ def test_boolean_numbers_and_nonboolean_test_markers_rejected(batch, name, mutat
     edit(batch, name, mutation)
     result = run(batch)
     assert not result['observation_input_ready'] and result['observation_ranking'] == []
+
+
+@pytest.mark.parametrize('encoding', ['cp1252', 'utf-8'])
+@pytest.mark.parametrize('case', ['success', 'bad-anchor', 'write-failure'])
+def test_actual_cli_console_encoding_keeps_json_and_exit_contract(batch, tmp_path, encoding, case):
+    output = tmp_path / 'observation.json'
+    anchor_sha = digest(batch / 'anchors.json')
+    if case == 'bad-anchor':
+        anchor_sha = '0' * 64
+    elif case == 'write-failure':
+        parent_file = tmp_path / '\u4e2d\u6587-not-a-directory'
+        parent_file.write_bytes(b'not a directory')
+        output = parent_file / 'result.json'
+    process = subprocess.run(
+        [sys.executable, '-m', 'overnight_quant.scripts.run_baostock_daily_observation',
+         '--batch-dir', str(batch), '--anchors', str(batch / 'anchors.json'),
+         '--anchors-sha256', anchor_sha, '--synthetic-test-only', '--output', str(output)],
+        cwd=REPO, capture_output=True, timeout=15,
+        env={**os.environ, 'PYTHONIOENCODING': encoding + ':strict', 'PYTHONUTF8': '0'},
+    )
+    stdout, stderr = process.stdout.decode(encoding), process.stderr.decode(encoding)
+    assert process.returncode == (0 if case == 'success' else 2), stderr
+    assert 'UnicodeEncodeError' not in stderr
+    if case == 'write-failure':
+        assert 'OBSERVATION_WRITE_FAILED' in stdout
+        assert not output.exists()
+        return
+    expected_console = DISCLAIMER.encode(encoding, errors='backslashreplace').decode(encoding)
+    assert expected_console in stdout
+    assert ('VENDOR_PRICE_OBSERVATION_COMPUTED' if case == 'success' else 'OBSERVATION_REJECTED') in stdout
+    result = json.loads(output.read_bytes().decode('utf-8'))
+    safety(result)
+    assert result['disclaimer'] == DISCLAIMER
+    assert result['observation_input_ready'] is (case == 'success')
+    assert len(result['observation_ranking']) == (5 if case == 'success' else 0)
+    if case == 'success':
+        baseline = run(batch)
+        assert result['decision_hash'] == baseline['decision_hash']
+        assert result['observation_ranking'] == baseline['observation_ranking']

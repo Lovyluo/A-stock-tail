@@ -43,6 +43,8 @@ $anchorSha = (Get-FileHash -LiteralPath $anchors -Algorithm SHA256).Hash.ToLower
 ```
 
 输出必须在原件目录外且不存在；不可覆盖。默认缺参退出2，`--network`不受支持，所有路径均零来源请求。
+控制台按当前输出编码显示；无法表示的字符使用可逆反斜杠转义，避免cp1252管道抛编码异常。
+UTF-8/支持中文的终端仍显示原文；结果JSON始终UTF-8，中文限制、排序、决策hash及退出码合同不变。
 `--synthetic-test-only`必须与原件test-only标记严格匹配；合成夹具不代表来源证据或资格。
 拒绝时排序为空、退出2。成功退出0仅表示该供应商序列的受限观察输入可计算。
 
