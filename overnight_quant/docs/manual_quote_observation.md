@@ -47,7 +47,15 @@ D:\A-stock\.venv\Scripts\python.exe -m streamlit run overnight_quant/ui/dashboar
 
 每次新批次独立intent、源请求参数、原始响应base64/原始字节SHA、来源版本、请求开始/响应完成/处理完成时间、PID/退出/清理信息和最终回执均不可覆盖。原始响应在Provider解析前保存；读到的材料超过256KiB本地上限时标记不完整并失败。没有响应时保留实际异常，请求计数无法确认则UNKNOWN，不补造raw。文件SHA对应原样response.json字节，不与规范化内容hash混称。
 
-成功快照重新运行原Provider＋quote Adapter验证，并绑定同批文件/原始响应hash；候选写出但最终回执缺失/失败、清理未确认或仍在收尾的不作为成功快照。内部哈希只证明本地材料一致性，不证明供应商使用权或来源资格。用户原设置/原件不覆盖；损坏材料明确拒绝，不自动修复。
+成功快照重新运行原Provider＋quote Adapter验证，并绑定同批文件/原始响应hash。终态另以`manual_quote_refresh_finalization_v2`约束，不改变报价/年龄/限频合同：
+
+- `receipt.json`仅为候选回执，成功候选状态为CANDIDATE_SUCCEEDED，不是最终成功。原始响应和所有已写回执不覆盖。
+- 候选写入、解锁前后分别检查同一单调10秒截止；解锁未完成或超预算，不生成成功提交。`pending-finalization-*.json`不可覆盖保留，未完成提交会阻止后续刷新，不靠锁消失推断成功。
+- 解锁通过后写入并重读`final-result.json`候选，记录实际阶段时间及hash；再将已写完、fsync且重读核对的私有`final-commit-candidate.json`通过同卷原子硬链接公开为`final-commit.json`，不替换旧文件。公开前后及最终确认仍检查原截止，同卷原子操作不可用即失败，无fallback。
+- `committed_refresh_outcome`是控制器、成功快照列表与页面共用的终态解析：要求v2提交、批次/原件/候选回执hash、有限且有序的同一单调时钟阶段、预算及清理一致。`final-failure.json`优先否决成功；缺失、损坏、未提交、公开后超时或异常均不作为成功快照。失败回执无法落盘时保留/恢复阻断，不声明恢复完成。
+- 页面重读成功列表，缓存的SUCCEEDED不能绕过丢失或失败的最终提交；失败批次不能作为第二份成功快照参与比较，其他合法批次与设置保持可用。
+
+旧版只有早期成功回执的刷新候选不自动升级为v2成功，不回写旧原件或补造完成证明；包1明确历史快照及既有设置读取合同不变。内部哈希只证明本地材料一致性，不证明供应商使用权或来源资格。损坏材料明确拒绝，不自动修复。
 
 ## 明确的test-only页面演练
 

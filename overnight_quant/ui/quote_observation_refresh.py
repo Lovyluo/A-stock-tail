@@ -20,10 +20,14 @@ def render_refresh(st, store, state, prefix, *, controller=None):
         attempt = st.session_state[prefix + "_attempt"]
         if attempt["status"] == "SUCCEEDED":
             st.session_state[prefix + "_snapshot"] = attempt["batch_id"]
+    snapshots = store.refresh_snapshots()
     attempt = st.session_state.get(prefix + "_attempt")
+    if attempt and attempt["status"] == "SUCCEEDED" and attempt["batch_id"] not in {s["batch_id"] for s in snapshots}:
+        attempt = {**attempt, "status": "FAILED", "error": "final_commit_missing_or_invalid"}
+        st.session_state[prefix + "_attempt"] = attempt
     if attempt:
         if attempt["status"] == "SUCCEEDED":
             st.success("本次报价已保存；每次交互重新计算年龄，不持续监控。")
         else:
             st.error("本次刷新失败/拒绝：" + attempt["error"] + "；旧快照仅供历史查看，不补齐本次覆盖。")
-    return store.refresh_snapshots(), attempt
+    return snapshots, attempt

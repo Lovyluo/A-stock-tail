@@ -48,8 +48,15 @@ def store(tmp_path):
 
 
 def mark_test_receipt(active, batch):
-    obs.write_once(active.root / refresh.VERSION / "attempts" / batch / "receipt.json",
-                   dict(status="SUCCEEDED", batch_id=batch, cleanup_complete=True, elapsed_ms=10))
+    assert active.scope == "synthetic_test_only"
+    body = obs._json((active.root / refresh.VERSION / "snapshots" / (obs.stable_hash(batch) + ".json")).read_bytes())
+    target = active.root / refresh.VERSION / "attempts" / batch
+    obs.write_once(target / "response.json", body["response"])
+    obs.write_once(active.root / refresh.VERSION / "control" / "active.lock", {"batch_id": batch})
+    started = time.perf_counter()
+    final = refresh._finish_refresh(active, target, refresh.safe("SUCCEEDED", batch_id=batch, cleanup_complete=True),
+        started=started, hard=started + 10, owned=True, cleaned=True, dispatched=True, published=True)
+    assert final["status"] == "SUCCEEDED", final
 
 
 def local_runner(task, *args, **kwargs):

@@ -308,7 +308,9 @@ class ObservationStore:
         return snapshot
 
     def refresh_snapshots(self):
-        from overnight_quant.data.quote_observation_refresh import VERSION as contract, decode_response
+        from overnight_quant.data.quote_observation_refresh import (
+            VERSION as contract, committed_refresh_outcome, decode_response,
+        )
         result = []
         for path in sorted((self.root / contract / "snapshots").glob("*.json")):
             body = _json(path.read_bytes())
@@ -317,18 +319,7 @@ class ObservationStore:
             snapshot = decode_response(body["response"])
             if snapshot["scope"] != self.scope or path.stem != stable_hash(snapshot["batch_id"]):
                 raise ValueError("refresh_stored_identity_mismatch")
-            # A candidate written before final receipt is not a successful refresh.
-            receipt_path = self.root / contract / "attempts" / snapshot["batch_id"] / "receipt.json"
-            if not receipt_path.exists():
+            if committed_refresh_outcome(self.root, snapshot["batch_id"], body["sha256"])["status"] != "SUCCEEDED":
                 continue
-            receipt = _json(receipt_path.read_bytes())
-            if (receipt.get("status") != "SUCCEEDED" or receipt.get("batch_id") != snapshot["batch_id"]
-                    or receipt.get("cleanup_complete") is not True
-                    or type(receipt.get("elapsed_ms")) not in (int, float)
-                    or not 0 <= receipt["elapsed_ms"] <= 10000):
-                continue
-            lock = self.root / contract / "control" / "active.lock"
-            if lock.exists() and _json(lock.read_bytes()).get("batch_id") == snapshot["batch_id"]:
-                continue  # This controller has not confirmed publication completion.
             result.append(snapshot)
         return result
