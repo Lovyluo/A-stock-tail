@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 import hashlib
 import json
+import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ import pytest
 from overnight_quant.data.market_calendar import CN_TZ
 from overnight_quant.data.market_source_providers import MarketDotNetHttpClientTransport, _run_dotnet_http_worker
 from overnight_quant.data.t25_bounded_executor import AuditRequest, BoundedAuditExecutor
+from overnight_quant.tests.test_phase103_t31_complete_industry_audit import prepared_handler
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "overnight_quant/tests/fixtures/t29_http_client_worker.ps1"
@@ -44,6 +47,39 @@ def _spawn(tmp, key, *, _processes=None, **scenario):
     p.stdin.close()
     p.stdin = None
     return p, marker
+
+
+def _preserve_client_failure(details, directory):
+    target = os.environ.get("PHASE101_DIAGNOSTICS")
+    if not target:
+        return
+    # Only test fixture checkpoints/timing and sanitized errors are uploaded.
+    def scrub(value):
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, str):
+            text = value.replace(str(ROOT), "<repo>").replace(str(Path.home()), "<home>")
+            return re.sub(r"(?i)\b(authorization|token|api[_-]?key|password)\s*[:=][^\r\n]+",
+                          r"\1=<redacted>", text)[:4096]
+        return value
+    summary = {key: details[key] for key in (
+        "test_only", "request_id", "pid", "elapsed_ms", "terminated_at_teardown", "returncode", "phases")}
+    summary["phases"] = scrub(summary["phases"])
+    summary["stdout_sha256"] = hashlib.sha256(details["stdout"].encode("utf-8")).hexdigest()
+    summary["stderr"] = scrub(details["stderr"])
+    try:
+        response = json.loads(details["stdout"])
+        summary["result"] = {key: scrub(response[key]) for key in (
+            "ok", "error_code", "raw_error_type", "raw_error_message", "http_call_made") if key in response}
+    except ValueError:
+        summary["stdout_parseable"] = False
+    path = Path(target)
+    path.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256(f"{directory}|{details['request_id']}".encode("utf-8")).hexdigest()[:16]
+    with (path / f"phase101-{identity}-{details['pid']}.json").open("x", encoding="utf-8") as stream:
+        json.dump(summary, stream, indent=2)
 
 
 @contextmanager
@@ -83,13 +119,21 @@ def _client_process_scope(processes):
             if was_alive or process.returncode != 0:
                 # Only failures print fixture metadata, never market responses.
                 print("PHASE101_CLIENT_FAILURE " + json.dumps(details, ensure_ascii=True))
+                try:
+                    _preserve_client_failure(details, directory)
+                except (OSError, ValueError, TypeError) as exc:
+                    failures.append({"request_id": key, "pid": process.pid,
+                                     "stage": "fixture_diagnostic_write_failed", "error_type": type(exc).__name__})
         assert not failures, failures
 
 
 @pytest.fixture(autouse=True)
-def isolated_client_processes(monkeypatch):
+def isolated_client_processes(monkeypatch, prepared_handler):
     original = _spawn
     processes = []
+    # Reuse the existing preparation-only C# fixture. Fresh PowerShell startup,
+    # loading, the deliberately different cold delays, gate and reads stay real.
+    monkeypatch.setattr(sys.modules[__name__], "COMMAND", [*COMMAND, "-HandlerAssembly", str(prepared_handler)])
 
     def tracked_spawn(tmp, key, **scenario):
         return original(tmp, key, _processes=processes, **scenario)
@@ -115,7 +159,7 @@ def _barrier(tmp, count=2):
     (tmp / "release").touch()
 
 
-def test_slow_first_cold_start_fast_second_real_http_calls_stay_500ms_apart(tmp_path):
+def test_slow_first_cold_start_fast_second_real_http_calls_stay_500ms_apart(tmp_path, record_property):
     processes = [_spawn(tmp_path, str(i), cold_ms=550 if i == 0 else 50,
                         ready_marker=str(tmp_path / f"{i}.ready"), release_marker=str(tmp_path / "release"))
                  for i in range(2)]
@@ -125,6 +169,13 @@ def test_slow_first_cold_start_fast_second_real_http_calls_stay_500ms_apart(tmp_
     starts = sorted(float(marker.read_text()) for _, marker in processes)
     assert starts[1] - starts[0] >= .5
     assert all(r["response"]["client_read_elapsed_ms"] < 2000 for r in results)
+    for index in range(2):
+        phases = json.loads((tmp_path / f"{index}.diagnostic.json").read_text(encoding="utf-8-sig"))["phases"]
+        stages = {phase["stage"]: phase["monotonic_seconds"] for phase in phases}
+        assert "fixture_assembly_load" in stages and "fixture_compile" not in stages
+        assert stages["fixture_initialized"] < stages["fixture_cold_delay"] < stages["coordination_wait"]
+        record_property(f"worker_{index}_observed_cold_delay_ms",
+                        (stages["coordination_wait"] - stages["fixture_cold_delay"]) * 1000)
 
 
 def test_three_competing_clients_do_not_burst(tmp_path):
@@ -139,7 +190,9 @@ def test_three_competing_clients_do_not_burst(tmp_path):
 
 @pytest.mark.parametrize("corrupt_checkpoint", [False, True])
 def test_failed_ready_barrier_scope_reaps_real_client_and_retains_diagnostics(
-        tmp_path, isolated_client_processes, corrupt_checkpoint):
+        tmp_path, isolated_client_processes, corrupt_checkpoint, monkeypatch):
+    artifact_directory = tmp_path / "failure-artifact"
+    monkeypatch.setenv("PHASE101_DIAGNOSTICS", str(artifact_directory))
     processes = []
     # Use the original implementation so this explicitly exercises nested
     # failure cleanup, independently of the enclosing autouse fixture.
@@ -163,6 +216,45 @@ def test_failed_ready_barrier_scope_reaps_real_client_and_retains_diagnostics(
         assert saved["phases"]["diagnostic_read_error"].startswith("JSONDecodeError:")
     else:
         assert saved["phases"]["phases"][-1]["stage"] == "fixture_initialized"
+    artifact = json.loads(next(artifact_directory.glob("phase101-*.json")).read_text(encoding="utf-8"))
+    assert artifact["pid"] == process.pid and artifact["terminated_at_teardown"]
+    assert "stdout" not in artifact and "content_base64" not in json.dumps(artifact)
+
+
+def test_failure_artifact_is_redacted_and_excludes_response_body(tmp_path, monkeypatch):
+    monkeypatch.setenv("PHASE101_DIAGNOSTICS", str(tmp_path / "ci"))
+    details = {"test_only": True, "request_id": "fixture", "pid": 123, "elapsed_ms": 1,
+               "terminated_at_teardown": True, "returncode": 1,
+               "phases": {"path": str(ROOT / "private.txt"), "nested": ["token=SECRET_VALUE"]},
+               "stderr": str(Path.home() / "private.txt") + "\nAuthorization: Bearer SECRET_VALUE",
+               "stdout": json.dumps({"ok": False, "raw_error_message": "password=SECRET_VALUE",
+                                      "response": {"content_base64": "UNWANTED_BODY"}})}
+    _preserve_client_failure(details, tmp_path)
+    text = next((tmp_path / "ci").glob("*.json")).read_text(encoding="utf-8")
+    assert "SECRET_VALUE" not in text and "UNWANTED_BODY" not in text
+    assert str(ROOT) not in text and str(Path.home()) not in text
+    assert "<redacted>" in text and "stdout_sha256" in text
+
+
+def test_artifact_write_failure_still_reaps_all_clients(tmp_path, isolated_client_processes, monkeypatch):
+    processes = []
+    def denied(*args, **kwargs):
+        raise PermissionError("fixture denied")
+    monkeypatch.setattr(sys.modules[__name__], "_preserve_client_failure", denied)
+    with pytest.raises(AssertionError, match="fixture_diagnostic_write_failed"):
+        with _client_process_scope(processes):
+            for key in ("one", "two"):
+                isolated_client_processes(tmp_path, key, _processes=processes,
+                                         ready_marker=str(tmp_path / f"{key}.ready"),
+                                         release_marker=str(tmp_path / "never-release"))
+            end = time.perf_counter() + 15
+            while len(list(tmp_path.glob("*.ready"))) < 2 and time.perf_counter() < end:
+                time.sleep(.01)
+            assert len(list(tmp_path.glob("*.ready"))) == 2
+    assert len(processes) == 2
+    assert all(process.poll() is not None and process.stdout.closed and process.stderr.closed
+               for process, _, _, _ in processes)
+    assert not list(tmp_path.glob("*.call"))
 
 
 def test_wait_exhausts_budget_zero_http_calls_then_no_burst(tmp_path):

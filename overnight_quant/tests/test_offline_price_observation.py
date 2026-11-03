@@ -5,10 +5,14 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import asyncio
+import http.client
+import urllib.request
 
 import pytest
 
 from overnight_quant.data import offline_price_observation as model
+from overnight_quant.tests.fixtures.apptest_network_guard import AppTestNetworkGuard
 
 NOW = datetime.fromisoformat("2026-11-03T12:00:00+08:00")
 
@@ -227,7 +231,7 @@ def test_real_session_input_reuses_verifier_but_never_authorizes(monkeypatch):
         model.import_snapshot(data, expected_sha256=sha, now=NOW)
 
 
-def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch):
+def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch, record_property):
     from streamlit.testing.v1 import AppTest
     from overnight_quant.ui import offline_observation as ui
     store = model.ObservationStore(tmp_path, "synthetic_test_only")
@@ -235,15 +239,10 @@ def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch)
         data, sha = encoded(payload)
         store.import_bytes(data, sha, now=NOW)
     monkeypatch.setattr(ui, "DEFAULT_STORE", tmp_path)
-    calls = []
-    def forbidden(*args, **kwargs):
-        calls.append("forbidden")
-        raise AssertionError("network_or_legacy_action")
-    monkeypatch.setattr(socket.socket, "connect", forbidden)
-    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
-    monkeypatch.setattr(subprocess, "run", forbidden)
+    guard = AppTestNetworkGuard(monkeypatch)
     from overnight_quant.ui import dashboard
-    monkeypatch.setattr(dashboard, "run_dashboard_action", forbidden)
+    monkeypatch.setattr(dashboard, "run_dashboard_action", guard.deny_legacy_action)
+    monkeypatch.setattr(dashboard, "run_approved_action", guard.deny_legacy_action)
     path = Path(__file__).resolve().parents[1] / "ui" / "dashboard.py"
     package = path.parents[1]
     def formal_files():
@@ -265,7 +264,7 @@ def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch)
     assert any("不证明连续路径" in value.value for value in app.info)
     next(x for x in app.text_area if x.label == "证券代码（每行一个）").input("000001\n000002\n600000")
     next(x for x in app.button if x.label == "保存自选池").click().run()
-    assert not app.exception and not calls
+    assert not app.exception and not any(guard.business_attempts.values())
     table = app.dataframe[0].value
     assert "SZ:000002" in list(table["证券身份"])
     assert table[table["证券身份"] == "SZ:000002"].iloc[0]["比较价格"] == "缺失/不可用"
@@ -273,5 +272,66 @@ def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch)
     revision = next(key for key, value in store.settings().items() if value["pool"] == ["SH:600000", "SZ:000001", "SZ:000002"])
     next(x for x in app.selectbox if x.label == "已保存设置版本").select(revision).run()
     next(x for x in app.button if x.label == "加载所选设置").click().run()
-    assert not app.exception and not calls
+    assert not app.exception and not any(guard.business_attempts.values())
     assert formal_files() == original_formal_files
+    record_property("framework_socketpairs", guard.framework_pairs)
+    record_property("framework_connections", guard.framework_connections)
+    record_property("business_attempts", json.dumps(guard.business_attempts, sort_keys=True))
+    record_property("formal_files_unchanged", True)
+
+
+def test_framework_event_loop_can_initialize_but_business_loopback_cannot(monkeypatch):
+    guard = AppTestNetworkGuard(monkeypatch)
+    # Exercise the Windows socketpair path even on Streamlit versions whose
+    # LocalScriptRunner does not yet own an asyncio loop.
+    with guard.framework_initialization():
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            loop.close()
+        with socket.socket() as client, pytest.raises(AssertionError, match="business_connection"):
+            client.connect(("127.0.0.1", 9))
+    assert guard.framework_pairs >= 1
+    assert guard.business_attempts["connection"] == 1
+    assert sum(guard.business_attempts.values()) == 1
+
+
+@pytest.mark.parametrize("address", [("127.0.0.1", 9), ("192.0.2.1", 443), ("::1", 9)])
+def test_framework_exception_does_not_allow_arbitrary_local_or_external_connection(monkeypatch, address):
+    guard = AppTestNetworkGuard(monkeypatch)
+    with socket.socket() as client, pytest.raises(AssertionError, match="business_connection"):
+        client.connect(address)
+    assert guard.business_attempts["connection"] == 1
+    with socket.socket() as client, pytest.raises(AssertionError, match="business_connection"):
+        client.connect_ex(address)
+    assert guard.framework_connections == 0
+    with pytest.raises(AssertionError, match="business_connection"):
+        socket.socketpair()
+    assert guard.framework_pairs == 0
+
+
+def test_http_dns_and_old_actions_stay_denied_and_counted(monkeypatch):
+    import requests
+    from overnight_quant.ui import dashboard
+    guard = AppTestNetworkGuard(monkeypatch)
+    monkeypatch.setattr(dashboard, "run_dashboard_action", guard.deny_legacy_action)
+    for url in ("http://127.0.0.1:9/business", "https://example.invalid/business"):
+        with pytest.raises(AssertionError, match="business_http"):
+            urllib.request.urlopen(url)
+        with pytest.raises(AssertionError, match="business_http"):
+            requests.get(url)
+    with pytest.raises(AssertionError, match="business_http"):
+        http.client.HTTPConnection("127.0.0.1", 9).request("GET", "/business")
+    with pytest.raises(AssertionError, match="business_dns"):
+        socket.getaddrinfo("example.invalid", 443)
+    for lookup in (socket.gethostbyname, socket.gethostbyname_ex, socket.gethostbyaddr):
+        with pytest.raises(AssertionError, match="business_dns"):
+            lookup("example.invalid")
+    for action in ("formal_live_scan", "sell_plan_live"):
+        with pytest.raises(AssertionError, match="business_legacy_action"):
+            dashboard.run_dashboard_action(action, "zh")
+    with pytest.raises(AssertionError, match="business_subprocess"):
+        subprocess.run(["not-started"])
+    assert guard.business_attempts == {"connection": 0, "dns": 4, "http": 5, "legacy_action": 2, "subprocess": 1}
+    assert guard.framework_pairs == guard.framework_connections == 0
