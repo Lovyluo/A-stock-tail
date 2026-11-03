@@ -54,7 +54,7 @@ def mark_test_receipt(active, batch):
     obs.write_once(target / "response.json", body["response"])
     obs.write_once(active.root / refresh.VERSION / "control" / "active.lock", {"batch_id": batch})
     started = time.perf_counter()
-    final = refresh._finish_refresh(active, target, refresh.safe("SUCCEEDED", batch_id=batch, cleanup_complete=True),
+    final = refresh._finish_refresh(active, target, refresh.safe("CANDIDATE_SUCCEEDED", batch_id=batch, cleanup_complete=True),
         started=started, hard=started + 10, owned=True, cleaned=True, dispatched=True, published=True)
     assert final["status"] == "SUCCEEDED", final
 
@@ -159,7 +159,8 @@ def test_success_actual_worker_once_and_cooldown(tmp_path, monkeypatch):
     assert result["status"] == "SUCCEEDED", result
     assert result["requests_made"] == 1 and result["process"]["cleanup_complete"]
     assert result["process"]["payload"]["network_attempts"] == 0
-    assert result["elapsed_ms"] < 10000
+    assert result["execution_elapsed_ms"] < 10000
+    assert result["total_elapsed_ms"] >= result["execution_elapsed_ms"]
     assert len(active.refresh_snapshots()) == 1
     assert not (controller.state / "active.lock").exists()
     second = refresh.RefreshController(active, fixture=controller.fixture).refresh(refresh.CODES)

@@ -30,10 +30,11 @@ CODES = observation.INITIAL_POOL
 IDENTITIES = frozenset(observation.normalize_pool(CODES))
 NETWORK_SWITCH = "OBSERVATION_QUOTE_NETWORK_ENABLED"
 HTTP_SECONDS = 5
-TOTAL_SECONDS = 10
+TOTAL_SECONDS = 10  # v3 execution budget only; confirmation persistence is separate.
 INTERVAL_SECONDS = 10
 AGE_SECONDS = 60
-FINALIZATION_VERSION = "manual_quote_refresh_finalization_v2"
+FINALIZATION_VERSION = "manual_quote_refresh_confirmation_v3"
+EXECUTION_CANDIDATE_VERSION = "manual_quote_refresh_execution_candidate_v3"
 
 
 def utc_now():
@@ -47,24 +48,25 @@ def safe(status, **values):
                 tickets=[], orders=[], **values)
 
 
-def committed_refresh_outcome(root, batch, response_sha256):
-    """One admission rule for controller, storage and page; early receipt is not a commit."""
+def _duration_ms(start, end):
+    if (type(start) not in (int, float) or type(end) not in (int, float)
+            or not math.isfinite(start) or not math.isfinite(end) or end < start):
+        return None
+    value = (end - start) * 1000
+    return value if math.isfinite(value) else None
+
+
+def _execution_candidate(root, batch, response_sha256):
+    """Validate published candidate data, never infer execution completion from it."""
     directory = Path(root) / VERSION / "attempts" / batch
-    failure = directory / "final-failure.json"
-    rejected = safe("FAILED", batch_id=batch, error="final_commit_missing_or_invalid")
-    try:
-        if failure.exists():
-            body = observation._json(failure.read_bytes())
-            if body.get("batch_id") == batch and body.get("status") in ("FAILED", "REJECTED"):
-                return body
-            return rejected
-        commit = observation._json((directory / "final-commit.json").read_bytes())
-        final_bytes = (directory / "final-result.json").read_bytes()
-        receipt_bytes = (directory / "receipt.json").read_bytes()
-        final = observation._json(final_bytes)
-        receipt = observation._json(receipt_bytes)
-        if (commit.get("schema") != FINALIZATION_VERSION or commit.get("batch_id") != batch
-                or commit.get("status") != "SUCCEEDED"
+    commit_bytes = (directory / "final-commit.json").read_bytes()
+    commit = observation._json(commit_bytes)
+    final_bytes = (directory / "final-result.json").read_bytes()
+    receipt_bytes = (directory / "receipt.json").read_bytes()
+    final = observation._json(final_bytes)
+    receipt = observation._json(receipt_bytes)
+    if (commit.get("schema") != EXECUTION_CANDIDATE_VERSION or commit.get("batch_id") != batch
+                or commit.get("status") != "CANDIDATE_SUCCEEDED"
                 or commit.get("final_result_sha256") != hashlib.sha256(final_bytes).hexdigest()
                 or commit.get("candidate_receipt_sha256") != hashlib.sha256(receipt_bytes).hexdigest()
                 or commit.get("response_sha256") != response_sha256
@@ -72,39 +74,78 @@ def committed_refresh_outcome(root, batch, response_sha256):
                 or receipt.get("batch_id") != batch or receipt.get("cleanup_complete") is not True
                 or final.get("status") != "CANDIDATE_SUCCEEDED" or final.get("batch_id") != batch
                 or final.get("cleanup_complete") is not True):
-            return rejected
-        stages = [commit.get(key) for key in ("started_monotonic", "receipt_completed_monotonic",
+        raise ValueError("execution_candidate_identity_invalid")
+    stages = [commit.get(key) for key in ("started_monotonic", "receipt_completed_monotonic",
                   "unlock_started_monotonic", "unlock_completed_monotonic", "final_write_started_monotonic",
                   "final_write_completed_monotonic", "commit_prepared_monotonic")]
-        if (any(type(value) not in (int, float) or not math.isfinite(value) for value in stages)
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in stages)
                 or stages != sorted(stages) or not 0 <= stages[-1] - stages[0] < TOTAL_SECONDS):
-            return rejected
-        if final.get("elapsed_before_final_write_ms") != (stages[4] - stages[0]) * 1000:
-            return rejected
-        lock = Path(root) / VERSION / "control" / "active.lock"
-        if lock.exists() and observation._json(lock.read_bytes()).get("batch_id") == batch:
-            return rejected
-        return {**final, "status": commit["status"]}
+        raise ValueError("execution_candidate_timeline_invalid")
+    if final.get("elapsed_before_final_write_ms") != (stages[4] - stages[0]) * 1000:
+        raise ValueError("execution_candidate_elapsed_invalid")
+    stored = observation._json((Path(root) / VERSION / "snapshots" / (stable_hash(batch) + ".json")).read_bytes())
+    if stored.get("sha256") != response_sha256 or stable_hash(stored.get("response")) != response_sha256:
+        raise ValueError("sealed_observation_data_mismatch")
+    return final, commit, hashlib.sha256(commit_bytes).hexdigest()
+
+
+def committed_refresh_outcome(root, batch, response_sha256):
+    """Only one complete v3 confirmation admits success; candidate publication cannot."""
+    directory = Path(root) / VERSION / "attempts" / batch
+    unknown = safe("UNCONFIRMED", batch_id=batch, error="completion_unconfirmed",
+                   execution_result="UNKNOWN", result_committed=False, caller_received_result="UNKNOWN",
+                   execution_elapsed_ms=None, confirmation_elapsed_ms=None, total_elapsed_ms=None)
+    try:
+        confirmation = observation._json((directory / "final-confirmation.json").read_bytes())
+        final, commit, commit_sha = _execution_candidate(root, batch, response_sha256)
+        start = confirmation.get("execution_started_monotonic")
+        end = confirmation.get("execution_completed_monotonic")
+        confirm_start = confirmation.get("confirmation_started_monotonic")
+        if (confirmation.get("schema") != FINALIZATION_VERSION or confirmation.get("batch_id") != batch
+                or confirmation.get("response_sha256") != response_sha256
+                or confirmation.get("candidate_commit_sha256") != commit_sha
+                or confirmation.get("execution_result") != "EXECUTION_SUCCEEDED"
+                or any(type(value) not in (int, float) or not math.isfinite(value)
+                       for value in (start, end, confirm_start))
+                or start != commit["started_monotonic"]
+                or not commit["commit_prepared_monotonic"] <= end <= confirm_start
+                or not 0 <= end - start < TOTAL_SECONDS
+                or type(confirmation.get("execution_elapsed_ms")) not in (int, float)
+                or confirmation.get("execution_elapsed_ms") != (end - start) * 1000):
+            return unknown
+        # Confirmation publication is the durable boundary. Later page/process exits
+        # or failure diagnostics do not revoke a fully confirmed execution.
+        return {**final, "status": "SUCCEEDED", "execution_result": "EXECUTION_SUCCEEDED",
+                "result_committed": True, "caller_received_result": "UNKNOWN",
+                "execution_elapsed_ms": confirmation["execution_elapsed_ms"],
+                "confirmation_elapsed_ms": None, "total_elapsed_ms": None}
     except (OSError, ValueError, KeyError, TypeError):
-        return rejected
+        try:
+            failure = observation._json((directory / "final-failure.json").read_bytes())
+            if failure.get("batch_id") == batch and failure.get("status") in ("FAILED", "REJECTED", "UNCONFIRMED"):
+                return failure
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return unknown
 
 
 def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dispatched, published):
-    """Publish only after unlock and write/readback checks; keep failure vetoes append-only."""
+    """PM v3 boundary: execution <10s; persist its observed result separately."""
     batch = target.name if target is not None else None
     state = store.root / VERSION / "control"
     lock = state / "active.lock"
     stage = "candidate_receipt"
+    execution_completed = confirmation_started = None
+    response_sha = None
     try:
         if target is not None:
             result.update(batch_id=batch, finalization_contract=FINALIZATION_VERSION)
-            candidate = {**result, "status": "CANDIDATE_SUCCEEDED" if published and result["status"] == "SUCCEEDED"
-                         else result["status"]}
+            candidate = dict(result)
             observation.write_once(target / "receipt.json", candidate)
             receipt_completed = time.perf_counter()
             if receipt_completed >= hard:
                 raise TimeoutError("candidate_receipt_budget_exhausted")
-        if owned and cleaned and not (published and result["status"] != "SUCCEEDED"):
+        if owned and cleaned and not (published and result["status"] != "CANDIDATE_SUCCEEDED"):
             if dispatched:
                 observation.write_once(state / ("release-" + batch + ".json"),
                                        {"dispatch_monotonic": time.monotonic()})
@@ -121,10 +162,17 @@ def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dis
             unlock_completed = time.perf_counter()
             if unlock_completed >= hard:
                 raise TimeoutError("unlock_budget_exhausted")
-        if result["status"] != "SUCCEEDED":
+        if result["status"] != "CANDIDATE_SUCCEEDED":
+            observed = time.perf_counter()
+            result.update(execution_result="EXECUTION_FAILED" if dispatched else "NOT_EXECUTED",
+                          result_committed=False, caller_received_result="UNKNOWN",
+                          execution_elapsed_ms=(observed - started) * 1000,
+                          confirmation_elapsed_ms=None, total_elapsed_ms=None)
             if target is not None:
                 observation.write_once(target / "final-failure.json", result)
-            return result
+            finished = time.perf_counter()
+            return {**result, "total_elapsed_ms": (finished - started) * 1000,
+                    "elapsed_ms": (finished - started) * 1000}
         stage = "final_result"
         final_started = time.perf_counter()
         if final_started >= hard:
@@ -140,7 +188,7 @@ def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dis
         if final_completed >= hard:
             raise TimeoutError("final_result_budget_exhausted")
         response = observation._json((target / "response.json").read_bytes())
-        commit = dict(schema=FINALIZATION_VERSION, batch_id=batch, status="SUCCEEDED",
+        commit = dict(schema=EXECUTION_CANDIDATE_VERSION, batch_id=batch, status="CANDIDATE_SUCCEEDED",
             response_sha256=stable_hash(response), final_result_sha256=hashlib.sha256(final_bytes).hexdigest(),
             candidate_receipt_sha256=hashlib.sha256((target / "receipt.json").read_bytes()).hexdigest(),
             started_monotonic=started, receipt_completed_monotonic=receipt_completed,
@@ -156,16 +204,57 @@ def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dis
         if time.perf_counter() >= hard:
             raise TimeoutError("final_commit_budget_exhausted")
         os.link(staged, target / "final-commit.json")  # Atomic, same-volume, no replacement.
-        if time.perf_counter() >= hard:
-            raise TimeoutError("final_commit_publication_budget_exhausted")
-        persisted = committed_refresh_outcome(store.root, batch, stable_hash(response))
+        stage = "post_publication_execution_check"
+        response_sha = stable_hash(response)
+        _, _, candidate_sha = _execution_candidate(store.root, batch, response_sha)
+        if lock.exists():
+            raise ValueError("execution_unlock_unconfirmed")
+        observed = time.perf_counter()
+        if not math.isfinite(observed) or observed < started or observed >= hard:
+            raise TimeoutError("execution_completion_budget_exhausted")
+        execution_completed = observed  # Only now may EXECUTION_SUCCEEDED exist.
+
+        stage = "confirmation_persistence"
+        confirmation_started = time.perf_counter()
+        if not math.isfinite(confirmation_started) or confirmation_started < execution_completed:
+            raise ValueError("confirmation_clock_invalid")
+        confirmation = dict(schema=FINALIZATION_VERSION, batch_id=batch,
+            execution_result="EXECUTION_SUCCEEDED", response_sha256=response_sha,
+            candidate_commit_sha256=candidate_sha,
+            execution_started_monotonic=started, execution_completed_monotonic=execution_completed,
+            execution_elapsed_ms=(execution_completed - started) * 1000,
+            confirmation_started_monotonic=confirmation_started,
+            confirmation_elapsed_ms=None, total_elapsed_ms=None, caller_received_result="UNKNOWN")
+        # This single confirmation records an already observed result. Its own I/O
+        # is separately measured, not recursively certified by another file.
+        confirmation_candidate = target / "confirmation-candidate.json"
+        observation.write_once(confirmation_candidate, confirmation)
+        if observation._json(confirmation_candidate.read_bytes()) != confirmation:
+            raise ValueError("confirmation_readback_mismatch")
+        os.link(confirmation_candidate, target / "final-confirmation.json")
+        persisted = committed_refresh_outcome(store.root, batch, response_sha)
         finished = time.perf_counter()
-        if persisted["status"] != "SUCCEEDED" or finished >= hard:
-            raise TimeoutError("final_commit_confirmation_failed")
-        return {**persisted, "elapsed_ms": (finished - started) * 1000}
+        if persisted["status"] != "SUCCEEDED":
+            raise ValueError("confirmation_invalid")
+        return {**persisted, "confirmation_elapsed_ms": _duration_ms(confirmation_started, finished),
+                "total_elapsed_ms": _duration_ms(started, finished), "elapsed_ms": _duration_ms(started, finished)}
     except BaseException as exc:
-        result.update(status="FAILED", error=f"{stage}:{type(exc).__name__}:{exc}",
-                      elapsed_ms=(time.perf_counter() - started) * 1000)
+        if execution_completed is not None and response_sha is not None:
+            persisted = committed_refresh_outcome(store.root, batch, response_sha)
+            if persisted["status"] == "SUCCEEDED":
+                if not isinstance(exc, Exception):
+                    raise  # Result committed; whether the caller received it stays unknown.
+                finished = time.perf_counter()
+                return {**persisted, "confirmation_elapsed_ms": _duration_ms(confirmation_started, finished),
+                        "total_elapsed_ms": _duration_ms(started, finished),
+                        "elapsed_ms": _duration_ms(started, finished), "return_warning": type(exc).__name__}
+        result.update(status="UNCONFIRMED" if execution_completed is not None else "FAILED",
+                      execution_result="EXECUTION_SUCCEEDED" if execution_completed is not None else "EXECUTION_FAILED",
+                      result_committed=False, caller_received_result="UNKNOWN",
+                      execution_elapsed_ms=_duration_ms(started, execution_completed if execution_completed is not None else time.perf_counter()),
+                      confirmation_elapsed_ms=None, total_elapsed_ms=None,
+                      error=f"{stage}:{type(exc).__name__}:{exc}",
+                      elapsed_ms=_duration_ms(started, time.perf_counter()))
         if target is not None:
             try:
                 observation.write_once(target / "final-failure.json", result)
@@ -178,7 +267,11 @@ def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dis
                     result["failure_record_persisted"] = False
         if not isinstance(exc, Exception):
             raise
-        return result
+        finished = time.perf_counter()
+        return {**result,
+                "confirmation_elapsed_ms": _duration_ms(confirmation_started, finished),
+                "total_elapsed_ms": _duration_ms(started, finished),
+                "elapsed_ms": _duration_ms(started, finished)}
 
 
 def decode_response(envelope):
@@ -258,7 +351,7 @@ def evaluate_current(snapshot, identity, rule, *, now=None, attempt=None):
     if identity not in IDENTITIES:
         reason = "本轮刷新范围未支持"
     elif not attempt or attempt.get("status") != "SUCCEEDED":
-        reason = "本次刷新未成功：" + str((attempt or {}).get("error", "尚未刷新"))
+        reason = ("完成状态未确认：" if (attempt or {}).get("status") == "UNCONFIRMED" else "本次刷新未成功：") + str((attempt or {}).get("error", "尚未刷新"))
     elif not snapshot or attempt.get("batch_id") != snapshot.get("batch_id"):
         reason = "所选为历史快照，不代替本次刷新"
     elif snapshot.get("observation_contract") != VERSION:
@@ -338,7 +431,8 @@ class RefreshController:
             target.mkdir(parents=True, exist_ok=False)
             intent = dict(contract=VERSION, batch_id=batch, codes=list(CODES), created_at=utc_now().isoformat(),
                           synthetic_test_only=self.test_only, dispatch_monotonic=tick,
-                          http_timeout_seconds=HTTP_SECONDS, controller_budget_seconds=TOTAL_SECONDS)
+                          http_timeout_seconds=HTTP_SECONDS, execution_budget_seconds=TOTAL_SECONDS,
+                          confirmation_persistence_separate=True, finalization_contract=FINALIZATION_VERSION)
             observation.write_once(self.state / ("attempt-" + batch + ".json"), intent)
             observation.write_once(target / "intent.json", intent)
             task = dict(intent, output=str(target.resolve()), fixture=str(self.fixture) if self.fixture else None)
@@ -367,7 +461,7 @@ class RefreshController:
             published = True
             if time.perf_counter() >= hard:
                 raise TimeoutError("controller_publication_budget_exhausted")
-            result = safe("SUCCEEDED", batch_id=batch, requests_made=1, error="")
+            result = safe("CANDIDATE_SUCCEEDED", batch_id=batch, requests_made=1, error="")
         except Exception as exc:
             result = safe("FAILED" if dispatched else "REJECTED", error=f"{type(exc).__name__}:{exc}",
                           requests_made=None if dispatched else 0)

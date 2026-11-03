@@ -59,13 +59,14 @@ def test_unlock_crosses_ten_seconds_same_counterexample(tmp_path, monkeypatch, r
 
 
 @pytest.mark.parametrize("fault", ["unlock_error", "final_write_error", "final_write_late",
-    "commit_write_error", "commit_write_late", "publication_error", "publication_late", "confirmation_late"])
+    "commit_write_error", "commit_write_late", "publication_error", "publication_late", "execution_check_late"])
 def test_terminal_faults_preserve_originals_and_reject_candidate(tmp_path, monkeypatch, fault):
     active, controller, clock, calls = setup_controller(tmp_path, monkeypatch)
     write = obs.write_once
     unlink = Path.unlink
     link = refresh.os.link
     read_outcome = refresh.committed_refresh_outcome
+    candidate_check = refresh._execution_candidate
     def injected_write(path, value):
         path = Path(path)
         if fault == "final_write_error" and path.name == "final-result.json":
@@ -88,15 +89,15 @@ def test_terminal_faults_preserve_originals_and_reject_candidate(tmp_path, monke
         if fault == "publication_late":
             clock.value = 110.001
         return result
-    def injected_outcome(*args):
-        result = read_outcome(*args)
-        if fault == "confirmation_late" and result["status"] == "SUCCEEDED":
+    def injected_check(*args):
+        result = candidate_check(*args)
+        if fault == "execution_check_late":
             clock.value = 110.001
         return result
     monkeypatch.setattr(obs, "write_once", injected_write)
     monkeypatch.setattr(Path, "unlink", injected_unlink)
     monkeypatch.setattr(refresh.os, "link", injected_link)
-    monkeypatch.setattr(refresh, "committed_refresh_outcome", injected_outcome)
+    monkeypatch.setattr(refresh, "_execution_candidate", injected_check)
     result = controller.refresh(refresh.CODES)
     directory = Path(result["output"])
     raw = (directory / "response-received.json").read_bytes()
@@ -155,7 +156,7 @@ def test_missing_or_damaged_final_commit_is_not_early_receipt_success(tmp_path, 
     assert active.refresh_snapshots()
     directory = Path(result["output"])
     (directory / material).write_text("{incomplete", encoding="utf-8")
-    assert not active.refresh_snapshots() and outcome(active, result)["status"] == "FAILED"
+    assert not active.refresh_snapshots() and outcome(active, result)["status"] == "UNCONFIRMED"
 
 
 def test_interruption_before_publication_leaves_no_success(tmp_path, monkeypatch):
@@ -182,6 +183,125 @@ def test_abrupt_process_exit_does_not_publish_private_commit(tmp_path):
     assert list((active.root / refresh.VERSION / "control").glob("pending-finalization-*.json"))
     controller = refresh.RefreshController(active, fixture=fixture)
     assert "incomplete_finalization_block" in controller.refresh(refresh.CODES)["error"]
+
+
+@pytest.mark.parametrize("phase,admitted", [
+    ("after_publication_before_confirmation", 0),
+    ("before_confirmation", 0), ("during_confirmation", 0),
+    ("after_confirmation_publication", 1), ("after_return", 1),
+])
+def test_real_process_confirmation_boundary(tmp_path, phase, admitted, record_property):
+    from overnight_quant.data.probe_worker_process import run_probe_worker_process
+    active = store(tmp_path / "isolated")
+    fixture = fixture_file(tmp_path)
+    revision = active.save_settings(refresh.CODES, {}, ["SZ:000001"])
+    process = run_probe_worker_process(dict(store=str(tmp_path / "isolated"), fixture=str(fixture), phase=phase),
+        10000, bounded_cleanup_ms=500, retain_streams=True,
+        worker_command=[sys.executable, "-m", "overnight_quant.tests.fixtures.quote_refresh_interrupt"])
+    assert process["returncode"] == 19 and process["cleanup_complete"], process
+    reopened = store(tmp_path / "isolated")
+    snapshots = reopened.refresh_snapshots()
+    assert len(snapshots) == admitted and revision in reopened.settings()
+    directory = next((active.root / refresh.VERSION / "attempts").iterdir())
+    response = obs._json((directory / "response.json").read_bytes())
+    terminal = refresh.committed_refresh_outcome(active.root, directory.name, obs.stable_hash(response))
+    assert terminal["status"] == ("SUCCEEDED" if admitted else "UNCONFIRMED")
+    assert terminal["result_committed"] is bool(admitted)
+    assert terminal["caller_received_result"] == "UNKNOWN"
+    if admitted:
+        assert terminal["execution_elapsed_ms"] < 10000
+        assert terminal["confirmation_elapsed_ms"] is None and terminal["total_elapsed_ms"] is None
+    if phase == "after_publication_before_confirmation":
+        assert (directory / "final-commit.json").exists()
+        assert not (directory / "final-confirmation.json").exists()
+        record_property("postpublication_counterexample", json.dumps({"exit": 19, "admitted": admitted,
+                        "terminal": terminal["status"], "clock": 110.001, "real_requests": 0}))
+    if phase == "after_return":
+        returned = obs._json((tmp_path / "isolated" / "caller-observed-return.json").read_bytes())
+        assert returned["status"] == "SUCCEEDED" and returned["execution_result"] == "EXECUTION_SUCCEEDED"
+        assert returned["confirmation_elapsed_ms"] >= 0 and returned["total_elapsed_ms"] >= returned["execution_elapsed_ms"]
+
+
+def test_confirmation_write_failure_is_unconfirmed_not_execution_failure(tmp_path, monkeypatch):
+    active, controller, _, calls = setup_controller(tmp_path, monkeypatch)
+    write = obs.write_once
+    def denied(path, body):
+        if Path(path).name == "confirmation-candidate.json":
+            raise OSError("confirmation write denied")
+        return write(path, body)
+    monkeypatch.setattr(obs, "write_once", denied)
+    result = controller.refresh(refresh.CODES)
+    assert result["status"] == outcome(active, result)["status"] == "UNCONFIRMED"
+    assert result["execution_result"] == "EXECUTION_SUCCEEDED" and not result["result_committed"]
+    assert result["execution_elapsed_ms"] < 10000 and not active.refresh_snapshots()
+    assert controller.refresh(refresh.CODES)["requests_made"] == 0 and len(calls) == 1
+
+
+def test_confirmation_cost_is_separate_and_not_recursively_certified(tmp_path, monkeypatch):
+    active, controller, clock, _ = setup_controller(tmp_path, monkeypatch)
+    write = obs.write_once
+    def slow_confirmation(path, body):
+        result = write(path, body)
+        if Path(path).name == "confirmation-candidate.json":
+            clock.value = 115.25
+        return result
+    monkeypatch.setattr(obs, "write_once", slow_confirmation)
+    result = controller.refresh(refresh.CODES)
+    assert result["status"] == outcome(active, result)["status"] == "SUCCEEDED"
+    assert result["execution_elapsed_ms"] == 0
+    assert result["confirmation_elapsed_ms"] == result["total_elapsed_ms"] == 15250
+    persisted = outcome(active, result)
+    assert persisted["confirmation_elapsed_ms"] is None and persisted["total_elapsed_ms"] is None
+    assert len(active.refresh_snapshots()) == 1
+
+
+@pytest.mark.parametrize("fault", ["partial_confirmation", "old_schema", "wrong_batch", "deadline_not_met", "wrong_elapsed_type"])
+def test_invalid_confirmation_never_admits_candidate(tmp_path, monkeypatch, fault):
+    active, controller, _, _ = setup_controller(tmp_path, monkeypatch)
+    result = controller.refresh(refresh.CODES)
+    assert active.refresh_snapshots()
+    path = Path(result["output"]) / "final-confirmation.json"
+    if fault == "partial_confirmation":
+        path.write_text('{"schema":', encoding="utf-8")
+    else:
+        data = obs._json(path.read_bytes())
+        if fault == "old_schema":
+            data["schema"] = "manual_quote_refresh_finalization_v2"
+        elif fault == "wrong_batch":
+            data["batch_id"] = "other"
+        elif fault == "wrong_elapsed_type":
+            data["execution_elapsed_ms"] = False
+        else:
+            data["execution_completed_monotonic"] = data["execution_started_monotonic"] + 10
+            data["execution_elapsed_ms"] = 10000
+            data["confirmation_started_monotonic"] = data["execution_completed_monotonic"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+    assert outcome(active, result)["status"] == "UNCONFIRMED" and not active.refresh_snapshots()
+
+
+def test_confirmed_success_is_not_revoked_by_later_failure_diagnostic(tmp_path, monkeypatch):
+    active, controller, _, _ = setup_controller(tmp_path, monkeypatch)
+    result = controller.refresh(refresh.CODES)
+    original = active.refresh_snapshots()
+    obs.write_once(Path(result["output"]) / "final-failure.json",
+                   refresh.safe("FAILED", batch_id=result["batch_id"], error="later page exit"))
+    assert outcome(active, result)["status"] == "SUCCEEDED" and active.refresh_snapshots() == original
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), 1e308])
+def test_nonfinite_completion_time_never_forms_execution_success(tmp_path, monkeypatch, invalid):
+    active, controller, clock, _ = setup_controller(tmp_path, monkeypatch)
+    link = refresh.os.link
+    def invalid_clock(src, dst, **kwargs):
+        result = link(src, dst, **kwargs)
+        if Path(dst).name == "final-commit.json":
+            clock.value = invalid
+        return result
+    monkeypatch.setattr(refresh.os, "link", invalid_clock)
+    result = controller.refresh(refresh.CODES)
+    assert result["status"] == "FAILED" and result["execution_result"] == "EXECUTION_FAILED"
+    assert result["execution_elapsed_ms"] is None and not active.refresh_snapshots()
+    assert not (Path(result["output"]) / "final-confirmation.json").exists()
 
 
 def test_late_publication_with_failed_failure_receipt_keeps_lock_veto(tmp_path, monkeypatch):
@@ -224,5 +344,5 @@ def test_page_cached_success_cannot_bypass_missing_commit(tmp_path, monkeypatch)
     (active.root / refresh.VERSION / "attempts" / snapshot["batch_id"] / "final-commit.json").unlink()
     app.run()
     assert not app.exception and not any("本次报价已保存" in x.value for x in app.success)
-    assert any("final_commit_missing_or_invalid" in x.value for x in app.error)
+    assert any("completion_unconfirmed" in x.value for x in app.warning)
     assert not active.refresh_snapshots() and not any(guard.business_attempts.values())
