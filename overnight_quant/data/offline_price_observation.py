@@ -296,3 +296,30 @@ class ObservationStore:
                 raise ValueError("tracking_outside_explicit_pool")
             result[path.stem] = body
         return result
+
+    def save_refresh(self, envelope):
+        from overnight_quant.data.quote_observation_refresh import VERSION as contract, decode_response
+        snapshot = decode_response(envelope)
+        if snapshot["scope"] != self.scope:
+            raise ValueError("refresh_scope_mismatch")
+        path = self.root / contract / "snapshots" / (stable_hash(snapshot["batch_id"]) + ".json")
+        body = {"response": envelope, "sha256": stable_hash(envelope)}
+        write_once(path, body)
+        return snapshot
+
+    def refresh_snapshots(self):
+        from overnight_quant.data.quote_observation_refresh import (
+            VERSION as contract, committed_refresh_outcome, decode_response,
+        )
+        result = []
+        for path in sorted((self.root / contract / "snapshots").glob("*.json")):
+            body = _json(path.read_bytes())
+            if stable_hash(body["response"]) != body["sha256"]:
+                raise ValueError("refresh_stored_sha_mismatch")
+            snapshot = decode_response(body["response"])
+            if snapshot["scope"] != self.scope or path.stem != stable_hash(snapshot["batch_id"]):
+                raise ValueError("refresh_stored_identity_mismatch")
+            if committed_refresh_outcome(self.root, snapshot["batch_id"], body["sha256"])["status"] != "SUCCEEDED":
+                continue
+            result.append(snapshot)
+        return result

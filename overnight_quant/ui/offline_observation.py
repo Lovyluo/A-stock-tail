@@ -8,27 +8,34 @@ from overnight_quant.data.offline_price_observation import (
     compare, evaluate, make_rule, normalize_pool,
 )
 from overnight_quant.data.point_in_time import stable_hash
+from overnight_quant.data.quote_observation_refresh import evaluate_current, utc_now
+from overnight_quant.ui.quote_observation_refresh import render_refresh
 
 DEFAULT_STORE = Path(__file__).resolve().parents[1] / "data" / "cache" / "offline_observation"
 
 
-def render_offline_observation(st, *, storage_root=None):
+def render_offline_observation(st, *, storage_root=None, refresh_controller=None, clock=None):
     st.markdown("""<style>
-    .stMainBlockContainer {max-width: 1400px; padding-top: 2rem;}
+    .stMainBlockContainer {max-width: 1400px; padding-top: 4rem;}
     h1 {font-size: 2rem; letter-spacing: 0;}
     h2 {font-size: 1.35rem; letter-spacing: 0;}
     [data-testid="stCaptionContainer"] {overflow-wrap: anywhere;}
     </style>""", unsafe_allow_html=True)
     st.title("尾盘观察工作台")
-    st.warning("历史/离线观察，实时更新尚未接通。满足条件不等于买入、卖出或确认突破。")
+    st.warning("观察工作台：满足条件不等于买入、卖出或确认突破；风险及可交易性未评估。")
+    active = st.radio("观察方式", ["历史快照", "主动刷新观察"], horizontal=True,
+                      key="observation_mode") == "主动刷新观察"
+    if not active:
+        st.caption("历史/离线观察，实时更新尚未接通。历史结果不表示当前触发。")
     scope_label = st.radio("材料空间", ["真实历史材料", "测试材料 · test-only"], horizontal=True,
                            key="observation_scope")
     scope = SCOPES[scope_label == "测试材料 · test-only"]
     if scope == SCOPES[1]:
         st.info("synthetic_test_only：以下价格、条件及变化仅为测试，不是实际行情。")
-    prefix = "offline_" + scope
+    settings_prefix = "offline_" + scope
+    prefix = settings_prefix + ("_manual_quote" if active else "")
     store = ObservationStore(storage_root or DEFAULT_STORE, scope)
-    state_key = prefix + "_state"
+    state_key = settings_prefix + "_state"
     if state_key not in st.session_state:
         st.session_state[state_key] = {"pool": normalize_pool(INITIAL_POOL), "rules": {}, "tracking": []}
     state = st.session_state[state_key]
@@ -37,7 +44,7 @@ def render_offline_observation(st, *, storage_root=None):
     except (ValueError, KeyError, TypeError, OSError) as exc:
         st.error(f"本地材料拒绝：{exc}")
         return
-    with st.expander("导入明确历史批次", expanded=not snapshots):
+    with st.expander("导入明确历史批次", expanded=not snapshots and not active):
         upload = st.file_uploader("历史批次文件（JSON）", type=["json"], key=prefix + "_upload")
         anchor = st.text_input("可信外部SHA-256", key=prefix + "_anchor")
         st.caption("仅接收显式test-only材料，不进入真实历史空间。" if scope == SCOPES[1] else
@@ -75,6 +82,13 @@ def render_offline_observation(st, *, storage_root=None):
             st.session_state[state_key] = {key: revisions[chosen_revision][key] for key in ("pool", "rules", "tracking")}
             st.rerun()
 
+    attempt = None
+    if active:
+        try:
+            snapshots, attempt = render_refresh(st, store, state, prefix, controller=refresh_controller)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            st.error(f"刷新存储拒绝：{exc}")
+            return
     by_batch = {item["batch_id"]: item for item in snapshots}
     def batch_label(value):
         if value is None:
@@ -83,7 +97,8 @@ def render_offline_observation(st, *, storage_root=None):
         return f"{value if len(value) <= 24 else value[:12]} | {item['captured_at']}"
     selected = st.selectbox("观察快照", [None, *by_batch], format_func=batch_label, key=prefix + "_snapshot")
     snapshot = by_batch.get(selected)
-    st.caption("风险未评估 · NOT_ASSESSED｜仅针对所选历史快照，不表示当前触发。")
+    st.caption("风险/可交易性未评估 · NOT_ASSESSED｜不是买卖建议；页面无后台持续监控。" if active else
+               "风险未评估 · NOT_ASSESSED｜仅针对所选历史快照，不表示当前触发。")
     if snapshot:
         st.caption(f"所选批次 {snapshot['batch_id']}")
         st.caption(f"来源 {snapshot['source_version']} · 文件SHA {snapshot['file_sha256']}")
@@ -93,10 +108,11 @@ def render_offline_observation(st, *, storage_root=None):
     results, table = {}, []
     for identity in state["pool"]:
         rule = state["rules"].get(identity, make_rule(identity))
-        result = evaluate(snapshot, identity, rule)
+        result = (evaluate_current(snapshot, identity, rule, now=(clock or utc_now)(), attempt=attempt)
+                  if active else evaluate(snapshot, identity, rule))
         results[identity] = result
         row = snapshot["rows"].get(identity, {}) if snapshot else {}
-        if state_filter != "全部" and not any(value["label"] == state_filter for value in result["conditions"].values()):
+        if state_filter != "全部" and not any(STATES[value["state"]] == state_filter for value in result["conditions"].values()):
             continue
         table.append({"证券身份": identity, "比较价格": result["conditions"]["upper"]["comparison_price"] or "缺失/不可用",
                       "上沿状态": result["conditions"]["upper"]["label"],
@@ -106,6 +122,11 @@ def render_offline_observation(st, *, storage_root=None):
                       "实际获取时间": row.get("observed_at", "缺失"), "实际可用时间": row.get("available_at", "缺失"),
                       "历史批次": selected or "未选择", "风险状态": "NOT_ASSESSED",
                       "缺失/拒绝原因": result["reason"] or "无；仅历史价格比较"})
+        if active:
+            table[-1].update({"所选快照价格（失败时仅历史）": row.get("price", "缺失"),
+                              "报价年龄（秒）": result["quote_age_seconds"],
+                              "年龄状态": result["age_status"],
+                              "请求状态": (attempt or {}).get("status", "尚未刷新")})
     st.dataframe(table, use_container_width=True, hide_index=True)
 
     st.subheader("绝对价格观察条件")
@@ -143,6 +164,10 @@ def render_offline_observation(st, *, storage_root=None):
             st.error(f"跟踪保存失败：{exc}")
 
     st.subheader("两次快照变化跟踪")
+    if active:
+        st.caption("以下明确比较已保存快照的历史变化，不把旧快照年龄重置，也不证明当前触发。")
+        if len(snapshots) < 2:
+            st.info("尚无可比较快照")
     if not state["tracking"]:
         st.info("跟踪清单为空。")
         return
