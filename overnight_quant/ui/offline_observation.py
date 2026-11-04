@@ -201,3 +201,6 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
                             "实际获取时间": item["quote"]["observed_at"], "证据SHA": item["evidence_sha256"],
                             "原响应hash": item["quote"]["raw_hash"]})
         st.dataframe(changes, use_container_width=True, hide_index=True)
+    from overnight_quant.ui.observation_tracking import render_tracking
+    render_tracking(st, store, state, prefix,
+                    (tracked, selected, second_id, rule_options[left_rule], rule_options[right_rule]))
