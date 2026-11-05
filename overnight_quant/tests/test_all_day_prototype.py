@@ -2,7 +2,32 @@ import math
 
 import pytest
 
-from overnight_quant.ui.all_day_prototype import theme_status, observation_state
+from overnight_quant.ui.all_day_prototype import (
+    intraday_status, observation_state, system_reference, theme_status,
+)
+
+
+@pytest.mark.parametrize("today,breadth,expected", [
+    (0, .6, "走强"), (-.1, .39, "走弱"), (0, .5, "分化"),
+    (None, .5, "资料不足"), (math.nan, .5, "资料不足"),
+    (1, 1.1, "资料不足"), (True, .5, "资料不足"),
+])
+def test_intraday_is_independent_of_history(today, breadth, expected):
+    assert intraday_status(today, breadth) == expected
+    assert theme_status(None, breadth, today) == "资料不足"
+
+
+def test_system_reference_requires_complete_matching_basis():
+    basis = "unadjusted_cny_per_share"
+    highs, lows = [10, 11, 12, 11, 10.5], [9, 10, 11, 10, 9.6]
+    assert system_reference(highs, lows, basis, basis) == {
+        "prior_high": 10.5, "prior_low": 9.6, "five_high": 12, "five_low": 9,
+    }
+    assert system_reference(highs[:-1], lows, basis, basis) is None
+    assert system_reference(highs, lows, "qfq", basis) is None
+    assert system_reference(highs, lows, basis, "unknown") is None
+    assert system_reference(highs, [9, 10, 13, 10, 9], basis, basis) is None
+    assert system_reference(highs, [9, 10, math.nan, 10, 9], basis, basis) is None
 
 
 @pytest.mark.parametrize("relative,breadth,today,expected", [
@@ -34,6 +59,9 @@ def test_dashboard_demo_is_isolated_and_passive(monkeypatch, tmp_path):
     next(x for x in app.radio if x.label == "工作区").set_value("全天短线观察 · 演示").run()
     assert not app.exception
     assert any("演示数据" in x.value for x in app.warning)
+    assert any("当日表现" in x.value and "近期持续性" in x.value for x in app.markdown)
+    assert any("系统参考条件（合成日线）" in x.value for x in app.markdown)
+    assert any("用户自定义条件" in x.value for x in app.caption)
     assert {t.label for t in app.tabs} == {"今日机会", "竞价观察", "热门题材", "核心个股", "我的跟踪"}
     next(x for x in app.button if x.label == "加入演示跟踪").click().run()
     assert any("已加入" in x.value for x in app.success)
