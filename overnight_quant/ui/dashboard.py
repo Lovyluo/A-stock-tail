@@ -1940,7 +1940,11 @@ def main() -> None:
         return
 
     st.set_page_config(page_title="Overnight Quant Dashboard", layout="wide", initial_sidebar_state="expanded")
-    workspace = st.sidebar.radio("工作区", ["历史/离线观察", "原有研究工作台"], key="workspace_mode")
+    workspace = st.sidebar.radio("工作区", ["历史/离线观察", "全天短线观察 · 演示", "原有研究工作台"], key="workspace_mode")
+    if workspace == "全天短线观察 · 演示":
+        from overnight_quant.ui.all_day_prototype import render
+        render(st)
+        return
     if workspace == "历史/离线观察":
         from overnight_quant.ui.offline_observation import render_offline_observation
         render_offline_observation(st)
