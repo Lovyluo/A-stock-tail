@@ -1,0 +1,7 @@
+{
+  "synthetic_test_only": true,
+  "responses": [
+    {"body_base64": "eyJkYXRhIjp7InRvdGFsIjoxLCJkaWZmIjpbeyJmMTIiOiJCSzAwMDEiLCJmMTQiOiJTeW50aGV0aWMgQ29uY2VwdCIsImYzIjoxLjV9XX19"},
+    {"body_base64": "eyJkYXRhIjp7InRvdGFsIjozLCJkaWZmIjpbeyJmMTIiOiIwMDAwMDEiLCJmMTMiOjAsImYxNCI6IlN5bnRoZXRpYyBBIiwiZjMiOjEuMCwiZjYiOjUwMH0seyJmMTIiOiIwMDAzMzMiLCJmMTMiOjAsImYxNCI6IlN5bnRoZXRpYyBCIiwiZjMiOi0wLjUsImY2Ijo0MDB9LHsiZjEyIjoiNjAwMDAwIiwiZjEzIjoxLCJmMTQiOiJTeW50aGV0aWMgQyIsImYzIjoiLSIsImY2IjozMDB9XX19"}
+  ]
+}
