@@ -503,8 +503,13 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
                 or clocks != sorted(clocks) or clocks[-1] >= clocks[0] + 9
                 or clocks[0] < intent_started or clocks[-1] > outer_checked):
             raise ValueError("page_timing_invalid")
+        byte_count = raw.get("byte_count")
+        if type(byte_count) is not int or not 0 <= byte_count <= PLAN["max_response_bytes"]:
+            raise ValueError("raw_byte_count_invalid")
         body = base64.b64decode(raw["body_base64"], validate=True)
-        if len(body) != raw["byte_count"] or hashlib.sha256(body).hexdigest() != raw["raw_sha256"]:
+        if len(body) > PLAN["max_response_bytes"]:
+            raise ValueError("raw_body_size_exceeded")
+        if len(body) != byte_count or hashlib.sha256(body).hexdigest() != raw["raw_sha256"]:
             raise ValueError("raw_bytes_mismatch")
         totals[kind], received = decode_page(body, kind, pages[kind], totals[kind], seen[kind])
         rows[kind].extend(received)

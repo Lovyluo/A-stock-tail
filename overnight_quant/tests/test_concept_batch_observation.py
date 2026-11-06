@@ -197,6 +197,88 @@ def test_replay_rejects_missing_list_pages_even_with_recomputed_hashes(tmp_path)
         load(tmp_path, target)
 
 
+def reanchor_list_body(target, body, byte_count):
+    import hashlib
+    raw_path = target / "raw-0.json"
+    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw.update(body_base64=base64.b64encode(body).decode(), byte_count=byte_count,
+               raw_sha256=hashlib.sha256(body).hexdigest(), body_complete=True)
+    raw_path.write_text(json.dumps(raw), encoding="utf-8")
+    result_path = target / "batch-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["raw_anchors"][0] = concept.sha(raw_path)
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    execution_path = target / "execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["result_sha256"] = concept.sha(result_path)
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    report_path = target / "returned-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["result_sha256"] = concept.sha(result_path)
+    report["execution_sha256"] = concept.sha(execution_path)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    confirmation_path = target / "final-confirmation.json"
+    confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    confirmation["report_sha256"] = concept.sha(report_path)
+    confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+
+
+def test_replay_accepts_exactly_one_mib_of_valid_json(tmp_path):
+    limit = concept.PLAN["max_response_bytes"]
+    body = json.dumps({"data": {"total": 1, "diff": lists(1)}}).encode()
+    body += b" " * (limit - len(body))
+    process, receipt, target, _ = run(tmp_path, [{"body_base64": base64.b64encode(body).decode()}, page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    assert load(tmp_path, target)["list_coverage"] == {"received": 1, "total": 1, "complete": True}
+
+
+def test_replay_and_page_reject_oversized_body_with_recomputed_anchors(monkeypatch, tmp_path):
+    from streamlit.testing.v1 import AppTest
+    from overnight_quant.ui import dashboard, offline_observation
+    from overnight_quant.tests.fixtures.apptest_network_guard import AppTestNetworkGuard
+    process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    limit = concept.PLAN["max_response_bytes"]
+    body = json.dumps({"data": {"total": 1, "diff": lists(1)}}).encode()
+    body += b" " * (limit + 1 - len(body))
+    reanchor_list_body(target, body, len(body))
+    with pytest.raises(ValueError, match="raw_byte_count_invalid"):
+        load(tmp_path, target)
+    report = target / "returned-report.json"
+    user_store = tmp_path / "user-store"
+    monkeypatch.setattr(offline_observation, "DEFAULT_STORE", user_store)
+    guard = AppTestNetworkGuard(monkeypatch)
+    monkeypatch.setattr(dashboard, "run_dashboard_action", guard.deny_legacy_action)
+    monkeypatch.setattr(dashboard, "run_approved_action", guard.deny_legacy_action)
+    app = AppTest.from_file(str(Path(dashboard.__file__)), default_timeout=15).run()
+    next(x for x in app.radio if x.label == "工作区").set_value("捕获批次观察").run()
+    next(x for x in app.text_input if x.label == "批次目录").set_value(str(target))
+    next(x for x in app.text_input if x.label == "命令返回报告文件").set_value(str(report))
+    next(x for x in app.text_input if x.label == "返回报告外部 SHA-256").set_value(concept.sha(report))
+    next(x for x in app.text_input if x.label == "最终确认外部 SHA-256").set_value(concept.sha(target / "final-confirmation.json"))
+    next(x for x in app.button if x.label == "打开指定批次").click().run()
+    assert not app.exception
+    assert any("批次不可用" in x.value for x in app.error)
+    assert any("尚未选择" in x.value for x in app.info)
+    assert not any(guard.business_attempts.values())
+    assert not user_store.exists()
+
+
+def test_replay_checks_actual_size_and_rejects_invalid_declared_counts(tmp_path):
+    process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    limit = concept.PLAN["max_response_bytes"]
+    original = json.dumps({"data": {"total": 1, "diff": lists(1)}}).encode()
+    oversized = original + b" " * (limit + 1 - len(original))
+    reanchor_list_body(target, oversized, limit)
+    with pytest.raises(ValueError, match="raw_body_size_exceeded"):
+        load(tmp_path, target)
+    for invalid in (True, -1, 1.5, "1", None, limit + 1):
+        reanchor_list_body(target, original, invalid)
+        with pytest.raises(ValueError, match="raw_byte_count_invalid"):
+            load(tmp_path, target)
+
+
 def test_unproven_real_semantics_do_not_produce_metrics():
     result = concept.summarize(lists(1), stocks(3), total_list=1, total_members=3, synthetic=False)
     assert result["field_basis"] == "UNPROVEN"
