@@ -9,11 +9,12 @@ def render(st):
     directory = st.text_input("批次目录", key="concept_batch_path")
     report = st.text_input("命令返回报告文件", key="concept_batch_report")
     anchor = st.text_input("返回报告外部 SHA-256", key="concept_batch_anchor")
+    confirmation = st.text_input("最终确认外部 SHA-256", key="concept_batch_confirmation")
     if st.button("打开指定批次"):
         st.session_state.pop("concept_batch_selected", None)
         try:
             st.session_state["concept_batch_selected"] = {
-                "result": load_batch(directory, report, anchor), "directory": directory, "report": report,
+                "result": load_batch(directory, report, anchor, confirmation), "directory": directory, "report": report,
             }
         except Exception as exc:
             st.error(f"批次不可用：{type(exc).__name__}: {exc}")
@@ -28,7 +29,7 @@ def render(st):
     listing, members = result["list_coverage"], result["member_coverage"]
     st.subheader("覆盖与时点")
     st.write(f"批次 {result['batch_id']}｜采集完成 {result['capture_completed_at']}｜原生事件时点未确认")
-    scope = "列表完整性按返回总数核对，不代表全市场" if listing["complete"] else "已覆盖范围内候选，不代表全市场排名"
+    scope = "列表完整性按返回总数核对，不代表全市场" if listing["complete"] else "有限覆盖范围，不代表全市场排名"
     st.write(f"概念列表 {listing['received']}/{listing['total']}｜{scope}")
     st.caption(f"列表字段结构可读 {result['list_valid_numeric_rows']}｜无效/缺失 {result['list_invalid_numeric_rows']}")
     st.write(f"成分 {members['received']}/{members['total']}｜按本批返回总数核对")
@@ -37,8 +38,8 @@ def render(st):
     st.caption("原始字段不构成强弱排序；单位、身份和事件时间须另行核验。")
     st.dataframe([{"代码原值": r.get("f12"), "名称原值": r.get("f14"), "涨跌原值": r.get("f3")}
                   for r in result["list_raw"]], hide_index=True, use_container_width=True)
-    st.subheader("所选概念与成分")
-    st.write(f"{result['selected_bk']} · {result['selected_name']}｜选择规则：覆盖范围内代码升序第一，不代表最强")
+    st.subheader("固定结构验证样本与成分")
+    st.write(f"{result['selected_bk']} · {result['selected_name']}｜固定结构验证样本：覆盖范围内代码升序第一，非强势候选")
     if result["synthetic_test_only"]:
         change = result["selected_daily_change"]
         st.write(f"合成当日表现：{change}%" if change is not None else "合成当日表现：资料不足")

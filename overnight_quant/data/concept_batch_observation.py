@@ -22,14 +22,18 @@ from .point_in_time import stable_hash
 from .probe_worker_process import run_probe_worker_process
 from .s2_integration_contract import security_identity
 
-VERSION = "concept_batch_observation_v1"
-AUTH_VERSION = "concept_batch_authorization_v1"
+VERSION = "concept_batch_observation_v2"
+AUTH_VERSION = "concept_batch_authorization_v2"
+LAUNCH_VERSION = "concept_batch_launcher_v2"
+CONFIRM_VERSION = "concept_batch_outer_confirmation_v2"
 ENDPOINT = "https://push2.eastmoney.com/api/qt/clist/get"
 BUDGET = {"page_ms": 10000, "page_cleanup_ms": 1000,
           "batch_ms": 90000, "batch_cleanup_ms": 2000, "finish_reserve_ms": 3000}
 PLAN = {"list_fs": "m:90 t:3 f:!50", "members_fs": "b:{bk} f:!50",
         "pages_per_kind": 3, "page_size": 100, "sort": "f12",
         "selection": "lexicographically_smallest_valid_bk", "retry": False,
+        "max_response_bytes": 1048576, "proxy_policy": "system_and_environment",
+        "outer_contract": "powershell_launcher_v2",
         "fields": "f2,f3,f6,f12,f13,f14,f104,f105,f124"}
 CONTRACT = stable_hash({"version": VERSION, "plan": PLAN, "budget": BUDGET})
 STATE = Path(__file__).resolve().parents[1] / "data/cache/concept-batch-observation"
@@ -82,6 +86,8 @@ def decode_page(body, kind, page, expected_total, seen):
     if not isinstance(diff, list) or any(not isinstance(row, dict) for row in diff):
         raise ValueError("invalid_rows")
     required = max(0, min(100, total - (page - 1) * 100))
+    if page > 1 and required == 0:
+        raise ValueError("unexpected_empty_page")
     if len(diff) != required:
         raise ValueError("page_incomplete_or_excess")
     for row in diff:
@@ -320,12 +326,16 @@ def coordinate(task):
                 index += 1
                 total, received = decode_page(body, kind, page, total, seen)
                 rows.extend(received)
+                if kind == "members" and total > 300:
+                    raise ValueError("member_page_limit_exceeded")
                 if [row["f12"] for row in rows] != sorted(row["f12"] for row in rows):
                     raise ValueError("page_order_drift")
                 if len(rows) == total:
                     break
             if not rows:
                 raise ValueError("empty_" + kind)
+            if kind == "list" and len(rows) != min(total, 300):
+                raise ValueError("list_coverage_invalid")
             if kind == "members" and len(rows) != total:
                 raise ValueError("member_page_limit_exceeded")
             results[kind] = rows
@@ -356,16 +366,47 @@ def coordinate(task):
         return {"ok": False, "error": failure["error"]}
 
 
-def load_batch(directory, report_path, report_sha):
-    """Require the complete returned report, not an early on-disk success candidate."""
+def load_batch(directory, report_path, report_sha, confirmation_sha):
+    """Accept only an externally anchored report and the final launcher confirmation."""
     path = Path(directory).resolve()
     if not re.fullmatch(r"[0-9a-f]{64}", report_sha or "") or sha(report_path) != report_sha:
         raise ValueError("returned_report_anchor_mismatch")
+    confirmation_path = path / "final-confirmation.json"
+    if not re.fullmatch(r"[0-9a-f]{64}", confirmation_sha or "") or sha(confirmation_path) != confirmation_sha:
+        raise ValueError("final_confirmation_anchor_mismatch")
+    confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    start, checked, frequency = (confirmation.get(k) for k in
+                                 ("launcher_started_ticks", "report_checked_ticks", "stopwatch_frequency"))
+    if (confirmation.get("schema_version") != CONFIRM_VERSION or confirmation.get("status") != "EXECUTION_SUCCEEDED"
+            or confirmation.get("contract_hash") != CONTRACT or confirmation.get("output") != str(path)
+            or confirmation.get("report_sha256") != report_sha
+            or any(type(value) is not int for value in (start, checked, frequency))
+            or start < 0 or frequency <= 0 or checked < start or checked - start >= 90 * frequency):
+        raise ValueError("final_confirmation_invalid")
+    elapsed = (checked - start) * 1000 / frequency
+    stated_elapsed = confirmation.get("execution_elapsed_ms")
+    if (_number(stated_elapsed) is None or not math.isclose(float(stated_elapsed), elapsed, abs_tol=0.000001)):
+        raise ValueError("final_confirmation_elapsed_invalid")
+    ticket_path = Path(confirmation.get("ticket_path") or "")
+    ticket_sha = confirmation.get("ticket_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", ticket_sha or "") or sha(ticket_path) != ticket_sha:
+        raise ValueError("launcher_ticket_anchor_mismatch")
+    ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+    if (ticket.get("schema_version") != LAUNCH_VERSION or ticket.get("contract_hash") != CONTRACT
+            or ticket.get("output") != str(path) or ticket.get("batch_id") != confirmation.get("batch_id")
+            or ticket.get("launcher_started_ticks") != start or ticket.get("stopwatch_frequency") != frequency
+            or type(ticket.get("launcher_pid")) is not int or ticket["launcher_pid"] <= 0
+            or not re.fullmatch(r"[0-9a-f]{32}", ticket.get("nonce") or "")
+            or ticket.get("synthetic_test_only") is not confirmation.get("synthetic_test_only")):
+        raise ValueError("launcher_ticket_mismatch")
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    if (report.get("status") != "PASSED" or report.get("contract_hash") != CONTRACT
+    if (report.get("status") != "EXECUTION_CANDIDATE" or report.get("candidate_status") != "PASSED"
+            or report.get("contract_hash") != CONTRACT or report.get("batch_id") != confirmation.get("batch_id")
+            or report.get("synthetic_test_only") is not confirmation.get("synthetic_test_only")
             or report.get("output") != str(path) or _number(report.get("total_elapsed_ms")) is None
             or not 0 <= report["total_elapsed_ms"] < 90000
             or report.get("supervisor_cleanup_complete") is not True
+            or _number(report.get("supervisor_started_monotonic")) is None
             or _number(report.get("supervisor_elapsed_ms")) is None
             or not report["total_elapsed_ms"] <= report["supervisor_elapsed_ms"] < 90000):
         raise ValueError("returned_report_not_confirmed")
@@ -374,7 +415,7 @@ def load_batch(directory, report_path, report_sha):
         raise ValueError("execution_anchor_mismatch")
     receipt = json.loads((path / "execution.json").read_text(encoding="utf-8"))
     if any(report.get(k) != receipt.get(k) for k in
-           ("schema_version", "status", "batch_id", "synthetic_test_only", "elapsed_ms", "process", "result_sha256",
+           ("schema_version", "batch_id", "synthetic_test_only", "elapsed_ms", "process", "result_sha256",
             "requests_dispatched", "request_count_status", "request_attempt_markers", "responses_saved")):
         raise ValueError("returned_report_receipt_mismatch")
     if (receipt.get("status") != "PASSED" or not receipt.get("process", {}).get("ok")
@@ -383,6 +424,8 @@ def load_batch(directory, report_path, report_sha):
         raise ValueError("batch_not_confirmed")
     if report["total_elapsed_ms"] < receipt["elapsed_ms"]:
         raise ValueError("completion_time_order_invalid")
+    if report["supervisor_elapsed_ms"] > (checked - start) * 1000 / frequency:
+        raise ValueError("outer_elapsed_mismatch")
     result_path = path / "batch-result.json"
     if sha(result_path) != receipt.get("result_sha256"):
         raise ValueError("batch_result_anchor_mismatch")
@@ -408,8 +451,18 @@ def load_batch(directory, report_path, report_sha):
     intent = json.loads((path / "intent.json").read_text(encoding="utf-8"))
     if (intent.get("batch_id") != result["batch_id"] or intent.get("contract_hash") != CONTRACT
             or intent.get("test_only") is not result["synthetic_test_only"]
-            or receipt.get("synthetic_test_only") is not result["synthetic_test_only"]):
+            or receipt.get("synthetic_test_only") is not result["synthetic_test_only"]
+            or ticket.get("approved_sha") != intent.get("approved_sha") or ticket.get("day") != intent.get("day")
+            or ticket_path.resolve() != (Path(intent["state"]) / "launcher-tickets" / result["batch_id"] / "ticket.json").resolve()):
         raise ValueError("intent_identity_mismatch")
+    intent_started = _number(intent.get("started"))
+    supervisor_started = _number(report.get("supervisor_started_monotonic"))
+    outer_started, outer_checked = start / frequency, checked / frequency
+    if (intent_started is None or supervisor_started is None
+            or not outer_started <= supervisor_started <= intent_started
+            or intent_started + report["total_elapsed_ms"] / 1000 > outer_checked
+            or supervisor_started + report["supervisor_elapsed_ms"] / 1000 > outer_checked):
+        raise ValueError("outer_time_order_invalid")
     seen = {"list": set(), "members": set()}
     rows = {"list": [], "members": []}
     totals = {"list": None, "members": None}
@@ -434,7 +487,7 @@ def load_batch(directory, report_path, report_sha):
         bk = result["selected_bk"] if kind == "members" else None
         if (raw.get("batch_id") != result["batch_id"] or raw.get("index") != index
                 or raw.get("page") != pages[kind] or raw.get("params") != parameters(kind, pages[kind], bk)
-                or raw.get("url") != ENDPOINT or raw.get("status") != 200
+                or raw.get("url") != ENDPOINT or raw.get("status") != 200 or raw.get("body_complete") is not True
                 or raw.get("synthetic_test_only") is not result["synthetic_test_only"]):
             raise ValueError("raw_contract_mismatch")
         request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -447,7 +500,8 @@ def load_batch(directory, report_path, report_sha):
         clocks = [raw.get(k) for k in ("dispatch_monotonic", "request_started_monotonic",
                                       "response_completed_monotonic", "raw_write_started_monotonic")]
         if (any(type(value) not in (int, float) or not math.isfinite(value) for value in clocks)
-                or clocks != sorted(clocks) or clocks[-1] >= clocks[0] + 9):
+                or clocks != sorted(clocks) or clocks[-1] >= clocks[0] + 9
+                or clocks[0] < intent_started or clocks[-1] > outer_checked):
             raise ValueError("page_timing_invalid")
         body = base64.b64decode(raw["body_base64"], validate=True)
         if len(body) != raw["byte_count"] or hashlib.sha256(body).hexdigest() != raw["raw_sha256"]:
@@ -456,7 +510,13 @@ def load_batch(directory, report_path, report_sha):
         rows[kind].extend(received)
         if [row["f12"] for row in rows[kind]] != sorted(row["f12"] for row in rows[kind]):
             raise ValueError("page_order_drift")
-    if not rows["list"] or len(rows["members"]) != totals["members"]:
+    if (not rows["list"] or totals["list"] is None
+            or len(rows["list"]) != min(totals["list"], 300)
+            or pages["list"] != (min(totals["list"], 300) + 99) // 100):
+        raise ValueError("list_coverage_invalid")
+    if (not rows["members"] or totals["members"] is None or totals["members"] > 300
+            or len(rows["members"]) != totals["members"]
+            or pages["members"] != (totals["members"] + 99) // 100):
         raise ValueError("batch_coverage_invalid")
     if min(row["f12"] for row in rows["list"]) != result["selected_bk"]:
         raise ValueError("selection_not_deterministic")

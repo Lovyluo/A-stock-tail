@@ -8,16 +8,24 @@ import sys
 import time
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from overnight_quant.data.concept_batch_observation import (
-    CONTRACT, ENDPOINT, _check_auth, capture, coordinate, now, parameters, sha, write,
+    CONTRACT, ENDPOINT, PLAN, _check_auth, capture, coordinate, now, parameters, sha, write,
 )
 
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
+
+
+MAX_RESPONSE_BYTES = PLAN["max_response_bytes"]
+
+
+def configured_opener():
+    # Default ProxyHandler respects configured environment/system proxies and bypass rules.
+    return build_opener(NoRedirect())
 
 
 def page(task):
@@ -46,7 +54,7 @@ def page(task):
             time.sleep(item["sleep"])
         if item.get("network_error"):
             raise OSError("fixture_no_response")
-        body = base64.b64decode(item["body_base64"], validate=True)
+        body = base64.b64decode(item["body_base64"], validate=True)[:MAX_RESPONSE_BYTES + 1]
         status, final_url = item.get("status", 200), ENDPOINT
     else:
         if task.get("fixture") or not intent.get("authorization"):
@@ -58,14 +66,14 @@ def page(task):
         if auth != intent["authorization"]:
             raise ValueError("authorization_content_mismatch")
         _check_auth(auth, task["day"], task["approved_sha"], directory.resolve(), task["batch_id"])
-        opener = build_opener(ProxyHandler({}), NoRedirect())
+        opener = configured_opener()
         request = Request(ENDPOINT + "?" + urlencode(task["params"]))
         try:
             response = opener.open(request, timeout=max(.001, task["request_deadline"] - time.perf_counter()))
         except HTTPError as exc:
             response = exc
         with response:
-            body, status, final_url = response.read(), response.code, response.url
+            body, status, final_url = response.read(MAX_RESPONSE_BYTES + 1), response.code, response.url
     received, received_monotonic = now(), time.perf_counter()
     raw = {"batch_id": task["batch_id"], "kind": task["kind"], "page": task["page"],
            "index": index, "url": ENDPOINT, "response_url": final_url, "params": task["params"],
@@ -73,8 +81,11 @@ def page(task):
            "dispatch_monotonic": task["request_started"], "request_started_monotonic": started_monotonic,
            "response_completed_monotonic": received_monotonic, "raw_write_started_monotonic": time.perf_counter(),
            "raw_sha256": hashlib.sha256(body).hexdigest(), "body_base64": base64.b64encode(body).decode(),
-           "byte_count": len(body), "synthetic_test_only": task["test_only"]}
+           "byte_count": len(body), "body_complete": len(body) <= MAX_RESPONSE_BYTES,
+           "synthetic_test_only": task["test_only"]}
     write(directory / f"raw-{index}.json", raw)
+    if not raw["body_complete"]:
+        raise ValueError("response_size_limit_exceeded_partial_raw")
     if time.perf_counter() >= task["request_deadline"]:
         raise TimeoutError("page_seal_deadline_exceeded")
     return {"ok": True, "payload": {"raw_sha256": raw["raw_sha256"]}}

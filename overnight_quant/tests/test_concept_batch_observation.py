@@ -28,13 +28,19 @@ def head():
     return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
+def launcher_cmd(fixture, target, state, name, *, scenario="None", shell="powershell.exe"):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_concept_batch_manual.ps1"
+    return [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+            "-Day", "2026-11-05", "-ApprovedSha", head(), "-Output", str(target), "-BatchId", name,
+            "-Fixture", str(fixture), "-TestState", str(state), "-PythonPath", sys.executable,
+            "-TestScenario", scenario]
+
+
 def run(tmp_path, responses, name="batch", timeout=45):
     fixture = tmp_path / f"{name}-fixture.json"
     fixture.write_text(json.dumps({"responses": responses}), encoding="utf-8")
     target = tmp_path / name
-    cmd = [sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--day", "2026-11-05",
-           "--approved-sha", head(), "--output", str(target), "--batch-id", name,
-           "--fixture", str(fixture), "--test-state", str(tmp_path / f"{name}-state")]
+    cmd = launcher_cmd(fixture, target, tmp_path / f"{name}-state", name)
     process = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     assert process.stdout, process.stderr
     (tmp_path / f"{name}-returned.json").write_text(process.stdout, encoding="utf-8")
@@ -42,8 +48,9 @@ def run(tmp_path, responses, name="batch", timeout=45):
 
 
 def load(tmp_path, target, name="batch"):
-    report = tmp_path / f"{name}-returned.json"
-    return concept.load_batch(target, report, concept.sha(report))
+    report = target / "returned-report.json"
+    confirmation = target / "final-confirmation.json"
+    return concept.load_batch(target, report, concept.sha(report), concept.sha(confirmation))
 
 
 def test_default_zero_network_and_missing_parameters(tmp_path):
@@ -58,6 +65,12 @@ def test_default_zero_network_and_missing_parameters(tmp_path):
     assert result.returncode == 2
     assert json.loads(result.stdout)["requests_dispatched"] == 0
     assert list(tmp_path.iterdir()) == [fixture]
+    target = tmp_path / "direct-bypass"
+    direct = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch",
+                             "--fixture", str(fixture), "--day", "2026-11-05", "--approved-sha", head(),
+                             "--output", str(target), "--batch-id", "direct"], capture_output=True, text=True, timeout=10)
+    assert direct.returncode == 2 and json.loads(direct.stdout)["requests_dispatched"] == 0
+    assert not target.exists()
     describe = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--describe"],
                               capture_output=True, text=True, timeout=10)
     assert json.loads(describe.stdout)["status"] == "DRAFT_NOT_AUTHORIZED"
@@ -82,10 +95,12 @@ def test_actual_cli_full_six_pages_replay_and_no_overwrite(tmp_path):
     assert result["event_time_basis"] == "UNPROVEN"
     assert not result["current_observation_allowed"]
     assert load(tmp_path, target) == result
-    report = tmp_path / "batch-returned.json"
+    report = target / "returned-report.json"
+    confirmation = target / "final-confirmation.json"
     verified = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch",
                                "--verify-dir", str(target), "--returned-report", str(report),
-                               "--report-sha", concept.sha(report)], capture_output=True, text=True, timeout=10)
+                               "--report-sha", concept.sha(report), "--confirmation-sha", concept.sha(confirmation)],
+                              capture_output=True, text=True, timeout=10)
     assert verified.returncode == 0 and json.loads(verified.stdout)["status"] == "VERIFIED_OFFLINE"
     extra = target / "raw-6.json"
     extra.write_text("{}", encoding="utf-8")
@@ -115,7 +130,7 @@ def test_pagination_and_failure_stop_without_retry(tmp_path, responses, expected
     assert len(list(target.glob("request-*.json"))) == expected_requests
     assert (target / "raw-0.json").exists()
     with pytest.raises((ValueError, FileNotFoundError)):
-        concept.load_batch(target, tmp_path / "batch-returned.json", "0" * 64)
+        concept.load_batch(target, tmp_path / "batch-returned.json", "0" * 64, "0" * 64)
 
 
 def test_invalid_value_is_not_flat_and_no_current_claim(tmp_path):
@@ -144,6 +159,44 @@ def test_bounded_list_is_not_full_market_and_missing_amount_is_not_ranked(tmp_pa
     assert result["selected_daily_change"] is None
 
 
+def test_no_superfluous_empty_page():
+    body = json.dumps({"data": {"total": 100, "diff": []}}).encode()
+    with pytest.raises(ValueError, match="unexpected_empty_page"):
+        concept.decode_page(body, "list", 2, 100, set())
+
+
+def test_replay_rejects_missing_list_pages_even_with_recomputed_hashes(tmp_path):
+    import hashlib
+    process, receipt, target, _ = run(tmp_path, [page(100, lists(100)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    raw_path = target / "raw-0.json"
+    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    body = json.dumps({"data": {"total": 250, "diff": lists(100)}}).encode()
+    raw.update(body_base64=base64.b64encode(body).decode(), byte_count=len(body),
+               raw_sha256=hashlib.sha256(body).hexdigest())
+    raw_path.write_text(json.dumps(raw), encoding="utf-8")
+    result_path = target / "batch-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["raw_anchors"][0] = concept.sha(raw_path)
+    result["list_coverage"] = {"received": 100, "total": 250, "complete": False}
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    execution_path = target / "execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["result_sha256"] = concept.sha(result_path)
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    report_path = target / "returned-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["result_sha256"] = concept.sha(result_path)
+    report["execution_sha256"] = concept.sha(execution_path)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    confirmation_path = target / "final-confirmation.json"
+    confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    confirmation["report_sha256"] = concept.sha(report_path)
+    confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+    with pytest.raises(ValueError, match="list_coverage_invalid"):
+        load(tmp_path, target)
+
+
 def test_unproven_real_semantics_do_not_produce_metrics():
     result = concept.summarize(lists(1), stocks(3), total_list=1, total_members=3, synthetic=False)
     assert result["field_basis"] == "UNPROVEN"
@@ -154,13 +207,113 @@ def test_unproven_real_semantics_do_not_produce_metrics():
     assert not result["current_observation_allowed"]
 
 
+def test_configured_proxy_is_not_silently_replaced(monkeypatch):
+    import urllib.request
+    from overnight_quant.scripts import run_concept_batch_worker as worker
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:12345")
+    opener = worker.configured_opener()
+    proxy = next(handler for handler in opener.handlers if isinstance(handler, urllib.request.ProxyHandler))
+    assert proxy.proxies["https"] == "http://127.0.0.1:12345"
+    assert any(isinstance(handler, worker.NoRedirect) for handler in opener.handlers)
+
+
+def test_oversized_response_retains_explicit_partial_and_stops(tmp_path):
+    from overnight_quant.scripts.run_concept_batch_worker import MAX_RESPONSE_BYTES
+    body = b"x" * (MAX_RESPONSE_BYTES + 20)
+    process, receipt, target, _ = run(tmp_path, [{"body_base64": base64.b64encode(body).decode()}])
+    assert process.returncode == 2 and receipt["status"] == "FAILED"
+    assert len(list(target.glob("request-*.json"))) == 1
+    raw = json.loads((target / "raw-0.json").read_text(encoding="utf-8"))
+    assert raw["byte_count"] == MAX_RESPONSE_BYTES + 1
+    assert raw["body_complete"] is False
+    assert not (target / "final-confirmation.json").exists()
+
+
+@pytest.mark.parametrize("scenario,report_exists,confirmation_exists", [
+    ("StartupOverrun", False, False),
+    ("ReportOverrun", True, False),
+    ("AfterReportExit", True, False),
+    ("ConfirmationWriteFailure", True, False),
+    ("AfterConfirmationExit", True, True),
+])
+def test_outer_deadline_and_confirmation_fail_closed(tmp_path, scenario, report_exists, confirmation_exists):
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(json.dumps({"responses": [page(1, lists(1)), page(3, stocks(3))]}), encoding="utf-8")
+    target, state = tmp_path / "batch", tmp_path / "state"
+    process = subprocess.run(launcher_cmd(fixture, target, state, "batch", scenario=scenario),
+                             capture_output=True, text=True, timeout=30)
+    assert process.returncode == (19 if scenario in ("AfterReportExit", "AfterConfirmationExit") else 2)
+    report, confirmation = target / "returned-report.json", target / "final-confirmation.json"
+    assert report.exists() is report_exists
+    assert confirmation.exists() is confirmation_exists
+    if confirmation_exists:
+        assert concept.load_batch(target, report, concept.sha(report), concept.sha(confirmation))["batch_id"] == "batch"
+    elif report_exists:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            concept.load_batch(target, report, concept.sha(report), "0" * 64)
+        replay = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch",
+                                 "--verify-dir", str(target), "--returned-report", str(report),
+                                 "--report-sha", concept.sha(report), "--confirmation-sha", "0" * 64],
+                                capture_output=True, text=True, timeout=10)
+        assert replay.returncode == 2 and json.loads(replay.stdout)["status"] == "FAILED"
+    if scenario == "StartupOverrun":
+        assert (state / "cleanup-incomplete.json").exists()
+
+
+def test_corrupt_final_confirmation_is_not_accepted(tmp_path):
+    process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    confirmation = target / "final-confirmation.json"
+    confirmation.write_text('{"status":', encoding="utf-8")
+    with pytest.raises(ValueError):
+        load(tmp_path, target)
+
+
+def test_confirmation_at_exact_90_seconds_is_rejected(tmp_path):
+    process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    confirmation_path = target / "final-confirmation.json"
+    confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    confirmation["report_checked_ticks"] = confirmation["launcher_started_ticks"] + 90 * confirmation["stopwatch_frequency"]
+    confirmation["execution_elapsed_ms"] = 90000
+    confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+    with pytest.raises(ValueError, match="final_confirmation_invalid"):
+        load(tmp_path, target)
+
+
+def test_rehashed_confirmation_rejects_incomplete_launcher_ticket(tmp_path):
+    process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(2, stocks(2))])
+    assert process.returncode == 0, receipt
+    confirmation_path = target / "final-confirmation.json"
+    confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    ticket_path = Path(confirmation["ticket_path"])
+    ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+    ticket["nonce"] = ""
+    ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+    confirmation["ticket_sha256"] = concept.sha(ticket_path)
+    confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+    with pytest.raises(ValueError, match="launcher_ticket_mismatch"):
+        load(tmp_path, target)
+
+
+@pytest.mark.parametrize("shell", ["powershell.exe", "pwsh.exe"])
+def test_real_launcher_handles_spaces_on_powershell_5_and_7(tmp_path, shell):
+    folder = tmp_path / "test paths with spaces"
+    folder.mkdir()
+    fixture = folder / "fixture data.json"
+    fixture.write_text(json.dumps({"responses": [page(1, lists(1)), page(2, stocks(2))]}), encoding="utf-8")
+    target = folder / "captured data"
+    process = subprocess.run(launcher_cmd(fixture, target, folder / "state dir", "spaces", shell=shell),
+                             capture_output=True, text=True, timeout=35)
+    assert process.returncode == 0, (process.stdout, process.stderr)
+    assert load(folder, target)["batch_id"] == "spaces"
+
+
 def test_simultaneous_start_has_one_dispatcher(tmp_path):
     fixture = tmp_path / "fixture.json"
     fixture.write_text(json.dumps({"responses": [page(1, lists(1)), page(3, stocks(3))]}), encoding="utf-8")
     target, state = tmp_path / "batch", tmp_path / "state"
-    cmd = [sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--day", "2026-11-05",
-           "--approved-sha", head(), "--output", str(target), "--batch-id", "once",
-           "--fixture", str(fixture), "--test-state", str(state)]
+    cmd = launcher_cmd(fixture, target, state, "once")
     workers = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
     try:
         results = [json.loads(p.communicate(timeout=30)[0]) for p in workers]
@@ -183,7 +336,7 @@ def test_incomplete_member_set_stops_and_retains_pages(tmp_path):
     responses = [page(1, lists(1))] + [page(301, members[i:i + 100]) for i in (0, 100, 200)]
     process, receipt, target, _ = run(tmp_path, responses)
     assert process.returncode == 2 and receipt["status"] == "FAILED"
-    assert len(list(target.glob("request-*.json"))) == 4
+    assert len(list(target.glob("request-*.json"))) == 2
     failure = json.loads((target / "failure.json").read_text(encoding="utf-8"))
     assert "member_page_limit_exceeded" in failure["error"]
     assert not (target / "batch-result.json").exists()
@@ -231,8 +384,8 @@ def test_late_unlock_never_admits_early_success_receipt(monkeypatch, tmp_path):
     assert json.loads((target / "execution.json").read_text(encoding="utf-8"))["status"] == "PASSED"
     report = tmp_path / "returned.json"
     report.write_text(json.dumps(result), encoding="utf-8")
-    with pytest.raises(ValueError, match="returned_report_not_confirmed"):
-        concept.load_batch(target, report, concept.sha(report))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        concept.load_batch(target, report, concept.sha(report), "0" * 64)
 
 
 def test_real_process_timeout_cleans_up_and_stops(tmp_path):
@@ -251,6 +404,13 @@ def test_dashboard_opens_only_explicit_fixture_batch_without_business_network(mo
     from overnight_quant.tests.fixtures.apptest_network_guard import AppTestNetworkGuard
     process, receipt, target, _ = run(tmp_path, [page(1, lists(1)), page(3, stocks(3))])
     assert process.returncode == 0, receipt
+    fixture = tmp_path / "interrupted-fixture.json"
+    fixture.write_text(json.dumps({"responses": [page(1, lists(1)), page(2, stocks(2))]}), encoding="utf-8")
+    unconfirmed = tmp_path / "interrupted"
+    stopped = subprocess.run(launcher_cmd(fixture, unconfirmed, tmp_path / "interrupted-state",
+                                          "interrupted", scenario="AfterReportExit"),
+                             capture_output=True, text=True, timeout=30)
+    assert stopped.returncode == 19
     user_store = tmp_path / "user-store"
     monkeypatch.setattr(offline_observation, "DEFAULT_STORE", user_store)
     guard = AppTestNetworkGuard(monkeypatch)
@@ -260,15 +420,25 @@ def test_dashboard_opens_only_explicit_fixture_batch_without_business_network(mo
     next(x for x in app.radio if x.label == "工作区").set_value("捕获批次观察").run()
     assert any("尚未选择" in x.value for x in app.info)
     next(x for x in app.text_input if x.label == "批次目录").set_value(str(target))
-    report = tmp_path / "batch-returned.json"
+    report = target / "returned-report.json"
     next(x for x in app.text_input if x.label == "命令返回报告文件").set_value(str(report))
     next(x for x in app.text_input if x.label == "返回报告外部 SHA-256").set_value(concept.sha(report))
+    next(x for x in app.text_input if x.label == "最终确认外部 SHA-256").set_value(concept.sha(target / "final-confirmation.json"))
     next(x for x in app.button if x.label == "打开指定批次").click().run()
     assert not app.exception
     assert any("测试数据" in x.value for x in app.warning)
     assert any("原生事件时点未确认" in x.value for x in app.markdown)
     assert any("不代表全市场" in x.value for x in app.markdown)
+    assert any("固定结构验证样本" in x.value and "非强势候选" in x.value for x in app.markdown)
     next(x for x in app.text_input if x.label == "返回报告外部 SHA-256").set_value("0" * 64)
+    next(x for x in app.button if x.label == "打开指定批次").click().run()
+    assert any("批次不可用" in x.value for x in app.error)
+    assert any("尚未选择" in x.value for x in app.info)
+    report = unconfirmed / "returned-report.json"
+    next(x for x in app.text_input if x.label == "批次目录").set_value(str(unconfirmed))
+    next(x for x in app.text_input if x.label == "命令返回报告文件").set_value(str(report))
+    next(x for x in app.text_input if x.label == "返回报告外部 SHA-256").set_value(concept.sha(report))
+    next(x for x in app.text_input if x.label == "最终确认外部 SHA-256").set_value("0" * 64)
     next(x for x in app.button if x.label == "打开指定批次").click().run()
     assert any("批次不可用" in x.value for x in app.error)
     assert any("尚未选择" in x.value for x in app.info)
