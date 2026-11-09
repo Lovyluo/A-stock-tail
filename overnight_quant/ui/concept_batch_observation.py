@@ -26,6 +26,9 @@ def render(st):
     st.caption(f"已载入：{selected['directory']}；返回报告：{selected['report']}")
     if result["synthetic_test_only"]:
         st.warning("测试数据 · synthetic_test_only；不是实际行情。")
+    if result.get("experiment_permission") is not None:
+        st.warning("上游用途依据 UNKNOWN；用户仅批准本次个人内部有限结构验证，并已知悉该未知状态。"
+                   "不是上游授权或法律合规保证，不得公开传播。")
     listing, members = result["list_coverage"], result["member_coverage"]
     st.subheader("覆盖与时点")
     st.write(f"批次 {result['batch_id']}｜采集完成 {result['capture_completed_at']}｜原生事件时点未确认")

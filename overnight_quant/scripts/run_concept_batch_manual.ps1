@@ -71,6 +71,7 @@ function StopTreeBounded($Target) {
 try {
     if (!$Fixture -and !$Network) { [ordered]@{status='NETWORK_NOT_REQUESTED';requests_dispatched=0} | ConvertTo-Json -Compress; exit 0 }
     if (($Fixture -and $Network) -or ($TestState -and !$Fixture) -or ($TestScenario -ne 'None' -and (!$Fixture -or $Network))) { throw 'fixture_or_network_contract_invalid' }
+    if ($Network -and (!$Authorization -or !$AuthorizationSha)) { throw 'external_authorization_anchor_required' }
     if (!$BatchId -or $BatchId -notmatch '^[A-Za-z0-9_-]{1,64}$' -or !$Day -or !$ApprovedSha -or !$outputPath) { throw 'required_input_missing' }
     if (Test-Path -LiteralPath $outputPath) { throw 'output_exists' }
     [void][IO.Directory]::CreateDirectory($state)

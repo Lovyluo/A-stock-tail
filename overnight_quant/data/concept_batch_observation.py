@@ -23,7 +23,7 @@ from .probe_worker_process import run_probe_worker_process
 from .s2_integration_contract import security_identity
 
 VERSION = "concept_batch_observation_v2"
-AUTH_VERSION = "concept_batch_authorization_v2"
+AUTH_VERSION = "concept_batch_authorization_v3"
 LAUNCH_VERSION = "concept_batch_launcher_v2"
 CONFIRM_VERSION = "concept_batch_outer_confirmation_v2"
 ENDPOINT = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -37,6 +37,10 @@ PLAN = {"list_fs": "m:90 t:3 f:!50", "members_fs": "b:{bk} f:!50",
         "fields": "f2,f3,f6,f12,f13,f14,f104,f105,f124"}
 CONTRACT = stable_hash({"version": VERSION, "plan": PLAN, "budget": BUDGET})
 STATE = Path(__file__).resolve().parents[1] / "data/cache/concept-batch-observation"
+AUTH_PURPOSE = "PERSONAL_INTERNAL_STRUCTURE_VALIDATION"
+AUTH_SCOPE = {"max_list_pages": PLAN["pages_per_kind"], "max_member_pages": PLAN["pages_per_kind"],
+              "max_http_requests": 2 * PLAN["pages_per_kind"], "selection": PLAN["selection"],
+              "single_concept": True, "public_distribution": False}
 
 
 def now():
@@ -150,21 +154,54 @@ def summarize(list_rows, members, *, total_list, total_members, synthetic):
                             "概念身份及字段单位须独立验证", "风险与可交易性未评估"]}
 
 
-def _check_auth(auth, day, approved_sha, output, batch):
-    expected = {"schema_version": AUTH_VERSION, "status": "PM_APPROVED", "single_use": True,
+def _permission_context(auth):
+    if auth is None:
+        return None
+    # The intent keeps the original excerpt; page files carry its traceable reference.
+    return {**{key: auth[key] for key in (
+        "schema_version", "source_use_basis", "known_use_constraint", "access_control_bypass",
+        "user_approved", "user_acknowledges_unknown_basis", "purpose", "scope")},
+        "approval_evidence": {key: auth["approval_evidence"][key]
+                              for key in ("thread_id", "message_id", "quote_sha256")}}
+
+
+def _check_auth(auth, day, approved_sha, output, batch, *, stamp=None):
+    expected = {"schema_version": AUTH_VERSION, "status": "USER_APPROVED_LIMITED_EXPERIMENT",
                 "run_date": day, "approved_sha": approved_sha, "contract_hash": CONTRACT,
-                "output": str(output), "batch_id": batch, "budget": BUDGET}
-    if any(auth.get(k) != v for k, v in expected.items()):
+                "output": str(output), "batch_id": batch, "budget": BUDGET,
+                "purpose": AUTH_PURPOSE, "scope": AUTH_SCOPE}
+    if not isinstance(auth, dict) or any(auth.get(k) != v for k, v in expected.items()):
         raise ValueError("authorization_identity_mismatch")
-    stamp = datetime.now(CN_TZ)
+    if (any(type(auth["scope"][key]) is not type(value) for key, value in AUTH_SCOPE.items())
+            or any(type(auth["budget"][key]) is not int for key in BUDGET)
+            or auth.get("single_use") is not True or auth.get("user_approved") is not True
+            or auth.get("user_acknowledges_unknown_basis") is not True):
+        raise ValueError("authorization_confirmation_invalid")
+    if auth.get("source_use_basis") == "PROHIBITED" or auth.get("known_use_constraint") == "PROHIBITED":
+        raise ValueError("authorization_source_use_prohibited")
+    if (auth.get("source_use_basis") != "UNKNOWN" or auth.get("known_use_constraint") != "NO_KNOWN_PROHIBITION"
+            or auth.get("access_control_bypass") is not False):
+        raise ValueError("authorization_source_use_constraint_invalid")
+    evidence = auth.get("approval_evidence")
+    if (not isinstance(evidence, dict) or set(evidence) != {"thread_id", "message_id", "verbatim_quote", "quote_sha256"}
+            or any(not isinstance(evidence[key], str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", evidence[key])
+                   for key in ("thread_id", "message_id"))):
+        raise ValueError("authorization_approval_reference_invalid")
+    quote = evidence["verbatim_quote"]
+    if not isinstance(quote, str) or not quote.strip() or len(quote.encode("utf-8")) > 4096:
+        raise ValueError("authorization_approval_quote_invalid")
+    if hashlib.sha256(quote.encode("utf-8")).hexdigest() != evidence["quote_sha256"]:
+        raise ValueError("authorization_approval_quote_anchor_mismatch")
+    if not all(isinstance(auth.get(k), str) for k in ("window_start", "window_end")):
+        raise ValueError("authorization_window_invalid")
+    stamp = datetime.now(CN_TZ) if stamp is None else stamp
     start = datetime.fromisoformat(auth["window_start"])
     end = datetime.fromisoformat(auth["window_end"])
     if (start.utcoffset() != timedelta(hours=8) or end.utcoffset() != timedelta(hours=8)
+            or stamp.utcoffset() != timedelta(hours=8) or end - start != timedelta(minutes=10)
             or not start <= stamp < end or start.date().isoformat() != day or end.date().isoformat() != day):
         raise ValueError("authorization_window_invalid")
-    for field in ("pm_source", "source_use_basis"):
-        if not isinstance(auth.get(field), str) or auth[field].strip().upper() in ("", "UNKNOWN", "TBD"):
-            raise ValueError("authorization_" + field + "_unconfirmed")
+    return _permission_context(auth)
 
 
 def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
@@ -176,6 +213,7 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
     owned = False
     cleaned = True
     dispatched = False
+    permission = None
     try:
         if not fixture and not network:
             return safe(status="NETWORK_NOT_REQUESTED", requests_dispatched=0)
@@ -204,7 +242,7 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
             if not authorization or not authorization_sha or sha(authorization) != authorization_sha:
                 raise ValueError("external_authorization_anchor_required")
             auth = json.loads(Path(authorization).read_text(encoding="utf-8"))
-            _check_auth(auth, day, approved_sha, directory, batch_id)
+            permission = _check_auth(auth, day, approved_sha, directory, batch_id)
         else:
             fixture = str(Path(fixture).resolve(strict=True))
         state.mkdir(parents=True, exist_ok=True)
@@ -243,6 +281,7 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
         raw_count = len(list(directory.glob("raw-*.json")))
         observed_count = attempts if cleaned and attempts == raw_count else None
         receipt = safe(status="PASSED" if success else "FAILED", batch_id=batch_id,
+                       experiment_permission=permission,
                        synthetic_test_only=bool(fixture), elapsed_ms=elapsed, process=process,
                        requests_dispatched=result["requests_dispatched"] if success else observed_count,
                        request_count_status="KNOWN_RESPONDED" if observed_count is not None else "UNKNOWN",
@@ -261,12 +300,14 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
         total_elapsed = (time.perf_counter() - started) * 1000
         if total_elapsed >= 90000:
             return safe(status="FAILED", error="batch_deadline_exceeded", output=str(directory),
+                        experiment_permission=permission,
                         requests_dispatched=None, request_count_status="UNKNOWN")
         return {**receipt, "output": str(directory), "execution_sha256": execution_sha,
                 "contract_hash": CONTRACT, "total_elapsed_ms": total_elapsed,
                 "completion_checked_at": completion_at}
     except Exception as exc:
         failure = safe(status="FAILED", error=f"{type(exc).__name__}:{exc}", output=str(directory) if directory else None,
+                       experiment_permission=permission,
                        requests_dispatched=None if dispatched else 0,
                        request_count_status="UNKNOWN" if dispatched else "KNOWN_ZERO")
         if owned and directory and directory.exists():
@@ -316,7 +357,9 @@ def page_request(task, kind, page, bk, index):
 def coordinate(task):
     directory = Path(task["output"])
     index = 0
+    permission = None
     try:
+        permission = _permission_context(task.get("authorization"))
         results = {}
         for kind in ("list", "members"):
             seen, rows, total = set(), [], None
@@ -346,6 +389,7 @@ def coordinate(task):
                             total_members=results["total_members"], synthetic=task["test_only"])
         selected = next(row for row in results["list"] if row["f12"] == results["selected_bk"])
         payload = safe(status="CAPTURE_COMPLETE", batch_id=task["batch_id"], run_date=task["day"],
+                       experiment_permission=permission,
                        synthetic_test_only=task["test_only"], contract_hash=CONTRACT,
                        selected_bk=results["selected_bk"], selected_name=selected.get("f14"),
                        selected_daily_change=_number(selected.get("f3")) if task["test_only"] else None,
@@ -361,6 +405,7 @@ def coordinate(task):
         return {"ok": True, "payload": {"requests_dispatched": index}}
     except Exception as exc:
         failure = safe(status="FAILED", batch_id=task["batch_id"], error=f"{type(exc).__name__}:{exc}",
+                       experiment_permission=permission,
                        requests_completed=index, request_count_status="UNKNOWN_IF_DISPATCH_FAILED", completed_at=now())
         write(directory / "failure.json", failure)
         return {"ok": False, "error": failure["error"]}
@@ -416,7 +461,8 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
     receipt = json.loads((path / "execution.json").read_text(encoding="utf-8"))
     if any(report.get(k) != receipt.get(k) for k in
            ("schema_version", "batch_id", "synthetic_test_only", "elapsed_ms", "process", "result_sha256",
-            "requests_dispatched", "request_count_status", "request_attempt_markers", "responses_saved")):
+            "requests_dispatched", "request_count_status", "request_attempt_markers", "responses_saved",
+            "experiment_permission")):
         raise ValueError("returned_report_receipt_mismatch")
     if (receipt.get("status") != "PASSED" or not receipt.get("process", {}).get("ok")
             or not receipt.get("process", {}).get("cleanup_complete")
@@ -431,7 +477,8 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         raise ValueError("batch_result_anchor_mismatch")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if (result.get("status") != "CAPTURE_COMPLETE" or result.get("batch_id") != receipt.get("batch_id")
-            or result.get("batch_id") != report.get("batch_id") or result.get("contract_hash") != CONTRACT):
+            or result.get("batch_id") != report.get("batch_id") or result.get("contract_hash") != CONTRACT
+            or type(result.get("synthetic_test_only")) is not bool):
         raise ValueError("batch_identity_mismatch")
     count = result.get("requests_dispatched")
     if (type(count) is not int or not 2 <= count <= 6
@@ -450,11 +497,25 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         raise ValueError("intent_anchor_mismatch")
     intent = json.loads((path / "intent.json").read_text(encoding="utf-8"))
     if (intent.get("batch_id") != result["batch_id"] or intent.get("contract_hash") != CONTRACT
+            or intent.get("output") != str(path) or intent.get("day") != result.get("run_date")
             or intent.get("test_only") is not result["synthetic_test_only"]
             or receipt.get("synthetic_test_only") is not result["synthetic_test_only"]
             or ticket.get("approved_sha") != intent.get("approved_sha") or ticket.get("day") != intent.get("day")
             or ticket_path.resolve() != (Path(intent["state"]) / "launcher-tickets" / result["batch_id"] / "ticket.json").resolve()):
         raise ValueError("intent_identity_mismatch")
+    auth = intent.get("authorization")
+    permission = None
+    if result["synthetic_test_only"]:
+        if auth is not None:
+            raise ValueError("fixture_authorization_forbidden")
+    else:
+        if not re.fullmatch(r"[0-9a-f]{64}", intent.get("authorization_sha") or ""):
+            raise ValueError("authorization_anchor_missing")
+        permission = _check_auth(auth, result["run_date"], intent["approved_sha"], path, result["batch_id"],
+                                 stamp=datetime.fromisoformat(intent["created_at"]))
+    permission_hash = stable_hash(permission)
+    if any(stable_hash(item.get("experiment_permission")) != permission_hash for item in (result, receipt, report)):
+        raise ValueError("experiment_permission_mismatch")
     intent_started = _number(intent.get("started"))
     supervisor_started = _number(report.get("supervisor_started_monotonic"))
     outer_started, outer_checked = start / frequency, checked / frequency
@@ -493,10 +554,14 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         request = json.loads(request_path.read_text(encoding="utf-8"))
         if any(request.get(k) != raw.get(k) for k in ("batch_id", "kind", "page", "index", "params", "synthetic_test_only")):
             raise ValueError("request_binding_mismatch")
+        if any(stable_hash(item.get("experiment_permission")) != permission_hash for item in (request, raw)):
+            raise ValueError("experiment_permission_mismatch")
         start, received = (datetime.fromisoformat(raw[k]) for k in ("request_started_at", "response_completed_at"))
         if (start.utcoffset() != timedelta(hours=8) or received.utcoffset() != timedelta(hours=8)
                 or start > received or (not result["synthetic_test_only"] and received.date().isoformat() != result["run_date"])):
             raise ValueError("capture_time_invalid")
+        if not result["synthetic_test_only"]:
+            _check_auth(auth, result["run_date"], intent["approved_sha"], path, result["batch_id"], stamp=start)
         clocks = [raw.get(k) for k in ("dispatch_monotonic", "request_started_monotonic",
                                       "response_completed_monotonic", "raw_write_started_monotonic")]
         if (any(type(value) not in (int, float) or not math.isfinite(value) for value in clocks)

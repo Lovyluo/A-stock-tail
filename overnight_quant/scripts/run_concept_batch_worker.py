@@ -1,5 +1,6 @@
 """Internal, bounded child for the concept-batch controller."""
 import base64
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -39,10 +40,22 @@ def page(task):
         raise ValueError("page_task_identity_invalid")
     if time.perf_counter() >= task["request_deadline"]:
         raise TimeoutError("page_deadline_before_dispatch")
+    auth = permission = None
+    if not task["test_only"]:
+        if task.get("fixture") or not intent.get("authorization"):
+            raise ValueError("live_authorization_required")
+        authorization_path = task.get("authorization_path")
+        if not authorization_path or sha(authorization_path) != intent.get("authorization_sha"):
+            raise ValueError("authorization_anchor_mismatch")
+        auth = json.loads(Path(authorization_path).read_text(encoding="utf-8"))
+        if auth != intent["authorization"]:
+            raise ValueError("authorization_content_mismatch")
+        permission = _check_auth(auth, task["day"], task["approved_sha"], directory.resolve(), task["batch_id"])
     index = task["index"]
     write(directory / f"request-{index}.json", {"batch_id": task["batch_id"],
           "index": index, "kind": task["kind"], "page": task["page"],
-          "params": task["params"], "created_at": now(), "synthetic_test_only": task["test_only"]})
+          "params": task["params"], "created_at": now(), "synthetic_test_only": task["test_only"],
+          "experiment_permission": permission})
     started, started_monotonic = now(), time.perf_counter()
     if task["test_only"]:
         def denied(*args, **kwargs):
@@ -57,17 +70,13 @@ def page(task):
         body = base64.b64decode(item["body_base64"], validate=True)[:MAX_RESPONSE_BYTES + 1]
         status, final_url = item.get("status", 200), ENDPOINT
     else:
-        if task.get("fixture") or not intent.get("authorization"):
-            raise ValueError("live_authorization_required")
-        authorization_path = task.get("authorization_path")
-        if not authorization_path or sha(authorization_path) != intent.get("authorization_sha"):
-            raise ValueError("authorization_anchor_mismatch")
-        auth = json.loads(Path(authorization_path).read_text(encoding="utf-8"))
-        if auth != intent["authorization"]:
-            raise ValueError("authorization_content_mismatch")
-        _check_auth(auth, task["day"], task["approved_sha"], directory.resolve(), task["batch_id"])
         opener = configured_opener()
         request = Request(ENDPOINT + "?" + urlencode(task["params"]))
+        started, started_monotonic = now(), time.perf_counter()
+        _check_auth(auth, task["day"], task["approved_sha"], directory.resolve(), task["batch_id"],
+                    stamp=datetime.fromisoformat(started))
+        if time.perf_counter() >= task["request_deadline"]:
+            raise TimeoutError("page_deadline_before_dispatch")
         try:
             response = opener.open(request, timeout=max(.001, task["request_deadline"] - time.perf_counter()))
         except HTTPError as exc:
@@ -82,7 +91,7 @@ def page(task):
            "response_completed_monotonic": received_monotonic, "raw_write_started_monotonic": time.perf_counter(),
            "raw_sha256": hashlib.sha256(body).hexdigest(), "body_base64": base64.b64encode(body).decode(),
            "byte_count": len(body), "body_complete": len(body) <= MAX_RESPONSE_BYTES,
-           "synthetic_test_only": task["test_only"]}
+           "synthetic_test_only": task["test_only"], "experiment_permission": permission}
     write(directory / f"raw-{index}.json", raw)
     if not raw["body_complete"]:
         raise ValueError("response_size_limit_exceeded_partial_raw")
