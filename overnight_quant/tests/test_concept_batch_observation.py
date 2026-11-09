@@ -1,4 +1,7 @@
 import base64
+from datetime import datetime, timedelta
+import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
@@ -7,6 +10,130 @@ import sys
 import pytest
 
 from overnight_quant.data import concept_batch_observation as concept
+
+
+STAMP = datetime(2030, 1, 2, 10, 1, tzinfo=concept.CN_TZ)
+FAKE_SHA = "a" * 40
+
+
+@pytest.fixture
+def permit(tmp_path):
+    quote = "Synthetic test only: approve this limited experiment and acknowledge UNKNOWN upstream basis."
+    return {
+        "schema_version": concept.AUTH_VERSION, "status": "USER_APPROVED_LIMITED_EXPERIMENT",
+        "single_use": True, "user_approved": True, "user_acknowledges_unknown_basis": True,
+        "source_use_basis": "UNKNOWN", "known_use_constraint": "NO_KNOWN_PROHIBITION",
+        "access_control_bypass": False, "purpose": concept.AUTH_PURPOSE, "scope": dict(concept.AUTH_SCOPE),
+        "approval_evidence": {"thread_id": "fixture-thread", "message_id": "fixture-message",
+                              "verbatim_quote": quote, "quote_sha256": hashlib.sha256(quote.encode()).hexdigest()},
+        "run_date": STAMP.date().isoformat(), "approved_sha": FAKE_SHA, "contract_hash": concept.CONTRACT,
+        "batch_id": "offline-fixture", "output": str(tmp_path / "offline-fixture"), "budget": dict(concept.BUDGET),
+        "window_start": (STAMP - timedelta(minutes=1)).isoformat(),
+        "window_end": (STAMP + timedelta(minutes=9)).isoformat(),
+    }
+
+
+def check_permit(permit, target, stamp=STAMP):
+    return concept._check_auth(permit, STAMP.date().isoformat(), FAKE_SHA, target, "offline-fixture", stamp=stamp)
+
+
+def assert_no_formal_outputs(value):
+    assert value["qualification"] == "0/3"
+    assert value["data_ready"] is value["hard_gate_authorized"] is False
+    assert all(value[key] == [] for key in ("records", "candidates", "tickets", "orders"))
+
+
+def test_unknown_basis_only_passes_limited_permission_gate(permit, tmp_path):
+    context = check_permit(permit, tmp_path / "offline-fixture")
+    assert context["source_use_basis"] == "UNKNOWN"
+    assert context["user_approved"] is context["user_acknowledges_unknown_basis"] is True
+    assert context["approval_evidence"]["quote_sha256"] == permit["approval_evidence"]["quote_sha256"]
+    assert "verbatim_quote" not in context["approval_evidence"]
+    assert list(tmp_path.iterdir()) == []
+    assert_no_formal_outputs(concept.safe(experiment_permission=context))
+
+
+@pytest.mark.parametrize(("key", "value", "error"), [
+    ("user_acknowledges_unknown_basis", None, "confirmation_invalid"),
+    ("user_acknowledges_unknown_basis", "true", "confirmation_invalid"),
+    ("user_approved", False, "confirmation_invalid"),
+    ("user_approved", 1, "confirmation_invalid"),
+    ("single_use", 1, "confirmation_invalid"),
+    ("source_use_basis", "PROHIBITED", "source_use_prohibited"),
+    ("known_use_constraint", "PROHIBITED", "source_use_prohibited"),
+    ("known_use_constraint", "UNKNOWN", "source_use_constraint_invalid"),
+    ("source_use_basis", "AUTHORIZED", "source_use_constraint_invalid"),
+    ("access_control_bypass", True, "source_use_constraint_invalid"),
+    ("access_control_bypass", "false", "source_use_constraint_invalid"),
+    ("purpose", "PUBLIC_RESEARCH", "identity_mismatch"),
+    ("schema_version", "concept_batch_authorization_v2", "identity_mismatch"),
+    ("contract_hash", "b" * 64, "identity_mismatch"),
+    ("approved_sha", "b" * 40, "identity_mismatch"),
+    ("run_date", "2030-01-03", "identity_mismatch"),
+    ("batch_id", "another-batch", "identity_mismatch"),
+    ("output", "another-output", "identity_mismatch"),
+    ("approval_evidence", None, "approval_reference_invalid"),
+])
+def test_limited_permission_fails_closed(permit, tmp_path, key, value, error):
+    if value is None:
+        del permit[key]
+    else:
+        permit[key] = value
+    with pytest.raises(ValueError, match="authorization_" + error):
+        check_permit(permit, tmp_path / "offline-fixture")
+
+
+@pytest.mark.parametrize(("key", "value"), [("max_http_requests", 7), ("max_list_pages", 4),
+                                            ("max_member_pages", 4), ("single_concept", False),
+                                            ("public_distribution", True), ("public_distribution", 0)])
+def test_limited_permission_rejects_scope_drift(permit, tmp_path, key, value):
+    permit["scope"][key] = value
+    with pytest.raises(ValueError, match="authorization_(identity_mismatch|confirmation_invalid)"):
+        check_permit(permit, tmp_path / "offline-fixture")
+
+
+def test_limited_permission_checks_original_quote_and_window(permit, tmp_path):
+    target = tmp_path / "offline-fixture"
+    assert check_permit(permit, target, STAMP - timedelta(minutes=1))
+    with pytest.raises(ValueError, match="authorization_window_invalid"):
+        check_permit(permit, target, STAMP + timedelta(minutes=9))
+    permit["window_end"] = (STAMP + timedelta(minutes=10)).isoformat()
+    with pytest.raises(ValueError, match="authorization_window_invalid"):
+        check_permit(permit, target)
+    permit["approval_evidence"]["verbatim_quote"] += " changed"
+    with pytest.raises(ValueError, match="authorization_approval_quote_anchor_mismatch"):
+        check_permit(permit, target)
+
+
+@pytest.fixture
+def isolated_live_path(monkeypatch, tmp_path):
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz):
+            return STAMP
+
+    monkeypatch.setattr(concept, "datetime", FixedClock)
+    monkeypatch.setattr(concept, "STATE", tmp_path)
+    monkeypatch.setattr(concept.subprocess, "run", lambda args, **kwargs: subprocess.CompletedProcess(
+        args, 0, FAKE_SHA + "\n" if args[1] == "rev-parse" else ""))
+    return {"network": True, "state": tmp_path, "day": STAMP.date().isoformat(), "approved_sha": FAKE_SHA,
+            "output": tmp_path / "offline-fixture", "batch_id": "offline-fixture"}
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_no_dispatch_without_complete_limited_permission(monkeypatch, tmp_path, permit, isolated_live_path, missing):
+    monkeypatch.setattr(concept, "run_probe_worker_process", lambda *a, **k: pytest.fail("unexpected dispatch"))
+    args = isolated_live_path
+    if not missing:
+        del permit["user_acknowledges_unknown_basis"]
+        authorization = concept.write(tmp_path / "fixture-permit.json", permit)
+        args.update(authorization=str(authorization), authorization_sha=concept.sha(authorization))
+    report = concept.capture(**args)
+    assert report["status"] == "FAILED" and report["requests_dispatched"] == 0
+    assert report["request_count_status"] == "KNOWN_ZERO"
+    assert ("external_authorization_anchor_required" if missing else "authorization_confirmation_invalid") in report["error"]
+    assert not args["output"].exists() and not (tmp_path / "intents").exists()
+    assert_no_formal_outputs(report)
 
 
 def page(total, rows):
@@ -53,6 +180,89 @@ def load(tmp_path, target, name="batch"):
     return concept.load_batch(target, report, concept.sha(report), concept.sha(confirmation))
 
 
+def test_offline_transport_carries_limited_permission_through_replay(monkeypatch, tmp_path, permit, isolated_live_path):
+    from overnight_quant.scripts import run_concept_batch_worker as worker
+    from overnight_quant.tests.fixtures.apptest_network_guard import AppTestNetworkGuard
+    from streamlit.testing.v1 import AppTest
+
+    responses = iter([page(1, lists(1)), page(1, stocks(1))])
+    calls = []
+
+    class Response(BytesIO):
+        code = 200
+        url = concept.ENDPOINT
+
+    class FixtureOpener:
+        def open(self, request, timeout):
+            calls.append(request.full_url)
+            return Response(base64.b64decode(next(responses)["body_base64"]))
+
+    def local_worker(task, *args, **kwargs):
+        result = concept.coordinate(task) if task["mode"] == "coordinate" else worker.page(task)
+        return {**result, "cleanup_complete": True, "elapsed_ms": 1}
+
+    monkeypatch.setattr(worker, "configured_opener", FixtureOpener)
+    monkeypatch.setattr(concept, "run_probe_worker_process", local_worker)
+    target = isolated_live_path["output"]
+    authorization = concept.write(tmp_path / "fixture-permit.json", permit)
+    supervisor_started = concept.time.perf_counter()
+    receipt = concept.capture(**isolated_live_path, authorization=str(authorization),
+                              authorization_sha=concept.sha(authorization))
+    assert receipt["status"] == "PASSED" and receipt["requests_dispatched"] == len(calls) == 2
+    context = receipt["experiment_permission"]
+    assert context == check_permit(permit, target)
+    for name in ("request-0.json", "raw-0.json", "execution.json", "batch-result.json"):
+        assert json.loads((target / name).read_bytes())["experiment_permission"] == context
+    intent = json.loads((target / "intent.json").read_bytes())
+    assert intent["authorization"] == permit
+    assert_no_formal_outputs(receipt)
+    report = {**receipt, "status": "EXECUTION_CANDIDATE", "candidate_status": "PASSED",
+              "supervisor_cleanup_complete": True, "supervisor_started_monotonic": supervisor_started,
+              "supervisor_elapsed_ms": (concept.time.perf_counter() - supervisor_started) * 1000}
+    report_path = concept.write(target / "returned-report.json", report)
+    frequency = 1_000_000_000
+    start = int(supervisor_started * frequency)
+    checked = int(concept.time.perf_counter() * frequency)
+    ticket_path = concept.write(tmp_path / "launcher-tickets" / permit["batch_id"] / "ticket.json", {
+        "schema_version": concept.LAUNCH_VERSION, "contract_hash": concept.CONTRACT, "output": str(target),
+        "batch_id": permit["batch_id"], "launcher_started_ticks": start, "stopwatch_frequency": frequency,
+        "launcher_pid": 1, "nonce": "a" * 32, "synthetic_test_only": False,
+        "approved_sha": FAKE_SHA, "day": permit["run_date"],
+    })
+    confirmation_path = concept.write(target / "final-confirmation.json", {
+        "schema_version": concept.CONFIRM_VERSION, "contract_hash": concept.CONTRACT,
+        "status": "EXECUTION_SUCCEEDED", "output": str(target), "batch_id": permit["batch_id"],
+        "report_sha256": concept.sha(report_path), "ticket_path": str(ticket_path),
+        "ticket_sha256": concept.sha(ticket_path), "synthetic_test_only": False,
+        "launcher_started_ticks": start, "report_checked_ticks": checked, "stopwatch_frequency": frequency,
+        "execution_elapsed_ms": (checked - start) * 1000 / frequency,
+    })
+    result = load(tmp_path, target)
+    assert result["experiment_permission"] == context and result["field_basis"] == "UNPROVEN"
+    assert_no_formal_outputs(result)
+
+    guard = AppTestNetworkGuard(monkeypatch)
+    app = AppTest.from_string("import streamlit as st\n"
+                              "from overnight_quant.ui.concept_batch_observation import render\n"
+                              "render(st)\n").run()
+    for label, value in (("批次目录", str(target)), ("命令返回报告文件", str(report_path)),
+                         ("返回报告外部 SHA-256", concept.sha(report_path)),
+                         ("最终确认外部 SHA-256", concept.sha(confirmation_path))):
+        next(x for x in app.text_input if x.label == label).set_value(value)
+    next(x for x in app.button if x.label == "打开指定批次").click().run()
+    assert not app.exception and not app.error
+    assert any("用途依据 UNKNOWN" in w.value and "不是上游授权或法律合规保证" in w.value for w in app.warning)
+    assert not any(guard.business_attempts.values()) and len(calls) == 2
+
+    report["experiment_permission"] = {**context, "source_use_basis": "AUTHORIZED"}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    confirmation = json.loads(confirmation_path.read_bytes())
+    confirmation["report_sha256"] = concept.sha(report_path)
+    confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+    with pytest.raises(ValueError, match="returned_report_receipt_mismatch"):
+        load(tmp_path, target)
+
+
 def test_default_zero_network_and_missing_parameters(tmp_path):
     result = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch"],
                             capture_output=True, text=True, timeout=10)
@@ -73,10 +283,29 @@ def test_default_zero_network_and_missing_parameters(tmp_path):
     assert not target.exists()
     describe = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--describe"],
                               capture_output=True, text=True, timeout=10)
-    assert json.loads(describe.stdout)["status"] == "DRAFT_NOT_AUTHORIZED"
+    description = json.loads(describe.stdout)
+    assert description["status"] == "DRAFT_NOT_AUTHORIZED"
+    assert description["authorization_version"] == "concept_batch_authorization_v3"
     refused = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--network"],
                              capture_output=True, text=True, timeout=15)
     assert refused.returncode == 2 and json.loads(refused.stdout)["requests_dispatched"] == 0
+
+
+def test_manual_network_without_permission_does_not_start_worker(tmp_path):
+    script = tmp_path / "overnight_quant" / "scripts" / "run_concept_batch_manual.ps1"
+    script.parent.mkdir(parents=True)
+    script.write_bytes((Path(__file__).resolve().parents[1] / "scripts" / script.name).read_bytes())
+    target = tmp_path / "batch"
+    run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(script), "-Network", "-Day", STAMP.date().isoformat(),
+                          "-ApprovedSha", FAKE_SHA, "-Output", str(target), "-BatchId", "offline-fixture",
+                          "-PythonPath", str(tmp_path / "must-not-start.exe")],
+                         capture_output=True, text=True, timeout=15)
+    assert run.returncode == 2
+    report = json.loads(run.stdout)
+    assert report["error"] == "external_authorization_anchor_required"
+    assert report["requests_dispatched"] == 0 and report["request_count_status"] == "KNOWN_ZERO"
+    assert not target.exists() and not (tmp_path / "overnight_quant" / "data").exists()
 
 
 def test_actual_cli_full_six_pages_replay_and_no_overwrite(tmp_path):

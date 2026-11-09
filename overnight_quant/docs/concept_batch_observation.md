@@ -22,7 +22,13 @@
 
 ## 有界合同及真实验证待批单
 
-先用`D:\A-stock\.venv\Scripts\python.exe -m overnight_quant.scripts.run_concept_batch --describe`离线输出代码内冻结合同和合同hash；此输出为`DRAFT_NOT_AUTHORIZED`，不是许可。真实验收须另行固定**已审核的代码完整SHA**、日期及北京时间窗口、计划/合同hash、新批次ID和ignored输出目录、用途依据及其来源，并核对活动锁、未完成清理和既有intent；UNKNOWN不得冒充上游使用授权。不生成有效授权或自动顺延。
+**DRAFT_NOT_AUTHORIZED。** 请求计划仍为v2，许可单独升级为`concept_batch_authorization_v3`。先用`D:\A-stock\.venv\Scripts\python.exe -m overnight_quant.scripts.run_concept_batch --describe`离线核对版本和合同hash；此输出不是许可。
+
+- **另行待批**：最终审核固定的完整代码SHA、单日日期、当日北京时间10分钟窗口、全新批次ID及ignored输出路径；核对干净验证树、活动锁、清理阻断、既有intent和启动票据。此前未启动记录不改写，旧日期或许可不能沿用或自动顺延。
+- **分开记录**：`source_use_basis=UNKNOWN`；`status=USER_APPROVED_LIMITED_EXPERIMENT`、`user_approved=true`和独立的`user_acknowledges_unknown_basis=true`。个人内部结构验证不是上游授权或法律合规保证。两项确认及`single_use`均须为JSON布尔true。
+- **范围**：`purpose=PERSONAL_INTERNAL_STRUCTURE_VALIDATION`。固定`scope`包括列表3页、成分3页、总请求6次上限、代码字典序最小BK、只选一个概念、禁止公开传播。实际字段和值以代码内`AUTH_SCOPE`为准。
+- **明确拒绝**：已知禁止保持`PROHIBITED`，不能降为UNKNOWN；只有确无已知禁止时才能填`known_use_constraint=NO_KNOWN_PROHIBITION`，且`access_control_bypass`须为JSON布尔false。缺失、未知枚举、范围漂移、过期或旧版均不通过。
+- **原文追溯**：`approval_evidence`须包含可定位原文的`thread_id`与`message_id`、原文摘录`verbatim_quote`及其UTF-8字节SHA-256（`quote_sha256`）。人工须先对照原文核实许可、知情和范围；入口只核对锚点及结构，不认证发言人或独立判断上游权利。原文随intent留存，原件、执行及返回报告携带许可状态、引用和摘要；页面明确展示UNKNOWN与有限用户许可。
 
 固定端点`https://push2.eastmoney.com/api/qt/clist/get`，遵循系统/环境代理配置，不静默强制直连；禁止重定向、重试、自动换址或fallback。响应字节上限1 MiB，超限保留明确标记的不完整片段并失败。公共参数`pn=1..3,pz=100,po=1,fltt=2,fid=f12,fields=f2,f3,f6,f12,f13,f14,f104,f105,f124`；列表`fs=m:90 t:3 f:!50`至多3页；在已捕获列表中按合法BK代码字典序选择最小者，仅作为**固定结构验证样本**，不是强弱候选；成分`fs=b:{BK} f:!50`至多3页。最多6次HTTP请求，首响应总数决定必要页，逐页核对实际行数、总数、排序和身份；不请求报价、新闻、历史、竞价或资金流。列表须取得`min(总数,300)`，超过300仅称有限覆盖；成分首响应声明超过300立即停止，不再派余页。实际概念类型、代码范围、字段单位、原生时点和用途仍需单独验证；不得仅因此实现存在便认定已证明。
 
@@ -34,4 +40,4 @@
 
 单页绝对上限10秒，包含子进程启动、连接、读取、原件封存及回收（预留最多1秒清理）；全批从版本化PowerShell启动入口开始单调计时，覆盖Python启动、采集、进程回收、报告写完及写后检查，严格小于90秒。PowerShell进入脚本前的宿主启动不在该合同内；单份最终确认在检查后独立持久化，不宣称其写入耗时属于90秒。清理未知保留阻断，禁止派发后续请求。请求完成、结构解析、身份/单位/时间依据、指标可计算及是否能用于当前观察分别记录。失败时保留真实原件、请求标记与回执，无法确认实际请求数为UNKNOWN；不把无效值补零或当平盘。v1批次不能自动升级为v2成功。
 
-真实执行模式必须经版本化入口显式`-Network`并提供真实日期、完整代码SHA、新批次/输出、外部SHA锚定的v2单日授权文件。授权须绑定本合同、批次、日期、窗口、代码、输出、预算、PM来源和非UNKNOWN上游用途依据，且`single_use=true`；逐页复查窗口。此处不提供可用授权文件，未解决日期、窗口、用途及字段语义前不得执行。失败即停，不补采、不删除intent或清理阻断；任何结果不提升来源资格，不写正式records/candidates/tickets/orders。
+真实执行模式必须经版本化入口显式`-Network`，提供外部SHA锚定的v3单日许可文件，绑定本合同、批次、日期、窗口、代码、输出和预算；逐页复查许可及窗口。此处不提供可用许可文件。原v2合成批次仍可离线查看，不补造新许可；无v3许可依据的材料不作为此合同下的成功真实批次。失败即停，不补采、不删除intent或清理阻断；任何结果不提升来源资格，不写正式records/candidates/tickets/orders。

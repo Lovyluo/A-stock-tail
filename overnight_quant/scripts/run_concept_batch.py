@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from overnight_quant.data.concept_batch_observation import (
-    BUDGET, CONTRACT, ENDPOINT, LAUNCH_VERSION, PLAN, STATE, VERSION, load_batch, safe, write,
+    AUTH_VERSION, BUDGET, CONTRACT, ENDPOINT, LAUNCH_VERSION, PLAN, STATE, VERSION, load_batch, safe, write,
 )
 from overnight_quant.data.probe_worker_process import run_probe_worker_process
 
@@ -38,6 +38,7 @@ def main(argv=None):
             parser.error("offline inspection cannot execute capture")
         if args.describe:
             print(json.dumps(safe(status="DRAFT_NOT_AUTHORIZED", version=VERSION, contract_hash=CONTRACT,
+                                  authorization_version=AUTH_VERSION,
                                   endpoint=ENDPOINT, plan=PLAN, budget=BUDGET), ensure_ascii=True, sort_keys=True))
             return 0
         try:
