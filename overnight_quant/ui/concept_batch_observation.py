@@ -1,5 +1,5 @@
 """Explicitly selected offline batches, separate from user settings and demo state."""
-from overnight_quant.data.concept_batch_observation import load_batch
+from overnight_quant.data.concept_batch_observation import VERSION, load_batch
 
 
 def render(st):
@@ -42,7 +42,9 @@ def render(st):
     st.dataframe([{"代码原值": r.get("f12"), "名称原值": r.get("f14"), "涨跌原值": r.get("f3")}
                   for r in result["list_raw"]], hide_index=True, use_container_width=True)
     st.subheader("固定结构验证样本与成分")
-    st.write(f"{result['selected_bk']} · {result['selected_name']}｜固定结构验证样本：覆盖范围内代码升序第一，非强势候选")
+    selection_scope = "降序分页所得有限集合" if result["schema_version"] == VERSION else "v2 原批次覆盖集合"
+    st.write(f"{result['selected_bk']} · {result['selected_name']}｜固定结构验证样本："
+             f"{selection_scope}内代码字典序最小，不代表全市场代码最小，非强势候选")
     if result["synthetic_test_only"]:
         change = result["selected_daily_change"]
         st.write(f"合成当日表现：{change}%" if change is not None else "合成当日表现：资料不足")

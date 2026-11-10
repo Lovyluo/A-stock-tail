@@ -68,6 +68,7 @@ def test_unknown_basis_only_passes_limited_permission_gate(permit, tmp_path):
     ("purpose", "PUBLIC_RESEARCH", "identity_mismatch"),
     ("schema_version", "concept_batch_authorization_v2", "identity_mismatch"),
     ("contract_hash", "b" * 64, "identity_mismatch"),
+    ("contract_hash", concept.LEGACY_CONTRACT, "identity_mismatch"),
     ("approved_sha", "b" * 40, "identity_mismatch"),
     ("run_date", "2030-01-03", "identity_mismatch"),
     ("batch_id", "another-batch", "identity_mismatch"),
@@ -142,13 +143,13 @@ def page(total, rows):
 
 
 def lists(count):
-    return [{"f12": f"BK{i:04d}", "f14": f"方向{i}", "f3": 1.25} for i in range(count)]
+    return [{"f12": f"BK{i:04d}", "f14": f"方向{i}", "f3": 1.25} for i in reversed(range(count))]
 
 
 def stocks(count):
     return [{"f12": f"{i + 1:06d}", "f13": 0, "f14": f"测试{i}",
              "f3": (1 if i % 3 == 0 else -1 if i % 3 == 1 else 0), "f6": i + 1}
-            for i in range(count)]
+            for i in reversed(range(count))]
 
 
 def head():
@@ -165,7 +166,7 @@ def launcher_cmd(fixture, target, state, name, *, scenario="None", shell="powers
 
 def run(tmp_path, responses, name="batch", timeout=45):
     fixture = tmp_path / f"{name}-fixture.json"
-    fixture.write_text(json.dumps({"responses": responses}), encoding="utf-8")
+    fixture.write_text(json.dumps({"synthetic_test_only": True, "responses": responses}), encoding="utf-8")
     target = tmp_path / name
     cmd = launcher_cmd(fixture, target, tmp_path / f"{name}-state", name)
     process = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -286,6 +287,12 @@ def test_default_zero_network_and_missing_parameters(tmp_path):
     description = json.loads(describe.stdout)
     assert description["status"] == "DRAFT_NOT_AUTHORIZED"
     assert description["authorization_version"] == "concept_batch_authorization_v3"
+    assert description["version"] == "concept_batch_observation_v3"
+    assert description["contract_hash"] == concept.CONTRACT
+    assert description["plan"]["order"] == {
+        "request": {"fid": "f12", "po": "1"}, "expected": {"list": "descending", "members": "descending"},
+        "basis": {"list": "single_observed_list_page", "members": "pending_live_sample"},
+    }
     refused = subprocess.run([sys.executable, "-m", "overnight_quant.scripts.run_concept_batch", "--network"],
                              capture_output=True, text=True, timeout=15)
     assert refused.returncode == 2 and json.loads(refused.stdout)["requests_dispatched"] == 0
@@ -319,6 +326,7 @@ def test_actual_cli_full_six_pages_replay_and_no_overwrite(tmp_path):
     result = load(tmp_path, target)
     assert result["requests_dispatched"] == 6
     assert result["selected_bk"] == "BK0000"
+    assert result["list_raw"] == ls and result["member_raw"] == members
     assert result["member_coverage"] == {"received": 201, "total": 201, "complete": True}
     assert result["counts"] == {"up": 67, "down": 67, "flat": 67, "invalid": 0}
     assert result["event_time_basis"] == "UNPROVEN"
@@ -375,13 +383,14 @@ def test_invalid_value_is_not_flat_and_no_current_claim(tmp_path):
 
 def test_bounded_list_is_not_full_market_and_missing_amount_is_not_ranked(tmp_path):
     ls, members = lists(301), stocks(2)
-    ls[0]["f3"] = "-"
+    ls[-2]["f3"] = "-"
     members[0]["f6"] = None
     responses = [page(301, ls[i:i + 100]) for i in (0, 100, 200)] + [page(2, members)]
     process, receipt, target, _ = run(tmp_path, responses)
     assert process.returncode == 0, receipt
     result = load(tmp_path, target)
     assert result["list_coverage"] == {"received": 300, "total": 301, "complete": False}
+    assert result["selected_bk"] == "BK0001" and result["list_raw"] == ls[:300]
     assert result["list_invalid_numeric_rows"] == 1
     assert result["active_representatives"] == []
     assert result["amount_basis"] == "MISSING_OR_INVALID"
@@ -426,16 +435,15 @@ def test_replay_rejects_missing_list_pages_even_with_recomputed_hashes(tmp_path)
         load(tmp_path, target)
 
 
-def reanchor_list_body(target, body, byte_count):
-    import hashlib
-    raw_path = target / "raw-0.json"
+def reanchor_list_body(target, body, byte_count, index=0):
+    raw_path = target / f"raw-{index}.json"
     raw = json.loads(raw_path.read_text(encoding="utf-8"))
     raw.update(body_base64=base64.b64encode(body).decode(), byte_count=byte_count,
                raw_sha256=hashlib.sha256(body).hexdigest(), body_complete=True)
     raw_path.write_text(json.dumps(raw), encoding="utf-8")
     result_path = target / "batch-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    result["raw_anchors"][0] = concept.sha(raw_path)
+    result["raw_anchors"][index] = concept.sha(raw_path)
     result_path.write_text(json.dumps(result), encoding="utf-8")
     execution_path = target / "execution.json"
     execution = json.loads(execution_path.read_text(encoding="utf-8"))
@@ -450,6 +458,62 @@ def reanchor_list_body(target, body, byte_count):
     confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
     confirmation["report_sha256"] = concept.sha(report_path)
     confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+
+
+ORDER_FAILURES = [
+    ("mixed", 0, "page_order_drift"), ("ascending", 0, "page_order_drift"),
+    ("duplicate", 1, "duplicate_native_identity"), ("boundary", 1, "page_boundary_order_drift"),
+    ("total", 1, "total_drift"), ("ascending_members", 2, "page_order_drift"),
+]
+
+
+def order_fixture(case=None):
+    first, second = lists(102)[:100], lists(102)[100:]
+    members = stocks(2)
+    if case == "mixed":
+        first[1], first[2] = first[2], first[1]
+    elif case == "ascending":
+        first.reverse()
+    elif case == "duplicate":
+        second[0] = first[-1]
+    elif case == "boundary":
+        second[0] = {**second[0], "f12": "BK0102"}
+    elif case == "ascending_members":
+        members.reverse()
+    return [page(102, first), page(103 if case == "total" else 102, second), page(2, members)]
+
+
+@pytest.mark.parametrize(("case", "index", "reason"), ORDER_FAILURES)
+def test_capture_rejects_order_and_pagination_drift(tmp_path, case, index, reason):
+    proc, receipt, target, _ = run(tmp_path, order_fixture(case))
+    assert proc.returncode == 2 and receipt["status"] == "FAILED"
+    assert len(list(target.glob("request-*.json"))) == index + 1
+    assert json.loads((target / "failure.json").read_bytes())["error"] == "ValueError:" + reason
+    assert not (target / "final-confirmation.json").exists()
+
+
+def test_replay_uses_same_order_checks_on_anchored_raw_pages(tmp_path):
+    proc, receipt, target, _ = run(tmp_path, order_fixture())
+    assert proc.returncode == 0, receipt
+    verified = load(tmp_path, target)
+    originals = {p: p.read_bytes() for p in target.glob("*.json")}
+    for case, index, reason in ORDER_FAILURES:
+        body = base64.b64decode(order_fixture(case)[index]["body_base64"])
+        reanchor_list_body(target, body, len(body), index)
+        with pytest.raises(ValueError, match="^" + reason + "$"):
+            load(tmp_path, target)
+        for p, original in originals.items():
+            p.write_bytes(original)
+    assert load(tmp_path, target) == verified
+
+
+def test_legacy_order_is_kept_only_for_exact_v2_replay():
+    assert concept.LEGACY_CONTRACT == "ba4c6c1599e8648bae4f76bbfb1ecdab11e867804af27c95825b80914d67d6b8"
+    assert concept.CONTRACT != concept.LEGACY_CONTRACT
+    body = base64.b64decode(page(2, list(reversed(lists(2))))["body_base64"])
+    assert concept.decode_page(body, "list", 1, None, set(), plan=concept._LEGACY_REPLAY_PLAN)[0] == 2
+    with pytest.raises(ValueError, match="page_order_drift"):
+        concept.decode_page(body, "list", 1, None, set())
 
 
 def test_replay_accepts_exactly_one_mib_of_valid_json(tmp_path):
@@ -741,6 +805,7 @@ def test_dashboard_opens_only_explicit_fixture_batch_without_business_network(mo
     assert any("原生事件时点未确认" in x.value for x in app.markdown)
     assert any("不代表全市场" in x.value for x in app.markdown)
     assert any("固定结构验证样本" in x.value and "非强势候选" in x.value for x in app.markdown)
+    assert any("降序分页所得有限集合" in x.value and "不代表全市场代码最小" in x.value for x in app.markdown)
     next(x for x in app.text_input if x.label == "返回报告外部 SHA-256").set_value("0" * 64)
     next(x for x in app.button if x.label == "打开指定批次").click().run()
     assert any("批次不可用" in x.value for x in app.error)
