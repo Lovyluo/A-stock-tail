@@ -78,7 +78,7 @@ def main(argv=None):
             return 2
         started = ENTRY_STARTED
         outer = run_probe_worker_process({"mode": "capture", "contract_hash": CONTRACT, "capture_args": params},
-            90000, bounded_cleanup_ms=2000, hard_deadline_monotonic=started + 90, retain_streams=True,
+            90000, bounded_cleanup_ms=2000, hard_deadline_monotonic=started + 90, retain_streams=True, strict_utf8=True,
             worker_command=[sys.executable, "-m", "overnight_quant.scripts.run_concept_batch_worker"])
         elapsed = (time.perf_counter() - started) * 1000
         if outer.get("ok") and outer.get("cleanup_complete") and elapsed < 90000:

@@ -12,7 +12,7 @@ $contract = 'ba4c6c1599e8648bae4f76bbfb1ecdab11e867804af27c95825b80914d67d6b8'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $state = if ($TestState) { [IO.Path]::GetFullPath($TestState) } else { [IO.Path]::GetFullPath((Join-Path $root 'overnight_quant\data\cache\concept-batch-observation')) }
 $outputPath = if ($Output) { [IO.Path]::GetFullPath($Output) } else { '' }
-$process = $null; $owned = $false; $treeClean = $true; $launched = $false; $offset = [long]0
+$process = $null; $owned = $false; $treeClean = $true; $launched = $false; $knownZero = $false; $offset = [long]0
 $lock = Join-Path $state 'launcher.lock'
 
 function Tick { return [Diagnostics.Stopwatch]::GetTimestamp() + $script:offset }
@@ -98,8 +98,10 @@ try {
     $info.Arguments = (($arguments | ForEach-Object { QuoteArgument ([string]$_) }) -join ' ')
     $info.WorkingDirectory = $root; $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
-    $info.StandardOutputEncoding = [Text.Encoding]::UTF8; $info.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    $info.StandardErrorEncoding = $info.StandardOutputEncoding
     $info.EnvironmentVariables['CONCEPT_BATCH_LAUNCH_TOKEN'] = $nonce
+    $info.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8:strict'
     if ((RemainingMs) -le 2000) { throw 'insufficient_start_budget' }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
     if (!$process.Start()) { throw 'python_start_failed' }
@@ -121,6 +123,11 @@ try {
     $treeClean = (($candidate.supervisor_cleanup_complete -eq $true) -or ($candidate.requests_dispatched -eq 0))
     if (!$treeClean) { MarkUnconfirmed 'supervisor_cleanup_unknown'; throw 'supervisor_cleanup_unconfirmed' }
     if ($owned -and [IO.File]::ReadAllText($lock) -eq $nonce) { [IO.File]::Delete($lock); $owned = $false }
+    if ($candidate.status -eq 'FAILED' -and $candidate.supervisor_cleanup_complete -eq $true -and
+        $candidate.requests_dispatched -eq 0 -and $candidate.request_count_status -eq 'KNOWN_ZERO') {
+        $knownZero = $true
+        if ($candidate.error) { throw [string]$candidate.error }
+    }
     if ($process.ExitCode -ne 3 -or $candidate.status -ne 'EXECUTION_CANDIDATE' -or $candidate.candidate_status -ne 'PASSED') { throw 'capture_not_successful' }
     if ($candidate.batch_id -ne $BatchId -or $candidate.output -ne $outputPath -or $candidate.contract_hash -ne $contract -or $candidate.supervisor_cleanup_complete -ne $true) { throw 'candidate_identity_invalid' }
     $reportPath = Join-Path $outputPath 'returned-report.json'
@@ -154,8 +161,8 @@ try {
     exit 0
 } catch {
     if (!$treeClean) { MarkUnconfirmed 'launcher_failure_cleanup_unknown' }
-    [ordered]@{status='FAILED';error=$_.Exception.Message;requests_dispatched=$(if($launched){$null}else{0});
-        request_count_status=$(if($launched){'UNKNOWN'}else{'KNOWN_ZERO'});output=$outputPath} | ConvertTo-Json -Compress
+    [ordered]@{status='FAILED';error=$_.Exception.Message;requests_dispatched=$(if(!$launched -or $knownZero){0}else{$null});
+        request_count_status=$(if(!$launched -or $knownZero){'KNOWN_ZERO'}else{'UNKNOWN'});output=$outputPath} | ConvertTo-Json -Compress
     exit 2
 } finally {
     if ($process) { $process.Dispose() }

@@ -12,6 +12,18 @@ WORKER_TIMEOUT_ERROR = "REQUEST_DEADLINE_EXCEEDED"
 WORKER_OUTPUT_ERROR = "WORKER_OUTPUT_INVALID"
 WORKER_PROCESS_ERROR = "WORKER_PROCESS_FAILED"
 WORKER_CLEANUP_ERROR = "WORKER_CLEANUP_INCOMPLETE"
+MAX_BOUNDED_WORKER_INPUT_BYTES = 4096
+
+
+def encode_bounded_worker_input(task: dict[str, Any]) -> bytes:
+    try:
+        value = json.dumps(task, ensure_ascii=False).encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise ValueError("bounded_worker_input_invalid_unicode") from None
+    # Fits one empty anonymous input pipe; no communicate writer can get stuck.
+    if len(value) > MAX_BOUNDED_WORKER_INPUT_BYTES:
+        raise ValueError("bounded_worker_input_exceeds_4096_bytes")
+    return value
 
 
 def run_probe_worker_process(
@@ -26,6 +38,7 @@ def run_probe_worker_process(
     retain_streams: bool = False,
     bounded_cleanup_ms: int | None = None,
     hard_deadline_monotonic: float | None = None,
+    strict_utf8: bool = False,
 ) -> dict[str, Any]:
     """Run one provider request in a killable child process."""
     if bounded_cleanup_ms is not None:
@@ -33,8 +46,10 @@ def run_probe_worker_process(
             task, deadline_ms, worker_command=worker_command,
             python_executable=python_executable, monotonic=monotonic or time.perf_counter,
             cleanup_ms=bounded_cleanup_ms, retain_streams=retain_streams,
-            hard_deadline=hard_deadline_monotonic,
+            hard_deadline=hard_deadline_monotonic, strict_utf8=strict_utf8,
         )
+    if strict_utf8:
+        raise ValueError("strict_utf8_requires_bounded_worker")
     runtime_monotonic = monotonic or time.monotonic
     command = list(worker_command or [
         python_executable or sys.executable,
@@ -358,8 +373,8 @@ class _PipeDrain:
                 self.eof[name] = True
         return received
 
-    def text(self, name):
-        return b"".join(self.chunks[name]).decode("utf-8", errors="replace")
+    def text(self, name, *, strict_utf8=False):
+        return b"".join(self.chunks[name]).decode("utf-8", errors="strict" if strict_utf8 else "replace")
 
 
 def _resume_suspended_primary(process):
@@ -453,7 +468,7 @@ def _bounded_cleanup(process, scope, drain, *, deadline, monotonic):
 
 
 def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
-                        monotonic, cleanup_ms, retain_streams, hard_deadline):
+                        monotonic, cleanup_ms, retain_streams, hard_deadline, strict_utf8):
     started = monotonic()
     deadline = started + max(0, deadline_ms) / 1000
     if hard_deadline is not None:
@@ -469,10 +484,7 @@ def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
     cleanup_deadline = deadline
     stage = "prepare"
     try:
-        value = json.dumps(task, ensure_ascii=False).encode("utf-8")
-        # Fits one empty anonymous input pipe; no communicate writer can get stuck.
-        if len(value) > 4096:
-            raise ValueError("bounded_worker_input_exceeds_4096_bytes")
+        value = encode_bounded_worker_input(task)
         if monotonic() >= io_deadline:
             raise subprocess.TimeoutExpired(worker_command, 0)
         stage = "startup"
@@ -516,8 +528,15 @@ def _run_bounded_worker(task, deadline_ms, *, worker_command, python_executable,
         errors.extend(cleaned["diagnostics"])
         timings.update({key: value for key, value in cleaned.items() if key.endswith("_ms")})
         timings["cleanup_ms"] = (monotonic() - io_completed) * 1000
-    stdout, stderr = (drain.text("stdout"), drain.text("stderr")) if drain else ("", "")
     decode_started = monotonic()
+    stdout = stderr = ""
+    if drain:
+        try:
+            stdout = drain.text("stdout", strict_utf8=strict_utf8)
+            stderr = drain.text("stderr", strict_utf8=strict_utf8)
+        except UnicodeDecodeError:
+            errors.append("worker_output_invalid_utf8")
+            stdout = stderr = ""
     payload = _decode_worker_output(stdout) if cleanup_complete and not timed_out and not errors else None
     elapsed_ms = (monotonic() - started) * 1000
     timings["decode_ms"] = (monotonic() - decode_started) * 1000

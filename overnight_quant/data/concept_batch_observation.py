@@ -19,7 +19,7 @@ import time
 from .market_calendar import CN_TZ
 from .mootdx_node_benchmark import write_benchmark_json_atomic as write
 from .point_in_time import stable_hash
-from .probe_worker_process import run_probe_worker_process
+from .probe_worker_process import encode_bounded_worker_input, run_probe_worker_process
 from .s2_integration_contract import security_identity
 
 VERSION = "concept_batch_observation_v2"
@@ -38,6 +38,7 @@ PLAN = {"list_fs": "m:90 t:3 f:!50", "members_fs": "b:{bk} f:!50",
 CONTRACT = stable_hash({"version": VERSION, "plan": PLAN, "budget": BUDGET})
 STATE = Path(__file__).resolve().parents[1] / "data/cache/concept-batch-observation"
 AUTH_PURPOSE = "PERSONAL_INTERNAL_STRUCTURE_VALIDATION"
+MAX_APPROVAL_QUOTE_BYTES = 4096
 AUTH_SCOPE = {"max_list_pages": PLAN["pages_per_kind"], "max_member_pages": PLAN["pages_per_kind"],
               "max_http_requests": 2 * PLAN["pages_per_kind"], "selection": PLAN["selection"],
               "single_concept": True, "public_distribution": False}
@@ -165,6 +166,13 @@ def _permission_context(auth):
                               for key in ("thread_id", "message_id", "quote_sha256")}}
 
 
+def read_authorization(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="strict"))
+    except UnicodeDecodeError:
+        raise ValueError("authorization_file_invalid_utf8") from None
+
+
 def _check_auth(auth, day, approved_sha, output, batch, *, stamp=None):
     expected = {"schema_version": AUTH_VERSION, "status": "USER_APPROVED_LIMITED_EXPERIMENT",
                 "run_date": day, "approved_sha": approved_sha, "contract_hash": CONTRACT,
@@ -188,9 +196,15 @@ def _check_auth(auth, day, approved_sha, output, batch, *, stamp=None):
                    for key in ("thread_id", "message_id"))):
         raise ValueError("authorization_approval_reference_invalid")
     quote = evidence["verbatim_quote"]
-    if not isinstance(quote, str) or not quote.strip() or len(quote.encode("utf-8")) > 4096:
+    if not isinstance(quote, str) or not quote.strip():
         raise ValueError("authorization_approval_quote_invalid")
-    if hashlib.sha256(quote.encode("utf-8")).hexdigest() != evidence["quote_sha256"]:
+    try:
+        quote_bytes = quote.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise ValueError("authorization_approval_quote_invalid_unicode") from None
+    if len(quote_bytes) > MAX_APPROVAL_QUOTE_BYTES:
+        raise ValueError("authorization_approval_quote_exceeds_4096_bytes")
+    if hashlib.sha256(quote_bytes).hexdigest() != evidence["quote_sha256"]:
         raise ValueError("authorization_approval_quote_anchor_mismatch")
     if not all(isinstance(auth.get(k), str) for k in ("window_start", "window_end")):
         raise ValueError("authorization_window_invalid")
@@ -241,10 +255,21 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
                 raise ValueError("isolated_output_required")
             if not authorization or not authorization_sha or sha(authorization) != authorization_sha:
                 raise ValueError("external_authorization_anchor_required")
-            auth = json.loads(Path(authorization).read_text(encoding="utf-8"))
+            auth = read_authorization(authorization)
             permission = _check_auth(auth, day, approved_sha, directory, batch_id)
         else:
             fixture = str(Path(fixture).resolve(strict=True))
+        task = {"mode": "coordinate", "day": day, "approved_sha": approved_sha,
+                "batch_id": batch_id, "output": str(directory), "fixture": fixture,
+                "test_only": bool(fixture), "contract_hash": CONTRACT, "started": started, "state": str(state),
+                "work_deadline": started + 85, "authorization": auth,
+                "authorization_path": str(Path(authorization).resolve()) if network else None}
+        encode_bounded_worker_input(task)
+        # Reserve the largest page envelope before any HTTP request. A 24-character
+        # float covers the serialized width of both runtime monotonic fields.
+        wide_float = -1.2345678901234567e-308
+        widest_bk = "BK" + "\U0001d7ce" * 6  # The existing digit matcher also accepts non-ASCII digits.
+        encode_bounded_worker_input(_page_task(task, "members", 3, widest_bk, 5, wide_float, wide_float))
         state.mkdir(parents=True, exist_ok=True)
         if (state / "cleanup-incomplete.json").exists():
             raise ValueError("persistent_cleanup_block")
@@ -254,11 +279,6 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
         write(state / "intents" / f"{batch_id}.json", {"batch_id": batch_id, "output": str(directory),
               "contract_hash": CONTRACT, "created_at": now(), "synthetic_test_only": bool(fixture)})
         directory.mkdir(parents=True, exist_ok=False)
-        task = {"mode": "coordinate", "day": day, "approved_sha": approved_sha,
-                "batch_id": batch_id, "output": str(directory), "fixture": fixture,
-                "test_only": bool(fixture), "contract_hash": CONTRACT, "started": started, "state": str(state),
-                "work_deadline": started + 85, "authorization": auth,
-                "authorization_path": str(Path(authorization).resolve()) if network else None}
         write(directory / "intent.json", {**task, "created_at": now(), "budget": BUDGET,
                                           "authorization_sha": authorization_sha})
         if time.perf_counter() >= started + 85:
@@ -266,7 +286,7 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
         cleaned = False
         dispatched = True
         process = run_probe_worker_process(task, max(0, int((started + 87 - time.perf_counter()) * 1000)),
-            bounded_cleanup_ms=2000, hard_deadline_monotonic=started + 87, retain_streams=True,
+            bounded_cleanup_ms=2000, hard_deadline_monotonic=started + 87, retain_streams=True, strict_utf8=True,
             worker_command=[sys.executable, "-m", "overnight_quant.scripts.run_concept_batch_worker"])
         cleaned = process.get("cleanup_complete") is True
         if not cleaned:
@@ -327,16 +347,20 @@ def capture(*, day, approved_sha, output, batch_id, fixture=None, network=False,
             pass
 
 
+def _page_task(task, kind, page, bk, index, started, deadline):
+    return {**{key: value for key, value in task.items() if key != "state"},
+            "mode": "page", "kind": kind, "page": page, "bk": bk, "index": index,
+            "params": parameters(kind, page, bk), "request_started": started, "request_deadline": deadline}
+
+
 def page_request(task, kind, page, bk, index):
     if time.perf_counter() + 10 > task["work_deadline"]:
         raise TimeoutError("insufficient_page_and_cleanup_budget")
     directory = Path(task["output"])
     started = time.perf_counter()
-    page_task = {**task, "mode": "page", "kind": kind, "page": page, "bk": bk, "index": index,
-                 "params": parameters(kind, page, bk), "request_started": started,
-                 "request_deadline": started + 9}
+    page_task = _page_task(task, kind, page, bk, index, started, started + 9)
     result = run_probe_worker_process(page_task, 10000, bounded_cleanup_ms=1000,
-        hard_deadline_monotonic=started + 10, retain_streams=True,
+        hard_deadline_monotonic=started + 10, retain_streams=True, strict_utf8=True,
         worker_command=[sys.executable, "-m", "overnight_quant.scripts.run_concept_batch_worker"])
     write(directory / f"process-{index}.json", result)
     if not result.get("cleanup_complete"):
