@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import math
+import operator
 import os
 from pathlib import Path
 import re
@@ -22,20 +23,28 @@ from .point_in_time import stable_hash
 from .probe_worker_process import encode_bounded_worker_input, run_probe_worker_process
 from .s2_integration_contract import security_identity
 
-VERSION = "concept_batch_observation_v2"
+VERSION = "concept_batch_observation_v3"
+LEGACY_VERSION = "concept_batch_observation_v2"
 AUTH_VERSION = "concept_batch_authorization_v3"
 LAUNCH_VERSION = "concept_batch_launcher_v2"
 CONFIRM_VERSION = "concept_batch_outer_confirmation_v2"
 ENDPOINT = "https://push2.eastmoney.com/api/qt/clist/get"
 BUDGET = {"page_ms": 10000, "page_cleanup_ms": 1000,
           "batch_ms": 90000, "batch_cleanup_ms": 2000, "finish_reserve_ms": 3000}
-PLAN = {"list_fs": "m:90 t:3 f:!50", "members_fs": "b:{bk} f:!50",
-        "pages_per_kind": 3, "page_size": 100, "sort": "f12",
-        "selection": "lexicographically_smallest_valid_bk", "retry": False,
-        "max_response_bytes": 1048576, "proxy_policy": "system_and_environment",
-        "outer_contract": "powershell_launcher_v2",
-        "fields": "f2,f3,f6,f12,f13,f14,f104,f105,f124"}
+_PLAN_BASE = {"list_fs": "m:90 t:3 f:!50", "members_fs": "b:{bk} f:!50",
+              "pages_per_kind": 3, "page_size": 100,
+              "selection": "lexicographically_smallest_valid_bk", "retry": False,
+              "max_response_bytes": 1048576, "proxy_policy": "system_and_environment",
+              "outer_contract": "powershell_launcher_v2",
+              "fields": "f2,f3,f6,f12,f13,f14,f104,f105,f124"}
+PLAN = {**_PLAN_BASE, "order": {"request": {"fid": "f12", "po": "1"},
+                               "expected": {"list": "descending", "members": "descending"},
+                               "basis": {"list": "single_observed_list_page", "members": "pending_live_sample"}}}
 CONTRACT = stable_hash({"version": VERSION, "plan": PLAN, "budget": BUDGET})
+# Preserve the v2 fingerprint and its original local check for offline replay only.
+LEGACY_CONTRACT = stable_hash({"version": LEGACY_VERSION, "plan": {**_PLAN_BASE, "sort": "f12"}, "budget": BUDGET})
+_LEGACY_REPLAY_PLAN = {**_PLAN_BASE, "order": {"request": {"fid": "f12", "po": "1"},
+                                             "expected": {"list": "ascending", "members": "ascending"}}}
 STATE = Path(__file__).resolve().parents[1] / "data/cache/concept-batch-observation"
 AUTH_PURPOSE = "PERSONAL_INTERNAL_STRUCTURE_VALIDATION"
 MAX_APPROVAL_QUOTE_BYTES = 4096
@@ -58,14 +67,15 @@ def safe(**fields):
             "tickets": [], "orders": [], **fields}
 
 
-def parameters(kind, page, bk=None):
-    if kind not in ("list", "members") or type(page) is not int or not 1 <= page <= 3:
+def parameters(kind, page, bk=None, *, plan=PLAN):
+    if kind not in ("list", "members") or type(page) is not int or not 1 <= page <= plan["pages_per_kind"]:
         raise ValueError("invalid_page_identity")
     if kind == "members" and not re.fullmatch(r"BK\d{4,6}", bk or ""):
         raise ValueError("invalid_bk")
-    fs = PLAN["list_fs"] if kind == "list" else PLAN["members_fs"].format(bk=bk)
-    return {"pn": str(page), "pz": "100", "po": "1", "fltt": "2", "fid": "f12",
-            "fs": fs, "fields": PLAN["fields"]}
+    fs = plan["list_fs"] if kind == "list" else plan["members_fs"].format(bk=bk)
+    order = plan["order"]["request"]
+    return {"pn": str(page), "pz": str(plan["page_size"]), "po": order["po"], "fltt": "2",
+            "fid": order["fid"], "fs": fs, "fields": plan["fields"]}
 
 
 def _number(value):
@@ -78,7 +88,7 @@ def _number(value):
     return result if math.isfinite(result) else None
 
 
-def decode_page(body, kind, page, expected_total, seen):
+def decode_page(body, kind, page, expected_total, seen, *, previous_code=None, plan=PLAN):
     obj = json.loads(body)
     data = obj.get("data") if isinstance(obj, dict) else None
     if not isinstance(data, dict) or type(data.get("total")) is not int or data["total"] < 0:
@@ -90,11 +100,13 @@ def decode_page(body, kind, page, expected_total, seen):
         diff = list(diff.values())
     if not isinstance(diff, list) or any(not isinstance(row, dict) for row in diff):
         raise ValueError("invalid_rows")
-    required = max(0, min(100, total - (page - 1) * 100))
+    size = plan["page_size"]
+    required = max(0, min(size, total - (page - 1) * size))
     if page > 1 and required == 0:
         raise ValueError("unexpected_empty_page")
     if len(diff) != required:
         raise ValueError("page_incomplete_or_excess")
+    codes = []
     for row in diff:
         code = row.get("f12")
         pattern = r"BK\d{4,6}" if kind == "list" else r"\d{6}"
@@ -108,6 +120,12 @@ def decode_page(body, kind, page, expected_total, seen):
         if code in seen:
             raise ValueError("duplicate_native_identity")
         seen.add(code)
+        codes.append(code)
+    precedes = {"ascending": operator.lt, "descending": operator.gt}[plan["order"]["expected"][kind]]
+    if any(not precedes(left, right) for left, right in zip(codes, codes[1:])):
+        raise ValueError("page_order_drift")
+    if codes and previous_code is not None and not precedes(previous_code, codes[0]):
+        raise ValueError("page_boundary_order_drift")
     return total, diff
 
 
@@ -173,9 +191,9 @@ def read_authorization(path):
         raise ValueError("authorization_file_invalid_utf8") from None
 
 
-def _check_auth(auth, day, approved_sha, output, batch, *, stamp=None):
+def _check_auth(auth, day, approved_sha, output, batch, *, stamp=None, contract=CONTRACT):
     expected = {"schema_version": AUTH_VERSION, "status": "USER_APPROVED_LIMITED_EXPERIMENT",
-                "run_date": day, "approved_sha": approved_sha, "contract_hash": CONTRACT,
+                "run_date": day, "approved_sha": approved_sha, "contract_hash": contract,
                 "output": str(output), "batch_id": batch, "budget": BUDGET,
                 "purpose": AUTH_PURPOSE, "scope": AUTH_SCOPE}
     if not isinstance(auth, dict) or any(auth.get(k) != v for k, v in expected.items()):
@@ -391,12 +409,11 @@ def coordinate(task):
             for page in range(1, 4):
                 body = page_request(task, kind, page, bk, index)
                 index += 1
-                total, received = decode_page(body, kind, page, total, seen)
+                total, received = decode_page(body, kind, page, total, seen,
+                                              previous_code=rows[-1]["f12"] if rows else None)
                 rows.extend(received)
                 if kind == "members" and total > 300:
                     raise ValueError("member_page_limit_exceeded")
-                if [row["f12"] for row in rows] != sorted(row["f12"] for row in rows):
-                    raise ValueError("page_order_drift")
                 if len(rows) == total:
                     break
             if not rows:
@@ -444,10 +461,17 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
     if not re.fullmatch(r"[0-9a-f]{64}", confirmation_sha or "") or sha(confirmation_path) != confirmation_sha:
         raise ValueError("final_confirmation_anchor_mismatch")
     confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
+    contract = confirmation.get("contract_hash")
+    if contract == CONTRACT:
+        version, plan = VERSION, PLAN
+    elif contract == LEGACY_CONTRACT:
+        version, plan = LEGACY_VERSION, _LEGACY_REPLAY_PLAN
+    else:
+        raise ValueError("final_confirmation_invalid")
     start, checked, frequency = (confirmation.get(k) for k in
                                  ("launcher_started_ticks", "report_checked_ticks", "stopwatch_frequency"))
     if (confirmation.get("schema_version") != CONFIRM_VERSION or confirmation.get("status") != "EXECUTION_SUCCEEDED"
-            or confirmation.get("contract_hash") != CONTRACT or confirmation.get("output") != str(path)
+            or confirmation.get("output") != str(path)
             or confirmation.get("report_sha256") != report_sha
             or any(type(value) is not int for value in (start, checked, frequency))
             or start < 0 or frequency <= 0 or checked < start or checked - start >= 90 * frequency):
@@ -461,7 +485,7 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
     if not re.fullmatch(r"[0-9a-f]{64}", ticket_sha or "") or sha(ticket_path) != ticket_sha:
         raise ValueError("launcher_ticket_anchor_mismatch")
     ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
-    if (ticket.get("schema_version") != LAUNCH_VERSION or ticket.get("contract_hash") != CONTRACT
+    if (ticket.get("schema_version") != LAUNCH_VERSION or ticket.get("contract_hash") != contract
             or ticket.get("output") != str(path) or ticket.get("batch_id") != confirmation.get("batch_id")
             or ticket.get("launcher_started_ticks") != start or ticket.get("stopwatch_frequency") != frequency
             or type(ticket.get("launcher_pid")) is not int or ticket["launcher_pid"] <= 0
@@ -470,7 +494,8 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         raise ValueError("launcher_ticket_mismatch")
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
     if (report.get("status") != "EXECUTION_CANDIDATE" or report.get("candidate_status") != "PASSED"
-            or report.get("contract_hash") != CONTRACT or report.get("batch_id") != confirmation.get("batch_id")
+            or report.get("contract_hash") != contract or report.get("schema_version") != version
+            or report.get("batch_id") != confirmation.get("batch_id")
             or report.get("synthetic_test_only") is not confirmation.get("synthetic_test_only")
             or report.get("output") != str(path) or _number(report.get("total_elapsed_ms")) is None
             or not 0 <= report["total_elapsed_ms"] < 90000
@@ -501,7 +526,8 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         raise ValueError("batch_result_anchor_mismatch")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if (result.get("status") != "CAPTURE_COMPLETE" or result.get("batch_id") != receipt.get("batch_id")
-            or result.get("batch_id") != report.get("batch_id") or result.get("contract_hash") != CONTRACT
+            or result.get("batch_id") != report.get("batch_id") or result.get("contract_hash") != contract
+            or result.get("schema_version") != version
             or type(result.get("synthetic_test_only")) is not bool):
         raise ValueError("batch_identity_mismatch")
     count = result.get("requests_dispatched")
@@ -520,7 +546,7 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
     if sha(path / "intent.json") != result.get("intent_sha256"):
         raise ValueError("intent_anchor_mismatch")
     intent = json.loads((path / "intent.json").read_text(encoding="utf-8"))
-    if (intent.get("batch_id") != result["batch_id"] or intent.get("contract_hash") != CONTRACT
+    if (intent.get("batch_id") != result["batch_id"] or intent.get("contract_hash") != contract
             or intent.get("output") != str(path) or intent.get("day") != result.get("run_date")
             or intent.get("test_only") is not result["synthetic_test_only"]
             or receipt.get("synthetic_test_only") is not result["synthetic_test_only"]
@@ -536,7 +562,7 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         if not re.fullmatch(r"[0-9a-f]{64}", intent.get("authorization_sha") or ""):
             raise ValueError("authorization_anchor_missing")
         permission = _check_auth(auth, result["run_date"], intent["approved_sha"], path, result["batch_id"],
-                                 stamp=datetime.fromisoformat(intent["created_at"]))
+                                 stamp=datetime.fromisoformat(intent["created_at"]), contract=contract)
     permission_hash = stable_hash(permission)
     if any(stable_hash(item.get("experiment_permission")) != permission_hash for item in (result, receipt, report)):
         raise ValueError("experiment_permission_mismatch")
@@ -571,7 +597,7 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
         pages[kind] += 1
         bk = result["selected_bk"] if kind == "members" else None
         if (raw.get("batch_id") != result["batch_id"] or raw.get("index") != index
-                or raw.get("page") != pages[kind] or raw.get("params") != parameters(kind, pages[kind], bk)
+                or raw.get("page") != pages[kind] or raw.get("params") != parameters(kind, pages[kind], bk, plan=plan)
                 or raw.get("url") != ENDPOINT or raw.get("status") != 200 or raw.get("body_complete") is not True
                 or raw.get("synthetic_test_only") is not result["synthetic_test_only"]):
             raise ValueError("raw_contract_mismatch")
@@ -585,7 +611,8 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
                 or start > received or (not result["synthetic_test_only"] and received.date().isoformat() != result["run_date"])):
             raise ValueError("capture_time_invalid")
         if not result["synthetic_test_only"]:
-            _check_auth(auth, result["run_date"], intent["approved_sha"], path, result["batch_id"], stamp=start)
+            _check_auth(auth, result["run_date"], intent["approved_sha"], path, result["batch_id"],
+                        stamp=start, contract=contract)
         clocks = [raw.get(k) for k in ("dispatch_monotonic", "request_started_monotonic",
                                       "response_completed_monotonic", "raw_write_started_monotonic")]
         if (any(type(value) not in (int, float) or not math.isfinite(value) for value in clocks)
@@ -593,17 +620,16 @@ def load_batch(directory, report_path, report_sha, confirmation_sha):
                 or clocks[0] < intent_started or clocks[-1] > outer_checked):
             raise ValueError("page_timing_invalid")
         byte_count = raw.get("byte_count")
-        if type(byte_count) is not int or not 0 <= byte_count <= PLAN["max_response_bytes"]:
+        if type(byte_count) is not int or not 0 <= byte_count <= plan["max_response_bytes"]:
             raise ValueError("raw_byte_count_invalid")
         body = base64.b64decode(raw["body_base64"], validate=True)
-        if len(body) > PLAN["max_response_bytes"]:
+        if len(body) > plan["max_response_bytes"]:
             raise ValueError("raw_body_size_exceeded")
         if len(body) != byte_count or hashlib.sha256(body).hexdigest() != raw["raw_sha256"]:
             raise ValueError("raw_bytes_mismatch")
-        totals[kind], received = decode_page(body, kind, pages[kind], totals[kind], seen[kind])
+        totals[kind], received = decode_page(body, kind, pages[kind], totals[kind], seen[kind], plan=plan,
+                                            previous_code=rows[kind][-1]["f12"] if rows[kind] else None)
         rows[kind].extend(received)
-        if [row["f12"] for row in rows[kind]] != sorted(row["f12"] for row in rows[kind]):
-            raise ValueError("page_order_drift")
     if (not rows["list"] or totals["list"] is None
             or len(rows["list"]) != min(totals["list"], 300)
             or pages["list"] != (min(totals["list"], 300) + 99) // 100):

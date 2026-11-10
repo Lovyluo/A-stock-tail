@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $started = [Diagnostics.Stopwatch]::GetTimestamp()
 $frequency = [Diagnostics.Stopwatch]::Frequency
-$contract = 'ba4c6c1599e8648bae4f76bbfb1ecdab11e867804af27c95825b80914d67d6b8'
+$contract = '6cb0e62da380c9cafb7950ae554dded368b4a286cea3b7cfa8e6d6c1d4f66a26'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $state = if ($TestState) { [IO.Path]::GetFullPath($TestState) } else { [IO.Path]::GetFullPath((Join-Path $root 'overnight_quant\data\cache\concept-batch-observation')) }
 $outputPath = if ($Output) { [IO.Path]::GetFullPath($Output) } else { '' }
