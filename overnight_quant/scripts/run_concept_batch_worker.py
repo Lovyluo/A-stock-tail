@@ -12,8 +12,9 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from overnight_quant.data.concept_batch_observation import (
-    CONTRACT, ENDPOINT, PLAN, _check_auth, capture, coordinate, now, parameters, sha, write,
+    CONTRACT, ENDPOINT, PLAN, _check_auth, capture, coordinate, now, parameters, read_authorization, sha, write,
 )
+from overnight_quant.data.probe_worker_process import MAX_BOUNDED_WORKER_INPUT_BYTES, encode_bounded_worker_input
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -47,7 +48,7 @@ def page(task):
         authorization_path = task.get("authorization_path")
         if not authorization_path or sha(authorization_path) != intent.get("authorization_sha"):
             raise ValueError("authorization_anchor_mismatch")
-        auth = json.loads(Path(authorization_path).read_text(encoding="utf-8"))
+        auth = read_authorization(authorization_path)
         if auth != intent["authorization"]:
             raise ValueError("authorization_content_mismatch")
         permission = _check_auth(auth, task["day"], task["approved_sha"], directory.resolve(), task["batch_id"])
@@ -100,9 +101,24 @@ def page(task):
     return {"ok": True, "payload": {"raw_sha256": raw["raw_sha256"]}}
 
 
+def read_task():
+    wire = sys.stdin.buffer.read(MAX_BOUNDED_WORKER_INPUT_BYTES + 1)
+    if len(wire) > MAX_BOUNDED_WORKER_INPUT_BYTES:
+        raise ValueError("bounded_worker_input_exceeds_4096_bytes")
+    try:
+        task = json.loads(wire.decode("utf-8", "strict"))
+    except UnicodeDecodeError:
+        raise ValueError("bounded_worker_input_invalid_utf8") from None
+    if not isinstance(task, dict):
+        raise ValueError("worker_input_not_object")
+    # Reject escaped lone surrogates after JSON parsing as well as malformed bytes.
+    encode_bounded_worker_input(task)
+    return task
+
+
 def main():
     try:
-        task = json.loads(sys.stdin.read())
+        task = read_task()
         if task.get("contract_hash") != CONTRACT:
             raise ValueError("worker_contract_mismatch")
         if task.get("mode") == "capture":
@@ -116,7 +132,12 @@ def main():
             raise ValueError("worker_mode_invalid")
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
-    print(json.dumps(result, ensure_ascii=True))
+    try:
+        wire = json.dumps(result, ensure_ascii=False).encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        result = {"ok": False, "error": "worker_output_invalid_unicode"}
+        wire = json.dumps(result).encode("utf-8", "strict")
+    sys.stdout.buffer.write(wire + b"\n")
     return 0 if result["ok"] else 2
 
 
