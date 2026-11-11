@@ -255,6 +255,24 @@ def test_offline_transport_carries_limited_permission_through_replay(monkeypatch
     assert any("用途依据 UNKNOWN" in w.value and "不是上游授权或法律合规保证" in w.value for w in app.warning)
     assert not any(guard.business_attempts.values()) and len(calls) == 2
 
+    index = concept.write(tmp_path / "verified-index.json", {
+        "batch_id": permit["batch_id"], "capture_status": "PASSED",
+        "independent_verification": "VERIFIED_OFFLINE", "output_directory": str(target),
+        "returned_report": str(report_path), "report_sha256": concept.sha(report_path),
+        "confirmation_sha256": concept.sha(confirmation_path),
+    })
+    monkeypatch.setenv("CONCEPT_BATCH_VERIFIED_INDEXES", str(index))
+    app.run()
+    selector = next(x for x in app.selectbox if x.label == "已核验批次")
+    assert selector.value is None
+    selector.set_value(permit["batch_id"]).run()
+    next(x for x in app.button if x.label == "打开所选批次").click().run()
+    assert not app.exception and not app.error
+    assert any("来源返回的概念及成分" in x.value for x in app.markdown)
+    assert any("源数据时点未确认" in x.value for x in app.warning)
+    assert any("未计算上涨" in x.value for x in app.info)
+    assert any("未计算代表股" in x.value for x in app.info)
+
     report["experiment_permission"] = {**context, "source_use_basis": "AUTHORIZED"}
     report_path.write_text(json.dumps(report), encoding="utf-8")
     confirmation = json.loads(confirmation_path.read_bytes())
@@ -262,6 +280,11 @@ def test_offline_transport_carries_limited_permission_through_replay(monkeypatch
     confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
     with pytest.raises(ValueError, match="returned_report_receipt_mismatch"):
         load(tmp_path, target)
+    # A previously verified index is not an approval to skip verification on open.
+    next(x for x in app.button if x.label == "打开所选批次").click().run()
+    assert any("returned_report_anchor_mismatch" in x.value for x in app.error)
+    assert any("尚未选择有效批次" in x.value for x in app.info)
+    assert not any(guard.business_attempts.values()) and len(calls) == 2
 
 
 def test_default_zero_network_and_missing_parameters(tmp_path):
