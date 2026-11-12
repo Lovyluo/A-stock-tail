@@ -8,7 +8,8 @@ from overnight_quant.data.offline_price_observation import (
     compare, evaluate, make_rule, normalize_pool,
 )
 from overnight_quant.data.point_in_time import stable_hash
-from overnight_quant.data.quote_observation_refresh import evaluate_current, utc_now
+from overnight_quant.data.quote_observation_refresh import IDENTITIES, evaluate_current, utc_now
+from overnight_quant.ui.concept_observation_handoff import HANDOFF, render_pending
 from overnight_quant.ui.quote_observation_refresh import render_refresh
 
 DEFAULT_STORE = Path(__file__).resolve().parents[1] / "data" / "cache" / "offline_observation"
@@ -21,7 +22,7 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     h2 {font-size: 1.35rem; letter-spacing: 0;}
     [data-testid="stCaptionContainer"] {overflow-wrap: anywhere;}
     </style>""", unsafe_allow_html=True)
-    st.title("尾盘观察工作台")
+    st.title("自选观察工作台")
     st.warning("观察工作台：满足条件不等于买入、卖出或确认突破；风险及可交易性未评估。")
     active = st.radio("观察方式", ["历史快照", "主动刷新观察"], horizontal=True,
                       key="observation_mode") == "主动刷新观察"
@@ -82,6 +83,20 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
             st.session_state[state_key] = {key: revisions[chosen_revision][key] for key in ("pool", "rules", "tracking")}
             st.rerun()
 
+    if active:
+        st.session_state.pop(HANDOFF, None)
+    else:
+        handoff_state = render_pending(st, store, state, revisions)
+        pending = st.session_state.get(HANDOFF)
+        if handoff_state is not None:
+            st.session_state[state_key] = handoff_state
+            st.session_state[prefix + "_identity"] = pending["identity"]
+            if pending["identity"] in handoff_state["tracking"]:
+                st.session_state[prefix + "_tracked_identity"] = pending["identity"]
+            st.rerun()
+        if pending and not pending.get("saved_revision"):
+            return
+
     attempt = None
     if active:
         try:
@@ -121,7 +136,8 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
                       "原生事件时间": row.get("event_time", "缺失"),
                       "实际获取时间": row.get("observed_at", "缺失"), "实际可用时间": row.get("available_at", "缺失"),
                       "历史批次": selected or "未选择", "风险状态": "NOT_ASSESSED",
-                      "缺失/拒绝原因": result["reason"] or "无；仅历史价格比较"})
+                      "缺失/拒绝原因": ("尚未接入报价" if identity not in IDENTITIES and not row else
+                                        result["reason"] or "无；仅历史价格比较")})
         if active:
             table[-1].update({"所选快照价格（失败时仅历史）": row.get("price", "缺失"),
                               "报价年龄（秒）": result["quote_age_seconds"],
@@ -131,6 +147,8 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
 
     st.subheader("绝对价格观察条件")
     identity = st.selectbox("设置条件的证券", state["pool"], key=prefix + "_identity")
+    if identity not in IDENTITIES and not (snapshot and identity in snapshot["rows"]):
+        st.info(f"{identity} 尚未接入报价。")
     current_rule = state["rules"].get(identity, make_rule(identity))
     rule_key = prefix + identity + current_rule["rule_version"]
     with st.form(rule_key):
@@ -159,6 +177,8 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
             updated = {**state, "tracking": sorted(tracking)}
             store.save_settings(**updated)
             st.session_state[state_key] = updated
+            if identity in tracking and (st.session_state.get(HANDOFF) or {}).get("identity") == identity:
+                st.session_state[prefix + "_tracked_identity"] = identity
             st.rerun()
         except (ValueError, OSError) as exc:
             st.error(f"跟踪保存失败：{exc}")
@@ -197,7 +217,8 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
             changes.append({"快照": label, "证券": tracked, "历史批次": item["batch_id"],
                             "价格": item["conditions"]["upper"]["comparison_price"],
                             "上沿": item["conditions"]["upper"]["label"], "下沿": item["conditions"]["lower"]["label"],
-                            "条件版本": item["rule_version"], "原生事件时间": item["quote"]["event_time"],
+                            "条件版本": item["rule_version"], "来源": item["quote"]["source_version"],
+                            "原生事件时间": item["quote"]["event_time"],
                             "实际获取时间": item["quote"]["observed_at"], "证据SHA": item["evidence_sha256"],
                             "原响应hash": item["quote"]["raw_hash"]})
         st.dataframe(changes, use_container_width=True, hide_index=True)

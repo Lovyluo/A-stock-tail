@@ -31,21 +31,19 @@ def _catalog():
     return {key: entries[key] for key in sorted(entries) if key not in ambiguous}, invalid + len(ambiguous)
 
 
+def require_catalog_selection(inputs, catalog_id):
+    if catalog_id is not None and _catalog()[0].get(catalog_id) != inputs:
+        raise ValueError("catalog_batch_anchor_changed")
+
+
 def _open(st, inputs, *, expected_id=None):
-    st.session_state.pop("concept_batch_selected", None)
-    try:
-        result = load_batch(*inputs)
-        if expected_id is not None and (result["batch_id"] != expected_id or result["synthetic_test_only"]):
-            raise ValueError("catalog_batch_identity_mismatch")
-        st.session_state["concept_batch_selected"] = {
-            "result": result, "directory": inputs[0], "report": inputs[1],
-        }
-    except Exception as exc:
-        st.error(f"批次不可用：{type(exc).__name__}: {exc}")
+    st.session_state["concept_batch_selected"] = {"inputs": inputs, "catalog_id": expected_id}
 
 
 def render(st):
     st.title("概念与成分 · 捕获批次观察")
+    if error := st.session_state.pop("concept_handoff_error", None):
+        st.error("批次重新核验失败：" + error)
     st.warning("离线查看指定批次；源数据时点未确认，不代表实时行情、当前强势、最终收盘或买卖建议。")
     st.caption("风险和可交易性未评估。")
     catalog, invalid = _catalog()
@@ -63,16 +61,30 @@ def render(st):
         report = st.text_input("命令返回报告文件", key="concept_batch_report")
         anchor = st.text_input("返回报告外部 SHA-256", key="concept_batch_anchor")
         confirmation = st.text_input("最终确认外部 SHA-256", key="concept_batch_confirmation")
+        manual_inputs = (directory, report, anchor, confirmation)
         if st.button("打开指定批次"):
-            _open(st, (directory, report, anchor, confirmation))
+            _open(st, manual_inputs)
         selected = st.session_state.get("concept_batch_selected")
+        if selected and ("catalog_id" not in selected or
+                         (selected["catalog_id"] is None and selected["inputs"] != manual_inputs)):
+            st.session_state.pop("concept_batch_selected")
+            selected = None
         if selected:
-            st.caption(f"已载入：{selected['directory']}；返回报告：{selected['report']}")
-    selected = st.session_state.get("concept_batch_selected")
+            st.caption(f"所选材料：{selected['inputs'][0]}；返回报告：{selected['inputs'][1]}")
     if not selected:
         st.info("尚未选择有效批次。")
         return
-    result = selected["result"]
+    try:
+        require_catalog_selection(selected["inputs"], selected["catalog_id"])
+        result = load_batch(*selected["inputs"])
+        if selected["catalog_id"] is not None and (result["batch_id"] != selected["catalog_id"]
+                                                   or result["synthetic_test_only"]):
+            raise ValueError("catalog_batch_identity_mismatch")
+    except Exception as exc:
+        st.session_state.pop("concept_batch_selected", None)
+        st.error(f"批次不可用：{type(exc).__name__}: {exc}")
+        st.info("尚未选择有效批次。")
+        return
     synthetic = result["synthetic_test_only"]
     if synthetic:
         st.warning("测试数据 · synthetic_test_only；不是实际行情。")
@@ -93,8 +105,8 @@ def render(st):
 
     st.subheader("固定结构验证样本与成分")
     selection_scope = "降序分页所得有限集合" if result["schema_version"] == VERSION else "v2 原批次覆盖集合"
-    name = result["selected_name"] or "名称未确认"
-    st.write(f"{result['selected_bk']} · {name}｜固定结构验证样本："
+    st.text(result["selected_name"] or "名称未确认")
+    st.write(f"{result['selected_bk']}｜固定结构验证样本："
              f"{selection_scope}内代码字典序最小，不代表全市场代码最小，非强势候选")
     if synthetic:
         st.caption("概念和成分归属仅为测试设定。")
@@ -103,6 +115,9 @@ def render(st):
         st.caption("东方财富页面确认概念分类；本批成分请求绑定所选 BK。仅反映来源归类，不代表客观或唯一题材归属。")
     else:
         st.info("归属依据不足：只展示原值，不确认概念归属。")
+
+    from overnight_quant.ui.concept_observation_handoff import render_selection
+    render_selection(st, {**selected, "result": result})
 
     st.markdown("**批次成分分布**")
     counts = summary["counts"]
