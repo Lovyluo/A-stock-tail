@@ -14,14 +14,13 @@ import urllib.request
 
 def execute(task, *, network_attempts=None):
     from overnight_quant.data.quote_observation_refresh import (
-        CODES, HTTP_SECONDS, NETWORK_SWITCH, VERSION, decode_response, utc_now,
+        HTTP_SECONDS, NETWORK_SWITCH, SELECTION_VERSION, decode_response, refresh_request_codes, utc_now,
     )
     from overnight_quant.data.offline_price_observation import _json, write_once
     from overnight_quant.data.tencent_direct_http_providers import (
         TENCENT_SOURCE_VERSION, TencentDirectHttpProviders, TencentHttpResponse, build_tencent_request_url,
     )
-    if task.get("contract") != VERSION or task.get("codes") != list(CODES):
-        raise ValueError("worker_contract_invalid")
+    codes = refresh_request_codes(task)
     test_only = task.get("synthetic_test_only")
     if type(test_only) is not bool or (not test_only and os.environ.get(NETWORK_SWITCH) != "1"):
         raise ValueError("worker_network_not_enabled")
@@ -30,6 +29,8 @@ def execute(task, *, network_attempts=None):
     attempts = network_attempts if network_attempts is not None else []
     target = Path(task["output"])
     fixture = _json(Path(task["fixture"]).read_bytes()) if test_only else None
+    if test_only and (not isinstance(fixture, dict) or not fixture):
+        raise ValueError("worker_fixture_invalid")
     envelope = None
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -42,9 +43,9 @@ def execute(task, *, network_attempts=None):
         def request(self, method, url, *, headers, timeout_seconds):
             nonlocal envelope
             self.count += 1
-            if self.count != 1 or url != build_tencent_request_url(CODES) or method != "GET":
+            if self.count != 1 or url != build_tencent_request_url(codes) or method != "GET":
                 raise ValueError("single_quote_request_only")
-            if fixture:
+            if test_only:
                 time.sleep(fixture.get("delay_seconds", 0))
                 if fixture.get("error"):
                     raise OSError(fixture["error"])
@@ -60,13 +61,15 @@ def execute(task, *, network_attempts=None):
                     raw = response.read(262145)
                     status, response_url = response.status, response.geturl()
             completed = utc_now().isoformat()
-            envelope = dict(contract=VERSION, batch_id=task["batch_id"], codes=list(CODES),
+            envelope = dict(contract=task["contract"], batch_id=task["batch_id"], codes=list(codes),
                 source_version=TENCENT_SOURCE_VERSION,
                 response_complete=len(raw) <= 262144,
                 synthetic_test_only=test_only, request_started_at=request_started,
                 response_completed_at=completed, completed_at=completed,
                 request_url=url, response_url=response_url, http_status=status, request_count=self.count,
                 raw_base64=base64.b64encode(raw).decode("ascii"), raw_sha256=hashlib.sha256(raw).hexdigest())
+            if task["contract"] == SELECTION_VERSION:
+                envelope["selection"] = task["selection"]
             # Retain even an invalid response before Provider/Adapter validation.
             write_once(target / "response-received.json", envelope)
             if len(raw) > 262144:
@@ -75,7 +78,7 @@ def execute(task, *, network_attempts=None):
 
     transport = Transport()
     request_started = utc_now().isoformat()
-    provider = TencentDirectHttpProviders(CODES, transport=transport, clock=utc_now, timeout_seconds=HTTP_SECONDS)
+    provider = TencentDirectHttpProviders(codes, transport=transport, clock=utc_now, timeout_seconds=HTTP_SECONDS)
     provider.collect_quote_records()
     envelope["completed_at"] = utc_now().isoformat()
     decode_response(envelope)

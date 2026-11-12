@@ -298,28 +298,36 @@ class ObservationStore:
         return result
 
     def save_refresh(self, envelope):
-        from overnight_quant.data.quote_observation_refresh import VERSION as contract, decode_response
+        from overnight_quant.data.quote_observation_refresh import decode_response
         snapshot = decode_response(envelope)
         if snapshot["scope"] != self.scope:
             raise ValueError("refresh_scope_mismatch")
-        path = self.root / contract / "snapshots" / (stable_hash(snapshot["batch_id"]) + ".json")
+        path = self.root / snapshot["observation_contract"] / "snapshots" / (stable_hash(snapshot["batch_id"]) + ".json")
         body = {"response": envelope, "sha256": stable_hash(envelope)}
         write_once(path, body)
         return snapshot
 
     def refresh_snapshots(self):
         from overnight_quant.data.quote_observation_refresh import (
-            VERSION as contract, committed_refresh_outcome, decode_response,
+            REFRESH_CONTRACTS, committed_refresh_outcome, decode_response,
         )
         result = []
-        for path in sorted((self.root / contract / "snapshots").glob("*.json")):
-            body = _json(path.read_bytes())
-            if stable_hash(body["response"]) != body["sha256"]:
-                raise ValueError("refresh_stored_sha_mismatch")
-            snapshot = decode_response(body["response"])
-            if snapshot["scope"] != self.scope or path.stem != stable_hash(snapshot["batch_id"]):
-                raise ValueError("refresh_stored_identity_mismatch")
-            if committed_refresh_outcome(self.root, snapshot["batch_id"], body["sha256"])["status"] != "SUCCEEDED":
-                continue
-            result.append(snapshot)
+        seen = set()
+        contracts = REFRESH_CONTRACTS if self.scope == "synthetic_test_only" else REFRESH_CONTRACTS[:1]
+        for contract in contracts:
+            for path in sorted((self.root / contract / "snapshots").glob("*.json")):
+                body = _json(path.read_bytes())
+                if stable_hash(body["response"]) != body["sha256"]:
+                    raise ValueError("refresh_stored_sha_mismatch")
+                snapshot = decode_response(body["response"])
+                batch = snapshot["batch_id"]
+                if (snapshot["scope"] != self.scope or snapshot["observation_contract"] != contract
+                        or path.stem != stable_hash(batch)):
+                    raise ValueError("refresh_stored_identity_mismatch")
+                if committed_refresh_outcome(self.root, batch, body["sha256"], contract=contract)["status"] != "SUCCEEDED":
+                    continue
+                if batch in seen:
+                    raise ValueError("refresh_duplicate_batch_identity")
+                seen.add(batch)
+                result.append(snapshot)
         return result
