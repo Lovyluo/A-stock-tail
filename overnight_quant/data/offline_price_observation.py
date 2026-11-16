@@ -20,6 +20,7 @@ VERSION = "offline_price_observation_v1"
 TEST_SCHEMA = "offline_price_snapshot_test_v1"
 PRICE_BASIS = "UNADJUSTED_QUOTE_CNY_PER_SHARE"
 SCOPES = ("historical", "synthetic_test_only")
+DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "offline_observation"
 INITIAL_POOL = ("000001", "000333", "600000", "600519", "601318")
 STATES = {"UNSET": "未设置", "MET": "满足", "NOT_MET": "不满足", "INSUFFICIENT": "数据不足"}
 
@@ -221,6 +222,10 @@ def compare(first, second, identity, rule_first, rule_second, *, now=None):
         return result
     if (first["scope"], first["source_version"]) != (second["scope"], second["source_version"]):
         return result
+    if any("permit_sha256" in snapshot for snapshot in (first, second)):
+        if (not first.get("permit_sha256") or first["permit_sha256"] != second.get("permit_sha256")
+                or first.get("selection") != second.get("selection")):
+            return result
     if left["reason"] or right["reason"]:
         return result
     if _time(left["quote"]["available_at"]) > _time(right["quote"]["event_time"]):
@@ -307,14 +312,16 @@ class ObservationStore:
         write_once(path, body)
         return snapshot
 
-    def refresh_snapshots(self):
+    def refresh_snapshots(self, *, contracts=None):
         from overnight_quant.data.quote_observation_refresh import (
-            REFRESH_CONTRACTS, committed_refresh_outcome, decode_response,
+            LIMITED_VERSION, REFRESH_CONTRACTS, VERSION as LEGACY_VERSION, committed_refresh_outcome, decode_response,
         )
         result = []
         seen = set()
-        contracts = REFRESH_CONTRACTS if self.scope == "synthetic_test_only" else REFRESH_CONTRACTS[:1]
-        for contract in contracts:
+        allowed = REFRESH_CONTRACTS if self.scope == "synthetic_test_only" else (LEGACY_VERSION, LIMITED_VERSION)
+        if contracts is not None and not set(contracts) <= set(allowed):
+            raise ValueError("refresh_contract_scope_invalid")
+        for contract in allowed if contracts is None else contracts:
             for path in sorted((self.root / contract / "snapshots").glob("*.json")):
                 body = _json(path.read_bytes())
                 if stable_hash(body["response"]) != body["sha256"]:

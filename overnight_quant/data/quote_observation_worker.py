@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import urllib.error
@@ -13,21 +14,39 @@ import urllib.request
 
 
 def execute(task, *, network_attempts=None):
+    from overnight_quant.data import quote_observation_permit as limited
     from overnight_quant.data.quote_observation_refresh import (
-        HTTP_SECONDS, NETWORK_SWITCH, SELECTION_VERSION, decode_response, refresh_request_codes, utc_now,
+        HTTP_SECONDS, NETWORK_SWITCH, PERMIT_FIELDS, SELECTED_CONTRACTS, decode_response, refresh_request_codes, utc_now,
     )
-    from overnight_quant.data.offline_price_observation import _json, write_once
+    from overnight_quant.data.offline_price_observation import DEFAULT_STORE, ObservationStore, _json, write_once
     from overnight_quant.data.tencent_direct_http_providers import (
         TENCENT_SOURCE_VERSION, TencentDirectHttpProviders, TencentHttpResponse, build_tencent_request_url,
     )
     codes = refresh_request_codes(task)
     test_only = task.get("synthetic_test_only")
-    if type(test_only) is not bool or (not test_only and os.environ.get(NETWORK_SWITCH) != "1"):
+    is_limited = task["contract"] == limited.LIMITED_VERSION
+    switch = limited.LIMITED_SWITCH if is_limited else NETWORK_SWITCH
+    if type(test_only) is not bool or (not test_only and os.environ.get(switch) != "1"):
         raise ValueError("worker_network_not_enabled")
     if test_only != bool(task.get("fixture")):
         raise ValueError("worker_scope_invalid")
     attempts = network_attempts if network_attempts is not None else []
     target = Path(task["output"])
+    if is_limited:
+        batch = task["batch_id"]
+        if not isinstance(batch, str) or not re.fullmatch(r"[a-f0-9]{32}", batch):
+            raise ValueError("limited_batch_invalid")
+        target = target.resolve()
+        root = target.parents[2]
+        scope = "synthetic_test_only" if test_only else "historical"
+        if (target != root / limited.LIMITED_VERSION / "attempts" / batch or root.name != scope
+                or (not test_only and root != ObservationStore(DEFAULT_STORE, scope).root.resolve())):
+            raise ValueError("limited_worker_storage_invalid")
+        intent = _json((target / "intent.json").read_bytes())
+        if intent != {key: value for key, value in task.items() if key not in {"fixture", "output"}}:
+            raise ValueError("limited_worker_intent_mismatch")
+        limited.check_dispatch(root, intent, utc_now(), check_code=True)
+        write_once(target / "worker-claimed.json", intent)
     fixture = _json(Path(task["fixture"]).read_bytes()) if test_only else None
     if test_only and (not isinstance(fixture, dict) or not fixture):
         raise ValueError("worker_fixture_invalid")
@@ -45,6 +64,9 @@ def execute(task, *, network_attempts=None):
             self.count += 1
             if self.count != 1 or url != build_tencent_request_url(codes) or method != "GET":
                 raise ValueError("single_quote_request_only")
+            if is_limited:
+                limited.check_dispatch(root, intent, request_stamp)
+                limited.check_dispatch(root, intent, utc_now())
             if test_only:
                 time.sleep(fixture.get("delay_seconds", 0))
                 if fixture.get("error"):
@@ -68,8 +90,10 @@ def execute(task, *, network_attempts=None):
                 response_completed_at=completed, completed_at=completed,
                 request_url=url, response_url=response_url, http_status=status, request_count=self.count,
                 raw_base64=base64.b64encode(raw).decode("ascii"), raw_sha256=hashlib.sha256(raw).hexdigest())
-            if task["contract"] == SELECTION_VERSION:
+            if task["contract"] in SELECTED_CONTRACTS:
                 envelope["selection"] = task["selection"]
+            if is_limited:
+                envelope.update({key: task[key] for key in PERMIT_FIELDS})
             # Retain even an invalid response before Provider/Adapter validation.
             write_once(target / "response-received.json", envelope)
             if len(raw) > 262144:
@@ -77,7 +101,8 @@ def execute(task, *, network_attempts=None):
             return TencentHttpResponse(raw, status, response_url)
 
     transport = Transport()
-    request_started = utc_now().isoformat()
+    request_stamp = utc_now()
+    request_started = request_stamp.isoformat()
     provider = TencentDirectHttpProviders(codes, transport=transport, clock=utc_now, timeout_seconds=HTTP_SECONDS)
     provider.collect_quote_records()
     envelope["completed_at"] = utc_now().isoformat()
