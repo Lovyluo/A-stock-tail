@@ -8,7 +8,7 @@ from overnight_quant.data.offline_price_observation import (
     compare, evaluate, make_rule, normalize_pool,
 )
 from overnight_quant.data.point_in_time import stable_hash
-from overnight_quant.data.quote_observation_refresh import IDENTITIES, evaluate_current, utc_now
+from overnight_quant.data.quote_observation_refresh import IDENTITIES, SELECTION_VERSION, evaluate_current, utc_now
 from overnight_quant.ui.concept_observation_handoff import HANDOFF, render_pending
 from overnight_quant.ui.quote_observation_refresh import render_refresh
 
@@ -121,12 +121,21 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     st.subheader("价格与条件状态")
     state_filter = st.selectbox("条件状态筛选", ["全部", *STATES.values()], key=prefix + "_filter")
     results, table = {}, []
+    refresh_contract = (attempt or {}).get("contract", SELECTION_VERSION)
+    selected_refresh = active and refresh_contract == SELECTION_VERSION
+    current_batch = (snapshot and (attempt or {}).get("status") == "SUCCEEDED"
+                     and attempt.get("batch_id") == snapshot["batch_id"]
+                     and snapshot.get("observation_contract") == refresh_contract
+                     and snapshot.get("selection") == attempt.get("selection"))
     for identity in state["pool"]:
         rule = state["rules"].get(identity, make_rule(identity))
-        result = (evaluate_current(snapshot, identity, rule, now=(clock or utc_now)(), attempt=attempt)
+        result = (evaluate_current(snapshot, identity, rule, now=(clock or utc_now)(), attempt=attempt,
+                                   contract=refresh_contract)
                   if active else evaluate(snapshot, identity, rule))
         results[identity] = result
         row = snapshot["rows"].get(identity, {}) if snapshot else {}
+        if selected_refresh and (not current_batch or identity not in attempt.get("selection", [])):
+            row = {}
         if state_filter != "全部" and not any(STATES[value["state"]] == state_filter for value in result["conditions"].values()):
             continue
         table.append({"证券身份": identity, "比较价格": result["conditions"]["upper"]["comparison_price"] or "缺失/不可用",
@@ -136,10 +145,11 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
                       "原生事件时间": row.get("event_time", "缺失"),
                       "实际获取时间": row.get("observed_at", "缺失"), "实际可用时间": row.get("available_at", "缺失"),
                       "历史批次": selected or "未选择", "风险状态": "NOT_ASSESSED",
-                      "缺失/拒绝原因": ("尚未接入报价" if identity not in IDENTITIES and not row else
+                      "缺失/拒绝原因": ("尚未接入报价" if not selected_refresh and identity not in IDENTITIES and not row else
                                         result["reason"] or "无；仅历史价格比较")})
         if active:
-            table[-1].update({"所选快照价格（失败时仅历史）": row.get("price", "缺失"),
+            quote_column = "本次报价" if selected_refresh else "所选快照价格（失败时仅历史）"
+            table[-1].update({quote_column: row.get("price", "未获取"),
                               "报价年龄（秒）": result["quote_age_seconds"],
                               "年龄状态": result["age_status"],
                               "请求状态": (attempt or {}).get("status", "尚未刷新")})
@@ -147,7 +157,7 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
 
     st.subheader("绝对价格观察条件")
     identity = st.selectbox("设置条件的证券", state["pool"], key=prefix + "_identity")
-    if identity not in IDENTITIES and not (snapshot and identity in snapshot["rows"]):
+    if not selected_refresh and identity not in IDENTITIES and not (snapshot and identity in snapshot["rows"]):
         st.info(f"{identity} 尚未接入报价。")
     current_rule = state["rules"].get(identity, make_rule(identity))
     rule_key = prefix + identity + current_rule["rule_version"]
