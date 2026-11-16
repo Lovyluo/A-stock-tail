@@ -4,18 +4,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from overnight_quant.data.offline_price_observation import (
-    INITIAL_POOL, SCOPES, STATES, ObservationStore,
+    DEFAULT_STORE, INITIAL_POOL, SCOPES, STATES, ObservationStore,
     compare, evaluate, make_rule, normalize_pool,
 )
 from overnight_quant.data.point_in_time import stable_hash
-from overnight_quant.data.quote_observation_refresh import IDENTITIES, SELECTION_VERSION, evaluate_current, utc_now
+from overnight_quant.data.quote_observation_refresh import (
+    IDENTITIES, LIMITED_VERSION, SELECTED_CONTRACTS, SELECTION_VERSION, evaluate_current, utc_now,
+)
 from overnight_quant.ui.concept_observation_handoff import HANDOFF, render_pending
 from overnight_quant.ui.quote_observation_refresh import render_refresh
 
-DEFAULT_STORE = Path(__file__).resolve().parents[1] / "data" / "cache" / "offline_observation"
-
-
-def render_offline_observation(st, *, storage_root=None, refresh_controller=None, clock=None):
+def render_offline_observation(st, *, storage_root: str | Path | None = None, refresh_controller=None, clock=None):
     st.markdown("""<style>
     .stMainBlockContainer {max-width: 1400px; padding-top: 4rem;}
     h1 {font-size: 2rem; letter-spacing: 0;}
@@ -24,8 +23,10 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     </style>""", unsafe_allow_html=True)
     st.title("自选观察工作台")
     st.warning("观察工作台：满足条件不等于买入、卖出或确认突破；风险及可交易性未评估。")
-    active = st.radio("观察方式", ["历史快照", "主动刷新观察"], horizontal=True,
-                      key="observation_mode") == "主动刷新观察"
+    mode = st.radio("观察方式", ["历史快照", "主动刷新观察", "有限真实观察"], horizontal=True,
+                    key="observation_mode")
+    active = mode != "历史快照"
+    live = mode == "有限真实观察"
     if not active:
         st.caption("历史/离线观察，实时更新尚未接通。历史结果不表示当前触发。")
     scope_label = st.radio("材料空间", ["真实历史材料", "测试材料 · test-only"], horizontal=True,
@@ -34,7 +35,7 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     if scope == SCOPES[1]:
         st.info("synthetic_test_only：以下价格、条件及变化仅为测试，不是实际行情。")
     settings_prefix = "offline_" + scope
-    prefix = settings_prefix + ("_manual_quote" if active else "")
+    prefix = settings_prefix + ("_limited_quote" if live else "_manual_quote" if active else "")
     store = ObservationStore(storage_root or DEFAULT_STORE, scope)
     state_key = settings_prefix + "_state"
     if state_key not in st.session_state:
@@ -100,7 +101,11 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     attempt = None
     if active:
         try:
-            snapshots, attempt = render_refresh(st, store, state, prefix, controller=refresh_controller)
+            if live:
+                snapshots, attempt = render_refresh(st, store, state, prefix, controller=refresh_controller,
+                                                    contract=LIMITED_VERSION)
+            else:
+                snapshots, attempt = render_refresh(st, store, state, prefix, controller=refresh_controller)
         except (ValueError, OSError, KeyError, TypeError) as exc:
             st.error(f"刷新存储拒绝：{exc}")
             return
@@ -121,8 +126,8 @@ def render_offline_observation(st, *, storage_root=None, refresh_controller=None
     st.subheader("价格与条件状态")
     state_filter = st.selectbox("条件状态筛选", ["全部", *STATES.values()], key=prefix + "_filter")
     results, table = {}, []
-    refresh_contract = (attempt or {}).get("contract", SELECTION_VERSION)
-    selected_refresh = active and refresh_contract == SELECTION_VERSION
+    refresh_contract = (attempt or {}).get("contract", LIMITED_VERSION if live else SELECTION_VERSION)
+    selected_refresh = active and refresh_contract in SELECTED_CONTRACTS
     current_batch = (snapshot and (attempt or {}).get("status") == "SUCCEEDED"
                      and attempt.get("batch_id") == snapshot["batch_id"]
                      and snapshot.get("observation_contract") == refresh_contract

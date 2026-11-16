@@ -16,6 +16,7 @@ import re
 from overnight_quant.data import offline_price_observation as observation
 from overnight_quant.data.point_in_time import stable_hash
 from overnight_quant.data.probe_worker_process import run_probe_worker_process
+from overnight_quant.data import quote_observation_permit as limited
 from overnight_quant.data.source_capability_adapters import (
     SOURCE_ADAPTER_BOUND, SourceProviderEnvelope, execute_source_adapter,
 )
@@ -27,7 +28,10 @@ from overnight_quant.data.tencent_direct_http_providers import (
 
 VERSION = "manual_quote_observation_v1"
 SELECTION_VERSION = "manual_quote_selection_v2"
-REFRESH_CONTRACTS = (VERSION, SELECTION_VERSION)
+LIMITED_VERSION = limited.LIMITED_VERSION
+SELECTED_CONTRACTS = (SELECTION_VERSION, LIMITED_VERSION)
+REFRESH_CONTRACTS = (VERSION, *SELECTED_CONTRACTS)
+PERMIT_FIELDS = ("permit_id", "permit_sha256", "permit_slot", "approved_sha")
 CODES = observation.INITIAL_POOL
 IDENTITIES = frozenset(observation.normalize_pool(CODES))
 NETWORK_SWITCH = "OBSERVATION_QUOTE_NETWORK_ENABLED"
@@ -69,8 +73,8 @@ def refresh_request_codes(material):
     contract = material.get("contract")
     if contract == VERSION and tuple(material.get("codes", [])) == CODES:
         return CODES
-    if contract == SELECTION_VERSION:
-        if material.get("synthetic_test_only") is not True:
+    if contract in SELECTED_CONTRACTS:
+        if contract == SELECTION_VERSION and material.get("synthetic_test_only") is not True:
             raise ValueError("quote_selection_test_only")
         selection = normalize_selection(material.get("selection"))
         codes = sorted(identity.split(":")[1] for identity in selection)
@@ -82,8 +86,20 @@ def refresh_request_codes(material):
 def _verify_selection_binding(envelope, intent):
     if (refresh_request_codes(envelope) != refresh_request_codes(intent)
             or any(envelope.get(key) != intent.get(key)
-                   for key in ("contract", "batch_id", "synthetic_test_only", "selection"))):
+                   for key in ("contract", "batch_id", "synthetic_test_only", "selection", *PERMIT_FIELDS))):
         raise ValueError("quote_selection_intent_mismatch")
+
+
+def _verify_limited_response(root, target, envelope, intent):
+    permit = limited.verify_reservation(root, intent)
+    claim = observation._json((target / "worker-claimed.json").read_bytes())
+    raw_bytes = (target / "response-received.json").read_bytes()
+    original = observation._json(raw_bytes)
+    if (claim != intent or original != {**envelope, "completed_at": envelope["response_completed_at"]}
+            or observation._time(intent["created_at"]) > observation._time(envelope["request_started_at"])):
+        raise ValueError("limited_raw_or_dispatch_binding_invalid")
+    limited._check_window(permit, observation._time(envelope["request_started_at"]))
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
 def _duration_ms(start, end):
@@ -124,7 +140,7 @@ def _execution_candidate(root, batch, response_sha256, contract=VERSION):
     stored = observation._json((Path(root) / contract / "snapshots" / (stable_hash(batch) + ".json")).read_bytes())
     if stored.get("sha256") != response_sha256 or stable_hash(stored.get("response")) != response_sha256:
         raise ValueError("sealed_observation_data_mismatch")
-    if contract == SELECTION_VERSION:
+    if contract in SELECTED_CONTRACTS:
         intent = observation._json((directory / "intent.json").read_bytes())
         dispatched = observation._json((Path(root) / VERSION / "control" / f"attempt-{batch}.json").read_bytes())
         response = observation._json((directory / "response.json").read_bytes())
@@ -134,6 +150,11 @@ def _execution_candidate(root, batch, response_sha256, contract=VERSION):
                 or final.get("selection") != intent.get("selection")):
             raise ValueError("sealed_selection_binding_invalid")
         _verify_selection_binding(response, intent)
+        if contract == LIMITED_VERSION and (
+                final.get("permit_sha256") != intent["permit_sha256"]
+                or commit.get("original_response_file_sha256")
+                != _verify_limited_response(root, directory, response, intent)):
+            raise ValueError("limited_sealed_binding_invalid")
     return final, commit, hashlib.sha256(commit_bytes).hexdigest()
 
 
@@ -246,8 +267,12 @@ def _finish_refresh(store, target, result, *, started, hard, owned, cleaned, dis
             unlock_started_monotonic=unlock_started, unlock_completed_monotonic=unlock_completed,
             final_write_started_monotonic=final_started, final_write_completed_monotonic=final_completed,
             commit_prepared_monotonic=time.perf_counter())
-        if contract == SELECTION_VERSION:
-            commit["intent_sha256"] = stable_hash(observation._json((target / "intent.json").read_bytes()))
+        if contract in SELECTED_CONTRACTS:
+            intent = observation._json((target / "intent.json").read_bytes())
+            commit["intent_sha256"] = stable_hash(intent)
+            if contract == LIMITED_VERSION:
+                commit["original_response_file_sha256"] = _verify_limited_response(store.root, target, response, intent)
+                commit["commit_prepared_monotonic"] = time.perf_counter()
         stage = "final_commit"
         # Stage/fsync/read back privately; incomplete writes are never a public commit.
         staged = target / "final-commit-candidate.json"
@@ -350,7 +375,7 @@ def decode_response(envelope):
     if (envelope.get("request_url") != expected_url or type(envelope.get("request_count")) is not int
             or envelope["request_count"] != 1):
         raise ValueError("refresh_request_identity_invalid")
-    if contract == SELECTION_VERSION and envelope.get("response_url") != expected_url:
+    if contract in SELECTED_CONTRACTS and envelope.get("response_url") != expected_url:
         raise ValueError("refresh_response_request_mismatch")
 
     class Replay:
@@ -376,7 +401,7 @@ def decode_response(envelope):
         if result.get("status") != SOURCE_ADAPTER_BOUND:
             raise ValueError("quote_adapter_rejected:" + str(result.get("status")))
     else:
-        # Fixture-only candidates must not use the formal Adapter binding.
+        # Selected observations do not use the formal Adapter binding.
         collect()
     if len(records) != len(codes) or {r["payload"]["code"] for r in records} != set(codes):
         raise ValueError("refresh_coverage_rejected")
@@ -397,10 +422,17 @@ def decode_response(envelope):
         file_sha256=hashlib.sha256((json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True)
                                   + "\n").encode("utf-8")).hexdigest(), rows=rows,
         request_status="SUCCEEDED", risk_assessment="NOT_ASSESSED")
-    if contract == SELECTION_VERSION:
+    if contract in SELECTED_CONTRACTS:
         if set(rows) != set(envelope["selection"]):
             raise ValueError("refresh_market_identity_mismatch")
         snapshot["selection"] = list(envelope["selection"])
+    if contract == LIMITED_VERSION:
+        for row in rows.values():
+            event = observation._time(row["event_time"])
+            if (event.astimezone(limited.CN).date() != times[0].astimezone(limited.CN).date()
+                    or not 0 <= (times[1] - event).total_seconds() <= AGE_SECONDS):
+                raise ValueError("limited_quote_stale_or_future")
+        snapshot.update({key: envelope[key] for key in PERMIT_FIELDS})
     for identity in rows:
         observation._quote(snapshot, identity, times[2])
     return snapshot
@@ -413,9 +445,9 @@ def evaluate_current(snapshot, identity, rule, *, now=None, attempt=None, contra
     reason, age = result["reason"], None
     if contract == VERSION and identity not in IDENTITIES:
         reason = "本轮刷新范围未支持"
-    elif contract == SELECTION_VERSION and not selection_supported(identity):
+    elif contract in SELECTED_CONTRACTS and not selection_supported(identity):
         reason = "本轮刷新范围未支持"
-    elif contract == SELECTION_VERSION and identity not in (attempt or {}).get("selection", []):
+    elif contract in SELECTED_CONTRACTS and identity not in (attempt or {}).get("selection", []):
         reason = "本次未获取（未选择）"
     elif not attempt or attempt.get("status") != "SUCCEEDED":
         reason = ("完成状态未确认：" if (attempt or {}).get("status") == "UNCONFIRMED" else "本次刷新未成功：") + str((attempt or {}).get("error", "尚未刷新"))
@@ -423,7 +455,7 @@ def evaluate_current(snapshot, identity, rule, *, now=None, attempt=None, contra
         reason = "所选为历史快照，不代替本次刷新"
     elif snapshot.get("observation_contract") != contract:
         reason = "refresh_contract_invalid"
-    elif contract == SELECTION_VERSION and snapshot.get("selection") != attempt["selection"]:
+    elif contract in SELECTED_CONTRACTS and snapshot.get("selection") != attempt["selection"]:
         reason = "本次报价集合不匹配"
     if snapshot and identity in snapshot.get("rows", {}) and (contract == VERSION or not reason):
         try:
@@ -450,18 +482,51 @@ def evaluate_current(snapshot, identity, rule, *, now=None, attempt=None, contra
 
 
 class RefreshController:
-    """A shared in-flight guard and cooldown for both observation contracts."""
-    def __init__(self, store, *, network_enabled=False, fixture=None, contract=VERSION):
+    """Shared in-flight guard and cooldown, including real v1 and limited v3."""
+    def __init__(self, store, *, network_enabled=False, fixture=None, contract=VERSION, test_permit=None):
         if contract not in REFRESH_CONTRACTS:
             raise ValueError("refresh_contract_invalid")
         self.contract = contract
         self.store = store
         self.fixture = Path(fixture).resolve() if fixture else None
         self.test_only = store.scope == "synthetic_test_only"
-        self.enabled = (self.test_only and self.fixture is not None) or (
+        if (not self.test_only and self.fixture is not None) or (
+                test_permit is not None and (not self.test_only or contract != LIMITED_VERSION)):
+            raise ValueError("limited_fixture_scope_invalid")
+        self.test_permit = test_permit
+        self._enabled = (self.test_only and self.fixture is not None) or (
             contract == VERSION and not self.test_only and network_enabled is True
             and os.environ.get(NETWORK_SWITCH) == "1")
         self.state = store.root / VERSION / "control"
+
+    def _limited_permit(self, stamp):
+        if not self.test_only:
+            if self.store.root.resolve() != observation.ObservationStore(observation.DEFAULT_STORE, "historical").root.resolve():
+                raise ValueError("limited_live_store_not_canonical")
+            return limited.configured_permit(stamp=stamp)
+        if self.fixture is None or self.test_permit is None:
+            raise ValueError("limited_test_permit_required")
+        permit, archive = limited.read_permit(*self.test_permit, test_only=True)
+        limited._check_window(permit, stamp)
+        return permit, archive
+
+    def limited_status(self):
+        permit = None
+        remaining = None
+        reason = None
+        try:
+            permit, archive = self._limited_permit(None)
+            remaining, reason = limited._permit_status(self.store.root, permit, archive)
+            limited._check_window(permit, utc_now())
+            if (self.state / "cleanup-incomplete.json").exists() or (self.state / "active.lock").exists():
+                reason = "refresh_in_flight_or_cleanup_block"
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            reason = str(exc)
+        return permit, remaining, reason
+
+    @property
+    def enabled(self):
+        return self.limited_status()[2] is None if self.contract == LIMITED_VERSION else self._enabled
 
     def refresh(self, pool, *, selection=None):
         started = time.perf_counter()
@@ -473,12 +538,12 @@ class RefreshController:
         process = None
         published = False
         selection_fields = {}
-        if not self.enabled:
+        if self.contract != LIMITED_VERSION and not self.enabled:
             return result
         try:
             identities = observation.normalize_pool(pool)
             codes = list(CODES)
-            if self.contract == SELECTION_VERSION:
+            if self.contract in SELECTED_CONTRACTS:
                 identities_selected = normalize_selection(selection)
                 if not set(identities_selected) <= set(identities):
                     raise ValueError("quote_selection_outside_pool")
@@ -486,6 +551,10 @@ class RefreshController:
                 codes = sorted(identity.split(":")[1] for identity in identities_selected)
             elif selection is not None or not set(identities) & IDENTITIES:
                 raise ValueError("本轮刷新范围未支持")
+            if self.contract == LIMITED_VERSION:
+                permit, archive = self._limited_permit(utc_now())
+                if permit["selection"] != identities_selected:
+                    raise ValueError("limited_permit_selection_mismatch")
             self.state.mkdir(parents=True, exist_ok=True)
             if (self.state / "cleanup-incomplete.json").exists():
                 raise ValueError("cleanup_incomplete_block")
@@ -509,13 +578,24 @@ class RefreshController:
                 elapsed = tick - previous["dispatch_monotonic"]
                 if elapsed < INTERVAL_SECONDS:
                     raise ValueError("refresh_cooldown_10_seconds_or_clock_reset")
+            if self.contract == LIMITED_VERSION:
+                remaining_slots, reason = limited._permit_status(self.store.root, permit, archive)
+                if reason:
+                    raise ValueError(reason)
+                limited._check_window(permit, utc_now())
+                permit_fields = {"permit_id": permit["permit_id"], "permit_slot": 3 - remaining_slots,
+                                 "permit_sha256": archive["sha256"], "approved_sha": permit["approved_sha"]}
+            else:
+                permit_fields = {}
             target = self.store.root / self.contract / "attempts" / batch
             target.mkdir(parents=True, exist_ok=False)
             intent = dict(contract=self.contract, batch_id=batch, codes=codes, created_at=utc_now().isoformat(),
                           synthetic_test_only=self.test_only, dispatch_monotonic=tick,
                           http_timeout_seconds=HTTP_SECONDS, execution_budget_seconds=TOTAL_SECONDS,
                           confirmation_persistence_separate=True, finalization_contract=FINALIZATION_VERSION,
-                          **selection_fields)
+                          **selection_fields, **permit_fields)
+            if self.contract == LIMITED_VERSION:
+                limited.reserve(self.store.root, permit, archive, intent)
             observation.write_once(self.state / ("attempt-" + batch + ".json"), intent)
             observation.write_once(target / "intent.json", intent)
             task = dict(intent, output=str(target.resolve()), fixture=str(self.fixture) if self.fixture else None)
@@ -537,8 +617,10 @@ class RefreshController:
             if (envelope["batch_id"] != batch or envelope["synthetic_test_only"] != self.test_only
                     or envelope.get("contract") != self.contract):
                 raise ValueError("worker_batch_or_scope_mismatch")
-            if self.contract == SELECTION_VERSION:
+            if self.contract in SELECTED_CONTRACTS:
                 _verify_selection_binding(envelope, intent)
+            if self.contract == LIMITED_VERSION:
+                _verify_limited_response(self.store.root, target, envelope, intent)
             if decode_response(envelope)["file_sha256"] != hashlib.sha256(source_bytes).hexdigest():
                 raise ValueError("response_file_bytes_mismatch")
             if time.perf_counter() >= hard:
@@ -548,7 +630,7 @@ class RefreshController:
             if time.perf_counter() >= hard:
                 raise TimeoutError("controller_publication_budget_exhausted")
             result = safe("CANDIDATE_SUCCEEDED", contract=self.contract, batch_id=batch,
-                          requests_made=1, error="", **selection_fields)
+                          requests_made=1, error="", **selection_fields, **permit_fields)
         except Exception as exc:
             result = safe("FAILED" if dispatched else "REJECTED", contract=self.contract,
                           error=f"{type(exc).__name__}:{exc}", requests_made=None if dispatched else 0,
