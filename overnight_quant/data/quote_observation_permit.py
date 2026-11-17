@@ -19,10 +19,13 @@ LIMITED_SWITCH = "OBSERVATION_LIMITED_QUOTE_ENABLED"
 PERMIT_FILE = "OBSERVATION_LIMITED_QUOTE_PERMIT_FILE"
 PERMIT_SHA = "OBSERVATION_LIMITED_QUOTE_PERMIT_SHA256"
 PERMIT_SCHEMA = "manual_quote_limited_permit_v1"
+LOCAL_PERMIT_SCHEMA = "manual_quote_limited_permit_v2"
+LOCAL_REFERENCE_KIND = "CODEX_LOCAL_MESSAGE_V1"
 CN = timezone(timedelta(hours=8))
 MAX_PERMIT_BYTES = 16384
 SHA256 = r"[a-f0-9]{64}"
 ID = r"[a-z0-9][a-z0-9_-]{7,79}"
+CODEX_ID = r"[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}"
 CODE_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -66,6 +69,64 @@ def _check_window(permit, stamp):
         raise ValueError("limited_permit_window_invalid")
     if stamp is not None and not start <= stamp < end:
         raise ValueError("limited_permit_outside_window")
+    if (stamp is not None and permit["schema"] == LOCAL_PERMIT_SCHEMA
+            and _time(permit["approval_reference"]["operator_check"]["checked_at"]) > stamp):
+        raise ValueError("limited_permit_approval_check_after_evaluation")
+
+
+def _check_approval_reference(schema, ref, approved_sha):
+    shared = {"verbatim_quote", "quote_sha256"}
+    if not isinstance(ref, dict) or not isinstance(ref.get("verbatim_quote"), str) or not ref["verbatim_quote"].strip():
+        raise ValueError("limited_permit_approval_reference_invalid")
+    try:
+        quote = ref["verbatim_quote"].encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError("limited_permit_approval_reference_invalid_utf8") from None
+    if _sha(quote) != ref.get("quote_sha256"):
+        raise ValueError("limited_permit_approval_reference_invalid")
+    if schema == PERMIT_SCHEMA:
+        if (set(ref) != shared | {"locator"} or not isinstance(ref["locator"], str)
+                or not re.fullmatch(r"https://[^\s]{8,500}", ref["locator"])):
+            raise ValueError("limited_permit_approval_reference_invalid")
+        return
+    if (set(ref) != shared | {"kind", "thread_id", "message_id", "local_original_path",
+                              "local_original_sha256", "operator_check"}
+            or ref["kind"] != LOCAL_REFERENCE_KIND
+            or any(not isinstance(ref[key], str) or not re.fullmatch(CODEX_ID, ref[key])
+                   for key in ("thread_id", "message_id"))
+            or ref["thread_id"] == ref["message_id"]):
+        raise ValueError("limited_permit_local_message_reference_invalid")
+    if not re.search(r"(?<![0-9a-fA-F])" + approved_sha + r"(?![0-9a-fA-F])", ref["verbatim_quote"]):
+        raise ValueError("limited_permit_local_approval_code_unbound")
+    check = ref["operator_check"]
+    if (not isinstance(check, dict) or set(check) != {"status", "operator", "checked_at"}
+            or check["status"] != "MATCHED_CURRENT_USER_MESSAGE"
+            or not isinstance(check["operator"], str) or not 1 <= len(check["operator"].strip()) <= 128
+            or _time(check["checked_at"]).utcoffset() != CN.utcoffset(None)):
+        raise ValueError("limited_permit_local_operator_check_invalid")
+    # A local attestation binds bytes; it cannot authenticate a user or look up a message.
+    try:
+        json.dumps(ref, ensure_ascii=False).encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError("limited_permit_approval_reference_invalid_utf8") from None
+    if not isinstance(ref["local_original_path"], str):
+        raise ValueError("limited_permit_local_original_path_invalid")
+    original = Path(ref["local_original_path"])
+    if not original.is_absolute() or original.as_posix().startswith("//"):
+        raise ValueError("limited_permit_local_original_path_invalid")
+    if os.name == "nt":
+        from ctypes import windll
+
+        if windll.kernel32.GetDriveTypeW(original.anchor) != 3:  # DRIVE_FIXED
+            raise ValueError("limited_permit_local_original_path_invalid")
+    original = original.resolve(strict=True)
+    if (original.as_posix().startswith("//") or not original.is_file()
+            or original.is_relative_to(CODE_ROOT) or any((parent / ".git").exists() for parent in original.parents)):
+        raise ValueError("limited_permit_local_original_path_invalid")
+    with original.open("rb") as source:
+        raw = source.read(MAX_PERMIT_BYTES + 1)
+    if raw != quote or _sha(raw) != ref["local_original_sha256"]:
+        raise ValueError("limited_permit_local_original_mismatch")
 
 
 def _parse(raw, digest, test_only):
@@ -75,13 +136,14 @@ def _parse(raw, digest, test_only):
         raise ValueError("limited_permit_anchor_invalid")
     permit = _json(raw.decode("utf-8", errors="strict"))
     expected = {
-        "schema": PERMIT_SCHEMA, "contract": LIMITED_VERSION,
+        "contract": LIMITED_VERSION,
         "status": "TEST_ONLY" if test_only else "USER_APPROVED",
         "purpose": "PERSONAL_INTERNAL_OBSERVATION",
         "source_use_basis": "UNKNOWN",
         "known_use_constraint": "NO_KNOWN_PROHIBITION",
     }
-    if (not isinstance(permit, dict) or any(permit.get(k) != v for k, v in expected.items())
+    if (not isinstance(permit, dict) or permit.get("schema") not in (PERMIT_SCHEMA, LOCAL_PERMIT_SCHEMA)
+            or any(permit.get(k) != v for k, v in expected.items())
             or not isinstance(permit.get("permit_id"), str) or not re.fullmatch(ID, permit["permit_id"])
             or not isinstance(permit.get("approved_sha"), str) or not re.fullmatch(r"[a-f0-9]{40}", permit["approved_sha"])
             or not isinstance(permit.get("worktree"), str) or not Path(permit["worktree"]).is_absolute()
@@ -91,12 +153,7 @@ def _parse(raw, digest, test_only):
             or permit.get("manual_clicks_only") is not True
             or normalize_selection(permit.get("selection")) != permit["selection"]):
         raise ValueError("limited_permit_invalid")
-    ref = permit.get("approval_reference")
-    if (not isinstance(ref, dict) or set(ref) != {"locator", "verbatim_quote", "quote_sha256"}
-            or not isinstance(ref["locator"], str) or not re.fullmatch(r"https://[^\s]{8,500}", ref["locator"])
-            or not isinstance(ref["verbatim_quote"], str) or not ref["verbatim_quote"].strip()
-            or _sha(ref["verbatim_quote"].encode("utf-8", errors="strict")) != ref["quote_sha256"]):
-        raise ValueError("limited_permit_approval_reference_invalid")
+    _check_approval_reference(permit["schema"], permit.get("approval_reference"), permit["approved_sha"])
     _check_window(permit, None)
     return permit
 
