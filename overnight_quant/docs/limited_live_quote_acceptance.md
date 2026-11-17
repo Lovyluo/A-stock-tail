@@ -1,6 +1,6 @@
 # 有限真实自选报价：验收待批单（未批准）
 
-观察合同 `manual_quote_limited_live_v3`；许可格式 `manual_quote_limited_permit_v1`。本工作包只做离线验收，不签发真实许可、不访问行情。它不是策略、正式来源资格或可交易性验证。
+观察合同 `manual_quote_limited_live_v3`；旧许可 `manual_quote_limited_permit_v1` 保留 HTTPS 引用，新许可 `manual_quote_limited_permit_v2` 支持本地会话原文。本工作包只做离线验收，不签发真实许可、不访问行情。它不是策略、正式来源资格或可交易性验证。
 
 ## 用户待填写
 
@@ -10,9 +10,13 @@
 | 时间 | 北京时间同一日：________；明确起止时间（含起、不含止）：________ |
 | 范围 | 唯一许可编号（8–80 位小写字母、数字、下划线或连字符）：________；规范市场＋代码集合（1–5 个）：________ |
 | 用途和限额 | 仅本人内部观察，不公开传播；最多两次人工点击，同一集合，间隔至少 10 秒。用户独立确认用途依据为 UNKNOWN：________ |
-| 证据 | 真实批准原文、可追溯 HTTPS 引用及原文 UTF-8 SHA-256：________。本地核对绑定，不联网核验引用；验收操作者须对照原批准，独立记录许可文件字节 SHA-256。 |
+| 证据 | 现行用户批准原文、实际会话与消息 ID（或旧许可的真实 HTTPS 引用）、原文字节 SHA-256、人工核对记录：________。独立记录许可文件字节 SHA-256，不公开分享、上传或虚构引用。 |
 
-许可 JSON 需要 `schema`、`contract`、`status`、`permit_id`、`approved_sha`、`worktree`（工作树绝对路径）、`date`（YYYY-MM-DD）、`window_start`/`window_end`（ISO 8601，明确 +08:00）、`selection`（排序的规范身份数组）、`approval_reference`（`locator`、`verbatim_quote`、`quote_sha256`）。固定合同项：`purpose=PERSONAL_INTERNAL_OBSERVATION`、`source_use_basis=UNKNOWN`、`known_use_constraint=NO_KNOWN_PROHIBITION`、`max_requests=2`、`manual_clicks_only=true`、`user_approved=true`、`acknowledges_unknown_basis=true`、`public_distribution=false`、`access_control_bypass=false`。仅获得新批准才接受 `status=USER_APPROVED`；示例 `{"schema":"manual_quote_limited_permit_v1","status":"EXAMPLE"}` 永不放行。不得改旧许可证复用；用户许可不是上游授权，明确禁止或需要绕过访问控制时停止。
+许可 JSON 需要 `schema`、`contract`、`status`、`permit_id`、`approved_sha`、`worktree`（工作树绝对路径）、`date`（YYYY-MM-DD）、`window_start`/`window_end`（ISO 8601，明确 +08:00）、`selection`（排序的规范身份数组）、`approval_reference`。固定合同项：`purpose=PERSONAL_INTERNAL_OBSERVATION`、`source_use_basis=UNKNOWN`、`known_use_constraint=NO_KNOWN_PROHIBITION`、`max_requests=2`、`manual_clicks_only=true`、`user_approved=true`、`acknowledges_unknown_basis=true`、`public_distribution=false`、`access_control_bypass=false`。仅获得新批准才接受 `status=USER_APPROVED`；示例 `{"schema":"manual_quote_limited_permit_v2","status":"EXAMPLE"}` 永不放行。不得改旧许可证复用；用户许可不是上游授权，明确禁止或需要绕过访问控制时停止。
+
+- **旧许可 v1**：`approval_reference` 仍只接受 `locator`（实际 HTTPS 引用）、`verbatim_quote` 和 `quote_sha256`。本地模式不能装入 v1。
+- **本地许可 v2**：`approval_reference.kind=CODEX_LOCAL_MESSAGE_V1`，填写实际取得的 `thread_id`、`message_id`、完整 `verbatim_quote`、`quote_sha256`、仓库外本机原文绝对路径 `local_original_path` 及独立从该文件计算的 `local_original_sha256`。`operator_check` 记录 `status=MATCHED_CURRENT_USER_MESSAGE`、核对人 `operator` 和明确 +08:00 的 `checked_at`。必须核对实际用户消息和所批准的范围，不得用助手文本代替。仅规范化独立的日期、窗口、证券字段；原文不改换行、标点、空白或编码。原文文件及许可均只留本地，不入 Git、CI 附件或公开 PR；执行、关闭与重放都依赖同一份原文文件。
+- 哈希用于完整性核对，不是用户身份签名；程序不验证消息 ID 的真实性。批准原文必须含该许可绑定的完整 SHA。新 SHA 需要用户另行确认，可明确引用原证券集合、未过期窗口和用途边界，无需重写原批准；本地保留两条消息的出处。过期不顺延。
 
 ## 获批后才运行
 
