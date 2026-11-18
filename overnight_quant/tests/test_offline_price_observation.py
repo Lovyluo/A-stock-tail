@@ -251,6 +251,7 @@ def test_actual_dashboard_chain_no_network_or_old_actions(tmp_path, monkeypatch,
     original_formal_files = formal_files()
     app = AppTest.from_file(str(path), default_timeout=15).run()
     assert not app.exception
+    next(x for x in app.radio if x.label == "工作区").set_value("历史/离线观察").run()
     next(x for x in app.radio if x.label == "材料空间").set_value("测试材料 · test-only").run()
     next(x for x in app.selectbox if x.label == "观察快照").select("test-A").run()
     next(x for x in app.text_input if x.label == "上沿：价格达到或高于").input("11")

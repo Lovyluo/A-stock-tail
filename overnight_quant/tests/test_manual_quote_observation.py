@@ -354,6 +354,7 @@ def test_actual_page_refresh_explain_save_compare_and_zero_passive_network(tmp_p
     path = Path(ui.__file__).with_name("dashboard.py")
     app = AppTest.from_file(str(path), default_timeout=15).run()
     assert not app.exception and not calls
+    next(x for x in app.radio if x.label == "工作区").set_value("历史/离线观察").run()
     next(x for x in app.radio if x.label == "材料空间").set_value("测试材料 · test-only").run()
     next(x for x in app.radio if x.label == "观察方式").set_value("主动刷新观察").run()
     assert not app.exception and not calls
