@@ -107,6 +107,7 @@ def test_actual_dashboard_tracking_notes_zero_network(tmp_path, monkeypatch, rec
     monkeypatch.setattr(dashboard, "run_dashboard_action", guard.deny_legacy_action)
     monkeypatch.setattr(dashboard, "run_approved_action", guard.deny_legacy_action)
     app = AppTest.from_file(str(ui.Path(ui.__file__).with_name("dashboard.py")), default_timeout=15).run()
+    next(x for x in app.radio if x.label == "工作区").set_value("历史/离线观察").run()
     next(x for x in app.radio if x.label == "材料空间").set_value("测试材料 · test-only").run()
     def click(label):
         next(x for x in app.button if x.label == label).click().run()
