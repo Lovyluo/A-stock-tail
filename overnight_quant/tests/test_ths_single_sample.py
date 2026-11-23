@@ -138,7 +138,7 @@ def test_cleanup_failure_persists_block_and_prevents_new_worker(tmp_path, monkey
     monkeypatch.setattr(ths, "run_probe_worker_process", failed)
     args = dict(target="2026-11-20", head=HEAD, fixture=str(fixture), state=tmp_path / "state")
     first = ths.capture(**args, output=tmp_path / "one", batch="one")
-    assert first["status"] == "FAILED" and first["actual_http_requests"] == 0
+    assert first["status"] == "FAILED" and first["actual_http_requests"] is None
     assert (tmp_path / "state/cleanup-incomplete.json").exists()
     assert (tmp_path / "state/active.lock").exists()
     second = ths.capture(**args, output=tmp_path / "two", batch="two")
@@ -299,5 +299,6 @@ def test_launcher_serialization_overrun_never_publishes_success(tmp_path):
     assert run.returncode == 2 and result["status"] == "FAILED"
     assert "receipt_serialization_deadline" in result["error"]
     completion_sha = ths.digest((output / "completion.json").read_bytes())
-    with pytest.raises(ValueError):
-        ths.verify(output, completion_sha, returned, ths.digest(returned.read_bytes()))
+    verified = ths.verify(output, completion_sha, returned, ths.digest(returned.read_bytes()))
+    assert verified["evidence_integrity_verified"] is True
+    assert verified["capture_execution_result"] == "FAILED"

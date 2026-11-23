@@ -2,7 +2,7 @@ param(
     [string]$TargetDate, [string]$ApprovedSha, [string]$Output, [string]$BatchId,
     [string]$Approval, [string]$ApprovalSha, [switch]$Execute,
     [string]$Fixture, [string]$TestState,
-    [ValidateSet('None','SerializationOverrun')][string]$TestScenario = 'None',
+    [ValidateSet('None','SerializationOverrun','UnconfirmedReceipt')][string]$TestScenario = 'None',
     [string]$PythonPath = 'D:\A-stock\.venv\Scripts\python.exe'
 )
 $ErrorActionPreference = 'Stop'
@@ -10,7 +10,7 @@ $start = [Diagnostics.Stopwatch]::GetTimestamp()
 $frequency = [Diagnostics.Stopwatch]::Frequency
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $state = if ($TestState -and $Fixture -and !$Execute) { [IO.Path]::GetFullPath($TestState) } else { Join-Path $root 'overnight_quant\data\cache\ths-single-sample' }
-$process = $null; $cleaned = $false
+$process = $null; $cleaned = $false; $startAttempted = $false; $result = $null
 $offset = 0
 function Elapsed { return ([Diagnostics.Stopwatch]::GetTimestamp() - $start) * 1000.0 / $frequency + $script:offset }
 function Quote([string]$Value) {
@@ -49,12 +49,16 @@ try {
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false,$true)
     $info.StandardErrorEncoding = $info.StandardOutputEncoding
     $info.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8:strict'
+    $startAttempted = $true
     $process = [Diagnostics.Process]::Start($info)
     $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
     if (!$process.WaitForExit([int][Math]::Max(0,9000-(Elapsed)))) { throw 'launcher_deadline_cleanup_unconfirmed' }
     if (!$stdout.Wait([int][Math]::Max(0,9500-(Elapsed))) -or !$stderr.Wait([int][Math]::Max(0,9500-(Elapsed)))) { throw 'launcher_pipe_cleanup_unconfirmed' }
     $result = $stdout.Result | ConvertFrom-Json
-    $cleaned = ($result.supervisor_cleanup_complete -eq $true -or $result.requests_attempted -eq 0)
+    if ($result -isnot [pscustomobject]) { $result = $null; throw 'controller_receipt_invalid' }
+    if ($TestScenario -eq 'UnconfirmedReceipt') { $result.supervisor_cleanup_complete = $false }
+    $cleaned = ($result.supervisor_cleanup_complete -is [bool] -and $result.supervisor_cleanup_complete -eq $true)
+    if (!$cleaned) { throw 'supervisor_cleanup_unconfirmed' }
     if ($result.output -and (Test-Path -LiteralPath $result.output -PathType Container)) {
         $bytes = [Text.UTF8Encoding]::new($false,$true).GetBytes($stdout.Result)
         SaveNew (Join-Path $result.output 'python-result.json') $bytes
@@ -71,16 +75,30 @@ try {
     $serialized
     if ($result.status -eq 'SAMPLE_PARSED') { exit 0 } else { exit 2 }
 } catch {
+    $caught = [string]$_.Exception.Message
+    $cleanupErrors = @()
     if ($process -and !$process.HasExited) {
         # The Python supervisor normally owns cleanup. Its failure is never called clean.
-        try { $process.Kill(); [void]$process.WaitForExit([int][Math]::Max(0,10000-(Elapsed))) } catch { }
+        try { $process.Kill(); [void]$process.WaitForExit([int][Math]::Max(0,10000-(Elapsed))) } catch { $cleanupErrors += [string]$_.Exception.Message }
     }
-    if ($process -and !$cleaned) {
+    if ($startAttempted -and !$cleaned) {
         try {
             [void][IO.Directory]::CreateDirectory($state)
             SaveNew (Join-Path $state 'cleanup-incomplete.json') ([Text.Encoding]::UTF8.GetBytes('{"status":"LAUNCHER_CLEANUP_UNCONFIRMED"}'))
-        } catch { }
+        } catch { $cleanupErrors += [string]$_.Exception.Message }
     }
-    @{status='FAILED';error=[string]$_.Exception.Message;actual_http_requests=$(if($Fixture){0}else{$null})} | ConvertTo-Json -Compress
+    $failure = [ordered]@{}
+    if ($result) { foreach ($property in $result.PSObject.Properties) { $failure[$property.Name] = $property.Value } }
+    else {
+        $count = if ($startAttempted) { $null } else { 0 }
+        $failure.actual_http_requests = $count; $failure.requests_attempted = $count
+    }
+    $failure.status = 'FAILED'
+    if ($failure.error) { $failure.subsequent_errors = @($failure.subsequent_errors | Where-Object { $null -ne $_ }) + @($caught) }
+    else { $failure.error = $caught }
+    $failure.supervisor_cleanup_complete = (!$startAttempted -or $cleaned)
+    $failure.serialized_before_deadline = $false
+    if ($cleanupErrors.Count) { $failure.launcher_cleanup_errors = $cleanupErrors }
+    $failure | ConvertTo-Json -Depth 35 -Compress
     exit 2
 } finally { if ($process) { $process.Dispose() } }

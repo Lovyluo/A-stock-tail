@@ -50,6 +50,22 @@ def safe(**values):
             "records": [], "candidates": [], "tickets": [], "orders": [], **values}
 
 
+def failed_result(result, error):
+    result["status"] = "FAILED"
+    if result.get("error"):
+        if result["error"] != error:
+            result.setdefault("subsequent_errors", []).append(error)
+    else:
+        result["error"] = error
+    return result
+
+
+def worker_not_started(process):
+    return (isinstance(process, dict) and "pid" in process and process["pid"] is None
+            and process.get("returncode") is None and process.get("stage") in ("prepare", "startup")
+            and process.get("tree_empty_observed") is None and process.get("cleanup_complete") is True)
+
+
 def stamp(value):
     result = datetime.fromisoformat(value)
     if result.utcoffset() != timedelta(hours=8):
@@ -337,21 +353,28 @@ def capture(*, target=None, head=None, output=None, batch=None, fixture=None,
             raise TimeoutError("preparation_budget_exceeded")
         cleaned = False
         dispatched = True
+        report.update(requests_attempted=None, actual_http_requests=None, cleanup_complete=None)
         process = run_probe_worker_process(task, 8000, bounded_cleanup_ms=PLAN["cleanup_ms"],
             hard_deadline_monotonic=task["work_deadline"] + 1, strict_utf8=True, retain_streams=True,
             worker_command=[sys.executable, "-m", "overnight_quant.scripts.run_ths_single_sample", "--worker"])
         cleaned = process.get("cleanup_complete") is True
+        report.update(process=process, cleanup_complete=cleaned)
+        if worker_not_started(process):
+            report.update(requests_attempted=0, actual_http_requests=0)
         if not cleaned:
             write_once(state / "cleanup-incomplete.json", {"output": str(directory), "process": process})
         response = None
+        response_bytes = None
         if (directory / "response.json").is_file():
-            _, response = _load(directory / "response.json", 4 * PLAN["max_response_bytes"])
+            response_bytes, response = _load(directory / "response.json", 4 * PLAN["max_response_bytes"])
+            report.update(requests_attempted=response.get("requests_attempted"),
+                          actual_http_requests=response.get("actual_http_requests"))
+            if response.get("error"):
+                report["error"] = response["error"]
         report.update(version=VERSION, contract_hash=CONTRACT, batch_id=batch, target_date=target,
                       approved_sha=head, synthetic_test_only=bool(fixture), source_use_basis="UNKNOWN",
                       process=process, cleanup_complete=cleaned, permission=permission,
-                      requests_attempted=(response or {}).get("requests_attempted"),
-                      actual_http_requests=0 if fixture else (response or {}).get("actual_http_requests"),
-                      response_sha256=digest((directory / "response.json").read_bytes()) if response else None)
+                      response_sha256=digest(response_bytes) if response_bytes is not None else None)
         report["intent_sha256"] = digest((directory / "intent.json").read_bytes())
         report["request_sha256"] = digest((directory / "request.json").read_bytes()) if (directory / "request.json").exists() else None
         report["partial_artifacts"] = [{"file": path.name, "sha256": digest(path.read_bytes())}
@@ -362,9 +385,7 @@ def capture(*, target=None, head=None, output=None, batch=None, fixture=None,
             raise TimeoutError("execution_deadline")
         report["status"] = "SAMPLE_PARSED"
     except Exception as exc:
-        report.update(status="FAILED", error=f"{type(exc).__name__}:{exc}")
-        if dispatched and "process" not in report:
-            report.update(requests_attempted=None, actual_http_requests=0 if fixture else None)
+        failed_result(report, f"{type(exc).__name__}:{exc}")
     finally:
         if owned:
             try:
@@ -376,14 +397,15 @@ def capture(*, target=None, head=None, output=None, batch=None, fixture=None,
                 else:
                     raise ValueError("lock_identity_mismatch")
             except Exception as exc:
-                report.update(status="FAILED", error=f"cleanup:{type(exc).__name__}:{exc}", cleanup_complete=False)
+                failed_result(report, f"cleanup:{type(exc).__name__}:{exc}")
+                report["cleanup_complete"] = False
     if owned and directory and directory.exists():
         try:
             report["completed_at"] = now()
             write_once(directory / "execution.json", report)
             actual_check = time.perf_counter()
             if actual_check >= deadline:
-                report.update(status="FAILED", error="execution_deadline_after_report")
+                failed_result(report, "execution_deadline_after_report")
             # One completion record, not a recursive confirmation chain.
             completion = {"version": VERSION, "status": report["status"],
                 "execution_sha256": digest((directory / "execution.json").read_bytes()),
@@ -393,13 +415,51 @@ def capture(*, target=None, head=None, output=None, batch=None, fixture=None,
             completion_sha = digest((directory / "completion.json").read_bytes())
             final_check = time.perf_counter()
             if final_check >= deadline:
-                return safe(status="FAILED", error="completion_write_deadline", actual_http_requests=report["actual_http_requests"], output=str(directory))
+                return {**failed_result(report, "completion_write_deadline"), "output": str(directory),
+                        "completion_sha256": completion_sha}
             return {**report, "output": str(directory), "execution_elapsed_ms": completion["execution_elapsed_ms"],
                     "final_check_elapsed_ms": (final_check - started) * 1000,
                     "completion_sha256": completion_sha}
         except Exception as exc:
-            report.update(status="FAILED", error=f"final_save:{type(exc).__name__}:{exc}")
+            failed_result(report, f"final_save:{type(exc).__name__}:{exc}")
     return report
+
+
+def _execution_time_errors(intent, response, process, started, checked, deadline):
+    def finite(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    errors = []
+    work = intent.get("work_deadline")
+    if not finite(work) or not started < work <= started + 7 or work >= deadline:
+        errors.append("work_deadline_invalid")
+    if intent.get("execution_deadline_monotonic") != deadline:
+        errors.append("intent_execution_deadline_inconsistent")
+    stages = [(response or {}).get(k) for k in ("started_monotonic", "response_completed_monotonic",
+              "raw_sealed_monotonic", "completed_monotonic")]
+    if not all(finite(value) for value in stages):
+        errors.append("response_time_evidence_missing_or_invalid")
+    else:
+        if not started <= stages[0] <= stages[1] <= stages[2] <= stages[3] <= checked:
+            errors.append("response_time_order_invalid")
+        if stages[2] - stages[0] >= PLAN["io_seconds"]:
+            errors.append("relative_io_deadline_exceeded")
+        if finite(work) and (any(value >= work for value in stages) or work > stages[0] + 5):
+            errors.append("absolute_work_deadline_not_met")
+    process = process if isinstance(process, dict) else {}
+    io_end, hard_end, cleanup_end = [process.get(key) for key in (
+        "io_deadline_monotonic", "hard_deadline_monotonic", "cleanup_deadline_monotonic")]
+    if not all(finite(value) for value in (io_end, hard_end, cleanup_end)):
+        errors.append("process_deadline_evidence_missing_or_invalid")
+    elif (not finite(work) or io_end != work or hard_end != work + PLAN["cleanup_ms"] / 1000
+          or not started <= cleanup_end <= hard_end <= deadline
+          or (finite(stages[-1]) and cleanup_end < stages[-1])):
+        errors.append("process_deadlines_inconsistent")
+    if (process.get("request_timed_out") is not False
+            or process.get("cleanup_budget_exhausted") is not False
+            or process.get("cleanup_complete") is not True):
+        errors.append("process_deadline_or_cleanup_unconfirmed")
+    return errors
 
 
 def verify(directory, completion_sha, returned_path, returned_sha):
@@ -466,16 +526,17 @@ def verify(directory, completion_sha, returned_path, returned_sha):
                 declared = response.get("declared_length")
                 if declared is not None and (not re.fullmatch(r"[0-9]+", str(declared)) or int(declared) != len(body)):
                     raise ValueError("declared_response_length_mismatch")
-                stages = [response.get(k) for k in ("started_monotonic", "response_completed_monotonic",
-                          "raw_sealed_monotonic", "completed_monotonic")]
-                if (any(type(x) not in (int, float) or not math.isfinite(x) for x in stages)
-                        or not started <= stages[0] <= stages[1] <= stages[2] <= stages[3] <= checked
-                        or stages[2] - stages[0] >= 5):
-                    raise ValueError("response_time_evidence_invalid")
                 parsed = parse_body(body, response["content_type"])
                 if parsed != response["parsed"]:
                     raise ValueError("parse_replay_mismatch")
-    passed = (completion["status"] == execution["status"] == "SAMPLE_PARSED"
+    time_errors = _execution_time_errors(intent, response, execution.get("process"), started, checked, deadline)
+    final_elapsed = child_returned.get("final_check_elapsed_ms")
+    if (type(final_elapsed) not in (int, float) or not math.isfinite(final_elapsed)
+            or not 0 <= final_elapsed < 10000 or returned.get("serialized_before_deadline") is not True):
+        time_errors.append("final_deadline_check_unconfirmed")
+    process = execution.get("process") or {}
+    passed = (not time_errors and completion["status"] == execution["status"] == "SAMPLE_PARSED"
+              and process.get("ok") is True and process.get("cleanup_complete") is True
               and execution.get("cleanup_complete") is True and parsed is not None)
     if passed:
         elapsed = child_returned.get("final_check_elapsed_ms")
@@ -485,5 +546,6 @@ def verify(directory, completion_sha, returned_path, returned_sha):
                   and returned.get("completion_sha256") == completion_sha
                   and type(elapsed) in (int, float) and math.isfinite(elapsed) and 0 <= elapsed < 10000)
     return safe(evidence_integrity_verified=True, capture_execution_result="PASSED" if passed else "FAILED",
+                execution_time_verified=not time_errors, execution_validation_errors=time_errors,
                 source_use_basis="UNKNOWN", sample=parsed, observation_input_ready=False,
                 current_analysis_usable=False, synthetic_test_only=execution.get("synthetic_test_only"))

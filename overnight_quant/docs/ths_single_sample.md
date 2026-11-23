@@ -61,3 +61,9 @@ fixture 格式为 `{"status":200,"content_type":"application/json; charset=utf-8
 不改原 Dashboard、正式来源绑定或资格。浏览器视觉验收仍未完成：沿用既有零网络预览被策略拒绝的记录，本轮不重试、不换工具、不用 AppTest 或旧截图代替。执行环境根因仍 `ROOT_CAUSE_UNCONFIRMED`。
 
 安全状态不变：`qualification=0/3; data_ready=false; hard_gate_authorized=false`；正式 records、candidates、tickets、orders 为空。本轮零真实HTTP、零NTP、无许可签发、无任务、无合并或发布。
+
+## 限定边界复核
+
+派发计数按实际证据保留：进入监督调用前，或监督器明确证明进程未创建时，可记0；进入调用后先记 null/UNKNOWN，只有可靠回执才能确认。后续异常保留已有计数、原始错误及清理状态，追加后继错误，不以 fixture 选项或统一异常回填0。缺失/不完整回执不能成为成功；清理未确认时使用现有持久阻断，零计数不是进程树清理证明。已读取的响应字节直接用于哈希，避免二次读失败丢失已取得的事实。
+
+重放仍按原合同，不新增许可或计划版本：必要阶段须为有限数值、顺序一致，严格早于 intent 的 `work_deadline`；等于截止也不通过。核对 intent 总截止、工作截止，以及进程 I/O、硬截止和清理截止的一致性，保留原相对5秒及总10秒门槛，不增加容差。字节完整但阶段超时/未知时，完整性可通过，`capture_execution_result=FAILED`、`execution_time_verified=false`；明确列出 `execution_validation_errors`，不升级分析可用性。

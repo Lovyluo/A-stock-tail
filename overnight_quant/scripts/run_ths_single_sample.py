@@ -10,7 +10,9 @@ from pathlib import Path
 import sys
 from uuid import uuid4
 
-from overnight_quant.data.ths_single_sample import STATE, capture, request_sample, safe, verify, write_once
+from overnight_quant.data.ths_single_sample import (
+    STATE, capture, failed_result, request_sample, safe, verify, worker_not_started, write_once,
+)
 from overnight_quant.data.probe_worker_process import run_probe_worker_process
 
 
@@ -62,6 +64,9 @@ def main(argv=None):
         except Exception as exc:
             print(json.dumps({"ok": False, "error": f"{type(exc).__name__}:{exc}"}, ensure_ascii=True))
             return 2
+    result = safe(status="FAILED", actual_http_requests=0, requests_attempted=0,
+                  supervisor_cleanup_complete=True)
+    supervisor_invoked = False
     try:
         if args.verify_dir:
             if args.execute or args.fixture:
@@ -87,6 +92,9 @@ def main(argv=None):
                 old_nonce = os.environ.get("THS_SAMPLE_SUPERVISOR_NONCE")
                 os.environ["THS_SAMPLE_SUPERVISOR_NONCE"] = nonce
                 try:
+                    supervisor_invoked = True
+                    result.update(actual_http_requests=None, requests_attempted=None,
+                                  supervisor_cleanup_complete=None)
                     outer = run_probe_worker_process({**params, "supervisor_nonce": nonce, "supervisor_pid": os.getpid()},
                         10000, bounded_cleanup_ms=1000, hard_deadline_monotonic=started + 9,
                         retain_streams=True, strict_utf8=True,
@@ -96,9 +104,23 @@ def main(argv=None):
                         os.environ.pop("THS_SAMPLE_SUPERVISOR_NONCE", None)
                     else:
                         os.environ["THS_SAMPLE_SUPERVISOR_NONCE"] = old_nonce
-                result = outer["payload"] if outer.get("ok") else safe(status="FAILED",
-                    error="controller_deadline_or_failure", actual_http_requests=0 if args.fixture else None)
+                result["supervisor_process"] = outer
                 result["supervisor_cleanup_complete"] = outer.get("cleanup_complete") is True
+                payload = outer.get("payload")
+                if outer.get("ok") and isinstance(payload, dict):
+                    result = {**result, **payload, "supervisor_process": outer,
+                              "supervisor_cleanup_complete": outer.get("cleanup_complete") is True}
+                    if (payload.get("status") not in ("FAILED", "SAMPLE_PARSED")
+                            or not {"requests_attempted", "actual_http_requests"} <= payload.keys()):
+                        failed_result(result, "controller_payload_incomplete")
+                    elif result["status"] == "SAMPLE_PARSED" and (
+                            type(result["requests_attempted"]) is not int or result["requests_attempted"] != 1
+                            or type(result["actual_http_requests"]) is not int or result["actual_http_requests"] not in (0, 1)):
+                        failed_result(result, "controller_dispatch_count_unconfirmed")
+                else:
+                    if worker_not_started(outer):
+                        result.update(actual_http_requests=0, requests_attempted=0)
+                    failed_result(result, outer.get("error") or "controller_payload_missing_or_failure")
                 if not result["supervisor_cleanup_complete"]:
                     state = Path(args.test_state) if args.fixture and args.test_state else STATE
                     try:
@@ -110,7 +132,13 @@ def main(argv=None):
                     result["status"] = "FAILED"
             code = 0 if result["status"] in ("NETWORK_NOT_REQUESTED", "SAMPLE_PARSED") else 2
     except Exception as exc:
-        result = safe(status="FAILED", error=f"{type(exc).__name__}:{exc}", actual_http_requests=0, requests_attempted=0)
+        failed_result(result, f"{type(exc).__name__}:{exc}")
+        if supervisor_invoked and result.get("supervisor_cleanup_complete") is not True:
+            state = Path(args.test_state) if args.fixture and args.test_state else STATE
+            try:
+                write_once(state / "cleanup-incomplete.json", {"reason": "supervisor_exception_cleanup_unknown"})
+            except OSError:
+                pass
         code = 2
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
     return code
