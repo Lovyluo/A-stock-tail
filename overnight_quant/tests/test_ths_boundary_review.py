@@ -29,15 +29,50 @@ def test_cli_failure_before_supervisor_is_known_zero(monkeypatch):
     assert result["supervisor_cleanup_complete"] is True
 
 
-def test_process_creation_failure_is_known_zero_and_keeps_diagnostics(monkeypatch):
+def test_process_creation_failure_is_known_zero_and_keeps_diagnostics(monkeypatch, tmp_path, record_property):
     from overnight_quant.data import probe_worker_process
-    monkeypatch.setattr(probe_worker_process.subprocess, "Popen",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("test_only_create_failed")))
-    code, result = invoke(["--execute", "--launcher-start", str(cli.ENTRY_STARTED)])
+    calls = 0
+    def fail_create(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("test_only_create_failed")
+    monkeypatch.setattr(probe_worker_process.subprocess, "Popen", fail_create)
+    monkeypatch.setattr(cli, "STATE", tmp_path / "state")
+    # Collection may precede this simulated process entry by several minutes.
+    entry_started = ths.time.perf_counter()
+    monkeypatch.setattr(cli, "ENTRY_STARTED", entry_started)
+    code, result = invoke(["--execute", "--launcher-start", str(entry_started)])
+    record_property("popen_fault_calls", calls)
+    assert calls == 1
     assert code == 2 and result["actual_http_requests"] == result["requests_attempted"] == 0
+    assert result["status"] == "FAILED"
     assert "test_only_create_failed" in result["error"]
     assert result["supervisor_cleanup_complete"] is True
     assert result["supervisor_process"]["pid"] is None
+
+
+def test_stale_entry_deadline_precedes_process_creation_fault(monkeypatch, tmp_path, record_property):
+    from overnight_quant.data import probe_worker_process
+    calls = 0
+    def fail_create(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("test_only_create_failed")
+    monkeypatch.setattr(probe_worker_process.subprocess, "Popen", fail_create)
+    monkeypatch.setattr(cli, "STATE", tmp_path / "state")
+    stale_entry = ths.time.perf_counter() - 60
+    monkeypatch.setattr(cli, "ENTRY_STARTED", stale_entry)
+    code, result = invoke(["--execute", "--launcher-start", str(stale_entry)])
+    record_property("popen_fault_calls", calls)
+    assert calls == 0
+    assert code == 2 and result["status"] == "FAILED"
+    assert result["actual_http_requests"] is result["requests_attempted"] is None
+    assert "test_only_create_failed" not in result["error"]
+    assert result["supervisor_process"]["stage"] == "prepare"
+    assert result["supervisor_process"]["request_timed_out"] is True
+    assert result["supervisor_process"]["pid"] is None
+    assert result["supervisor_cleanup_complete"] is False
+    assert (tmp_path / "state/cleanup-incomplete.json").is_file()
 
 
 @pytest.mark.parametrize("mode", ["missing", "empty", "partial", "unknown_count", "runner_raised", "late", "source_failed_late"])
