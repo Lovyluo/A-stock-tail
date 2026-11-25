@@ -44,24 +44,10 @@ def render(st):
         overflow-wrap: anywhere;
     }
     </style>""", unsafe_allow_html=True)
-    st.title("热点与核心股")
-    st.caption("离线研究 · 尚无已核验热点或核心股候选")
-
-    st.subheader("数据日期与覆盖")
-    st.write("热点事件日期：未核验（UNKNOWN）｜热点覆盖：UNKNOWN｜已核验事件：0")
-    st.caption("没有当前行情；本地采集时间不能替代来源事件时间。")
-
-    st.subheader("题材与证据")
-    st.info("暂无已核验热点。尚缺可追溯的主题事件、直接归因及对应日期/覆盖证据。")
-    st.write("同花顺强势股归因仅有接口线索，尚无本项目核验通过的真实样本。")
-
-    st.subheader("核心股研究候选与理由")
-    st.info("暂无已核验核心股研究候选。历史成分归属不能证明当前强势、核心地位或龙头。")
-    st.caption("候选理由尚缺：直接主题归因、规范证券身份、同日价格口径和完整观察范围。")
-
-    st.subheader("持续性与不确定性")
-    st.write("单日表现：资料不足。多日持续性：资料不足，未接入可比的连续日期证据。")
-    st.warning("风险及可交易性未评估；不提供买入/卖出条件或交易建议。上游数据用途依据 UNKNOWN。")
+    st.title("历史题材归因线索")
+    st.caption("历史来源线索 · 非当前热点或买卖参考")
+    from overnight_quant.ui.ths_history_clues import render as render_clues
+    render_clues(st)
 
     with st.expander("历史结构归属 · 非热点"):
         catalog, invalid = _catalog()
