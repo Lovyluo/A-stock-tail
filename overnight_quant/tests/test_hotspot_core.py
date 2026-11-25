@@ -81,6 +81,8 @@ def open_home(monkeypatch, tmp_path):
     from streamlit.testing.v1 import AppTest
     from overnight_quant.ui import dashboard, offline_observation
     monkeypatch.delenv("CONCEPT_BATCH_VERIFIED_INDEXES", raising=False)
+    monkeypatch.delenv("THS_HISTORY_INDEX", raising=False)
+    monkeypatch.delenv("THS_HISTORY_INDEX_SHA256", raising=False)
     monkeypatch.setattr(offline_observation, "DEFAULT_STORE", tmp_path / "user-store")
     guard = AppTestNetworkGuard(monkeypatch)
     def reject_old(*args, **kwargs):
@@ -100,10 +102,10 @@ def test_default_dashboard_early_return_zero_network_and_writes(monkeypatch, tmp
     assert set(workspace.options) == {"热点与核心股 · 证据", "历史/离线观察", "全天短线观察 · 演示",
                                       "捕获批次观察", "原有研究工作台"}
     assert not app.exception
-    assert [x.value for x in app.subheader] == ["数据日期与覆盖", "题材与证据", "核心股研究候选与理由", "持续性与不确定性"]
-    assert any("暂无已核验热点" in x.value for x in app.info)
-    assert any("暂无已核验核心股" in x.value for x in app.info)
-    assert not app.button and not app.text_input and not app.text_area and not app.file_uploader
+    assert [x.value for x in app.title] == ["历史题材归因线索"]
+    assert any("尚未选择封存" in x.value for x in app.info)
+    assert [x.label for x in app.text_input] == ["已封存线索索引", "索引外部SHA-256"]
+    assert not app.button and not app.text_area and not app.file_uploader
     assert_empty_product(json.loads(app.json[0].value))
     app.run()
     assert not app.exception and not any(guard.business_attempts.values())
